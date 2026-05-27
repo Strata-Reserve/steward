@@ -302,9 +302,16 @@ platform.get("/tenants/:id", async (c) => {
 
 /**
  * PATCH /tenants/:tenantId/email-config
- * Body: { apiKey, from, replyTo?, templateId?, subjectOverride? }
+ * Body: {
+ *   apiKey, from,
+ *   replyTo?, templateId?, subjectOverride?,
+ *   magicLinkBaseUrl?, magicLinkCallbackPath?,
+ * }
  *
- * Upserts the tenant-specific email provider config.
+ * Upserts the tenant-specific email provider config. The magic-link
+ * overrides let a tenant land the click on its own app instead of
+ * Steward's default `/auth/callback/email` → EMAIL_AUTH_REDIRECT_BASE_URL
+ * flow. Both are optional; when both unset the legacy flow is used.
  */
 platform.patch("/tenants/:tenantId/email-config", async (c) => {
   const db = getDb();
@@ -324,6 +331,8 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
     replyTo?: string;
     templateId?: string;
     subjectOverride?: string;
+    magicLinkBaseUrl?: string;
+    magicLinkCallbackPath?: string;
   }>(c);
 
   if (!body) {
@@ -337,12 +346,34 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
   if (
     !isOptionalString(body.replyTo) ||
     !isOptionalString(body.templateId) ||
-    !isOptionalString(body.subjectOverride)
+    !isOptionalString(body.subjectOverride) ||
+    !isOptionalString(body.magicLinkBaseUrl) ||
+    !isOptionalString(body.magicLinkCallbackPath)
   ) {
     return c.json<ApiResponse>(
-      { ok: false, error: "replyTo, templateId, and subjectOverride must be non-empty strings" },
+      {
+        ok: false,
+        error:
+          "replyTo, templateId, subjectOverride, magicLinkBaseUrl, and magicLinkCallbackPath must be non-empty strings",
+      },
       400,
     );
+  }
+
+  // Light validation on the magic-link base URL so a typo can't brick
+  // the link. Must be absolute http(s) and have no trailing slash.
+  if (body.magicLinkBaseUrl) {
+    try {
+      const u = new URL(body.magicLinkBaseUrl);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        throw new Error("protocol");
+      }
+    } catch {
+      return c.json<ApiResponse>(
+        { ok: false, error: "magicLinkBaseUrl must be an absolute http(s) URL" },
+        400,
+      );
+    }
   }
 
   const encryptedApiKey = JSON.stringify(platformKeyStore().encrypt(body.apiKey.trim()));
@@ -353,6 +384,12 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
     ...(body.replyTo ? { replyTo: body.replyTo.trim() } : {}),
     ...(body.templateId ? { templateId: body.templateId.trim() } : {}),
     ...(body.subjectOverride ? { subjectOverride: body.subjectOverride.trim() } : {}),
+    ...(body.magicLinkBaseUrl
+      ? { magicLinkBaseUrl: body.magicLinkBaseUrl.trim().replace(/\/$/, "") }
+      : {}),
+    ...(body.magicLinkCallbackPath
+      ? { magicLinkCallbackPath: body.magicLinkCallbackPath.trim() }
+      : {}),
   };
 
   const [existingConfig] = await db
@@ -381,6 +418,8 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
       replyTo?: string;
       templateId?: string;
       subjectOverride?: string;
+      magicLinkBaseUrl?: string;
+      magicLinkCallbackPath?: string;
       hasApiKey: true;
     }>
   >({
@@ -391,6 +430,8 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
       replyTo: emailConfig.replyTo,
       templateId: emailConfig.templateId,
       subjectOverride: emailConfig.subjectOverride,
+      magicLinkBaseUrl: emailConfig.magicLinkBaseUrl,
+      magicLinkCallbackPath: emailConfig.magicLinkCallbackPath,
       hasApiKey: true,
     },
   });
