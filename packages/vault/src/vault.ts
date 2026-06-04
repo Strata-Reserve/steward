@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import {
   agents,
   agentWallets,
   encryptedChainKeys,
   encryptedKeys,
   getDb,
+  policies,
   toAgentIdentity,
   transactions,
 } from "@stwd/db";
@@ -38,21 +40,46 @@ import {
   mainnet,
   polygon,
 } from "viem/chains";
-
+import { deriveEvmKey, deriveSolanaKey } from "./hd-wallet";
 import { type EncryptedKey, KeyStore } from "./keystore";
+import { backendFromKeyStore, type KeystoreBackend } from "./keystore-backend";
 import {
+  assertSolanaTransferTransactionMatches,
   generateSolanaKeypair,
   getSolanaBalance,
   restoreSolanaKeypair,
+  signEd25519Digest,
   signSolanaMessage,
   signSolanaTransaction,
 } from "./solana";
+import {
+  assertParsedSolanaTransferMatches,
+  isVersionedTransactionBytes,
+} from "./solana-instructions";
 import { getTokenBalances as fetchTokenBalances, type TokenBalance } from "./tokens";
+import {
+  ENTRY_POINT_V07,
+  getUserOperationHash,
+  packUserOperation,
+  type UnpackedUserOperationFields,
+} from "./userop";
 
 export interface VaultConfig {
   masterPassword: string;
   rpcUrl?: string;
   chainId?: number;
+  keystoreBackend?: KeystoreBackend;
+}
+
+/**
+ * Explicit, logged authorization required to call exportPrivateKey. Forces the
+ * caller to opt into a break-glass plaintext-key export rather than invoking it
+ * casually; actorId/reason are surfaced in the vault's audit log line.
+ */
+export interface ExportPrivateKeyAuthorization {
+  breakGlass: true;
+  actorId: string;
+  reason?: string;
 }
 
 const CHAINS: Record<number, Chain> = {
@@ -84,12 +111,41 @@ const SOLANA_RPCS: Record<number, string> = {
   102: "https://api.devnet.solana.com",
 };
 
+export function resolveSignVenueSelector(request: Pick<SignRequest, "venue">): string | null {
+  return request.venue ?? null;
+}
+
+export function missingSigningKeyError(
+  agentId: string,
+  chainFamily: string,
+  venue?: string | null,
+): Error {
+  const venueSuffix = venue ? ` with venue ${venue}` : "";
+  return new Error(
+    `No signing key found for agent ${agentId} on chain family ${chainFamily}${venueSuffix}`,
+  );
+}
+
+export function assertEvmWalletAddressMatches(secretKey: string, walletAddress?: string): void {
+  if (!walletAddress) return;
+  const derivedAddress = privateKeyToAccount(secretKey as `0x${string}`).address;
+  if (derivedAddress.toLowerCase() !== walletAddress.toLowerCase()) {
+    throw new Error(
+      `Wallet address mismatch: resolved ${derivedAddress} but request specified ${walletAddress}`,
+    );
+  }
+}
+
 /**
  * Detect chain type from wallet address format.
  * EVM addresses start with "0x"; Solana addresses are base58 (no "0x" prefix).
  */
 function detectChainType(walletAddress: string): "evm" | "solana" {
   return walletAddress.startsWith("0x") ? "evm" : "solana";
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /**
@@ -106,6 +162,17 @@ export interface SignTransactionOptions {
   status?: TxStatus;
 }
 
+interface MnemonicWalletMaterial {
+  evmPrivateKey: `0x${string}`;
+  evmAddress: string;
+  solanaSecretHex: string;
+  solanaAddress: string;
+}
+
+export interface RestoreAgentFromMnemonicResult extends AgentIdentity {
+  restoredExisting: boolean;
+}
+
 /**
  * Vault - the core signing service.
  *
@@ -114,12 +181,13 @@ export interface SignTransactionOptions {
  * of a signing operation and never exposed to agent containers.
  */
 export class Vault {
-  private keyStore: KeyStore;
+  private keyStore: KeystoreBackend;
   private config: VaultConfig;
 
   constructor(config: VaultConfig) {
     this.config = config;
-    this.keyStore = new KeyStore(config.masterPassword);
+    this.keyStore =
+      config.keystoreBackend ?? backendFromKeyStore(new KeyStore(config.masterPassword));
   }
 
   /**
@@ -158,8 +226,18 @@ export class Vault {
     const solanaAddress = solKp.publicKey;
 
     // ── Encrypt both keys ────────────────────────────────────────────────
-    const evmEncrypted = this.keyStore.encrypt(evmPrivateKey);
-    const solEncrypted = this.keyStore.encrypt(solKp.secretKey);
+    const evmEncrypted = await this.keyStore.encrypt(evmPrivateKey, {
+      tenantId,
+      agentId,
+      chainFamily: "evm",
+      venue: null,
+    });
+    const solEncrypted = await this.keyStore.encrypt(solKp.secretKey, {
+      tenantId,
+      agentId,
+      chainFamily: "solana",
+      venue: null,
+    });
 
     const createdAt = new Date();
 
@@ -224,6 +302,280 @@ export class Vault {
   }
 
   /**
+   * Create a new agent wallet from a BIP-39 mnemonic.
+   *
+   * This is intentionally only for NEW agents: assigning a mnemonic to an
+   * already-random wallet would create a false recovery guarantee. The caller
+   * is responsible for showing the mnemonic exactly once and never persisting it.
+   */
+  async createAgentFromMnemonic(
+    tenantId: string,
+    agentId: string,
+    name: string,
+    mnemonic: string,
+    options: { platformId?: string; passphrase?: string; walletType?: string } = {},
+  ): Promise<AgentIdentity> {
+    const db = getDb();
+    const [existingAgent] = await db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+
+    if (existingAgent) {
+      throw new Error(`Agent ${agentId} already exists for tenant ${tenantId}`);
+    }
+
+    const material = await this.deriveMnemonicWalletMaterial(mnemonic, options.passphrase);
+
+    const evmEncrypted = await this.keyStore.encrypt(material.evmPrivateKey, {
+      tenantId,
+      agentId,
+      chainFamily: "evm",
+      venue: null,
+    });
+    const solEncrypted = await this.keyStore.encrypt(material.solanaSecretHex, {
+      tenantId,
+      agentId,
+      chainFamily: "solana",
+      venue: null,
+    });
+    const createdAt = new Date();
+
+    await db.transaction(async (tx) => {
+      await tx.insert(agents).values({
+        id: agentId,
+        tenantId,
+        name,
+        walletAddress: material.evmAddress,
+        platformId: options.platformId,
+        walletType: options.walletType ?? "recoverable",
+        createdAt,
+        updatedAt: createdAt,
+      });
+
+      await tx.insert(encryptedKeys).values({
+        agentId,
+        ciphertext: evmEncrypted.ciphertext,
+        iv: evmEncrypted.iv,
+        tag: evmEncrypted.tag,
+        salt: evmEncrypted.salt,
+      });
+
+      await tx.insert(encryptedChainKeys).values([
+        {
+          agentId,
+          chainFamily: "evm",
+          ciphertext: evmEncrypted.ciphertext,
+          iv: evmEncrypted.iv,
+          tag: evmEncrypted.tag,
+          salt: evmEncrypted.salt,
+        },
+        {
+          agentId,
+          chainFamily: "solana",
+          ciphertext: solEncrypted.ciphertext,
+          iv: solEncrypted.iv,
+          tag: solEncrypted.tag,
+          salt: solEncrypted.salt,
+        },
+      ]);
+
+      await tx.insert(agentWallets).values([
+        { agentId, chainFamily: "evm", address: material.evmAddress, createdAt },
+        { agentId, chainFamily: "solana", address: material.solanaAddress, createdAt },
+      ]);
+    });
+
+    return {
+      id: agentId,
+      tenantId,
+      name,
+      walletAddress: material.evmAddress,
+      walletAddresses: { evm: material.evmAddress, solana: material.solanaAddress },
+      platformId: options.platformId,
+      createdAt,
+    };
+  }
+
+  private async deriveMnemonicWalletMaterial(
+    mnemonic: string,
+    passphrase?: string,
+  ): Promise<MnemonicWalletMaterial> {
+    const evmKey = await deriveEvmKey(mnemonic, { passphrase });
+    const evmAddress = privateKeyToAccount(evmKey.privateKey).address;
+    const solKey = await deriveSolanaKey(mnemonic, { passphrase });
+    const solanaSecretHex = bytesToHex(solKey.secretKey);
+    const solanaAddress = restoreSolanaKeypair(solanaSecretHex).publicKey.toBase58();
+    return {
+      evmPrivateKey: evmKey.privateKey,
+      evmAddress,
+      solanaSecretHex,
+      solanaAddress,
+    };
+  }
+
+  /**
+   * Restore/import a mnemonic-backed agent wallet.
+   *
+   * Safe cases:
+   *   - no agent exists: create the deterministic recoverable wallet;
+   *   - a recoverable agent exists and the mnemonic derives the exact stored
+   *     EVM/Solana identities: re-encrypt the derived keys for this deployment.
+   *
+   * Unsafe cases fail closed: an existing random/non-recoverable wallet or a
+   * mnemonic whose derived addresses differ from the stored identity is refused.
+   */
+  async restoreAgentFromMnemonic(
+    tenantId: string,
+    agentId: string,
+    name: string,
+    mnemonic: string,
+    options: { platformId?: string; passphrase?: string; walletType?: string } = {},
+  ): Promise<RestoreAgentFromMnemonicResult> {
+    const db = getDb();
+    const [existingAgent] = await db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+
+    if (!existingAgent) {
+      const created = await this.createAgentFromMnemonic(
+        tenantId,
+        agentId,
+        name,
+        mnemonic,
+        options,
+      );
+      return { ...created, restoredExisting: false };
+    }
+
+    const walletType = existingAgent.walletType ?? "agent";
+    const expectedType = options.walletType ?? "recoverable";
+    if (walletType !== expectedType) {
+      throw new Error("Existing wallet is not mnemonic-recoverable; refusing unsafe restore");
+    }
+
+    const material = await this.deriveMnemonicWalletMaterial(mnemonic, options.passphrase);
+    const wallets = await db.select().from(agentWallets).where(eq(agentWallets.agentId, agentId));
+    const evmWallet = wallets.find(
+      (wallet) => wallet.chainFamily === "evm" && wallet.venue === null,
+    );
+    const solanaWallet = wallets.find(
+      (wallet) => wallet.chainFamily === "solana" && wallet.venue === null,
+    );
+
+    if (existingAgent.walletAddress.toLowerCase() !== material.evmAddress.toLowerCase()) {
+      throw new Error("Mnemonic does not match the existing wallet identity");
+    }
+    if (evmWallet && evmWallet.address.toLowerCase() !== material.evmAddress.toLowerCase()) {
+      throw new Error("Mnemonic does not match the existing wallet identity");
+    }
+    if (solanaWallet && solanaWallet.address !== material.solanaAddress) {
+      throw new Error("Mnemonic does not match the existing wallet identity");
+    }
+
+    const evmEncrypted = await this.keyStore.encrypt(material.evmPrivateKey, {
+      tenantId,
+      agentId,
+      chainFamily: "evm",
+      venue: null,
+    });
+    const solEncrypted = await this.keyStore.encrypt(material.solanaSecretHex, {
+      tenantId,
+      agentId,
+      chainFamily: "solana",
+      venue: null,
+    });
+    const now = new Date();
+
+    await db.transaction(async (tx) => {
+      await tx
+        .update(agents)
+        .set({
+          walletAddress: material.evmAddress,
+          platformId: options.platformId ?? existingAgent.platformId,
+          updatedAt: now,
+        })
+        .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+
+      await tx
+        .insert(encryptedKeys)
+        .values({
+          agentId,
+          ciphertext: evmEncrypted.ciphertext,
+          iv: evmEncrypted.iv,
+          tag: evmEncrypted.tag,
+          salt: evmEncrypted.salt,
+        })
+        .onConflictDoUpdate({
+          target: encryptedKeys.agentId,
+          set: {
+            ciphertext: evmEncrypted.ciphertext,
+            iv: evmEncrypted.iv,
+            tag: evmEncrypted.tag,
+            salt: evmEncrypted.salt,
+          },
+        });
+
+      await tx
+        .delete(encryptedChainKeys)
+        .where(
+          and(
+            eq(encryptedChainKeys.agentId, agentId),
+            inArray(encryptedChainKeys.chainFamily, ["evm", "solana"]),
+            isNull(encryptedChainKeys.venue),
+          ),
+        );
+      await tx.insert(encryptedChainKeys).values([
+        {
+          agentId,
+          chainFamily: "evm",
+          venue: null,
+          ciphertext: evmEncrypted.ciphertext,
+          iv: evmEncrypted.iv,
+          tag: evmEncrypted.tag,
+          salt: evmEncrypted.salt,
+        },
+        {
+          agentId,
+          chainFamily: "solana",
+          venue: null,
+          ciphertext: solEncrypted.ciphertext,
+          iv: solEncrypted.iv,
+          tag: solEncrypted.tag,
+          salt: solEncrypted.salt,
+        },
+      ]);
+
+      await tx
+        .insert(agentWallets)
+        .values([
+          {
+            agentId,
+            chainFamily: "evm",
+            venue: null,
+            address: material.evmAddress,
+            createdAt: now,
+          },
+          {
+            agentId,
+            chainFamily: "solana",
+            venue: null,
+            address: material.solanaAddress,
+            createdAt: now,
+          },
+        ])
+        .onConflictDoNothing();
+    });
+
+    const restored = await this.getAgent(tenantId, agentId);
+    if (!restored) {
+      throw new Error(`Restored wallet ${agentId} could not be fetched`);
+    }
+    return { ...restored, restoredExisting: true };
+  }
+
+  /**
    * Get an agent's public identity, including `walletAddresses` for agents
    * created with multi-wallet support.
    */
@@ -255,9 +607,19 @@ export class Vault {
    * List all agent identities for a tenant, including `walletAddresses`
    * for agents created with multi-wallet support.
    */
-  async listAgents(tenantId: string): Promise<AgentIdentity[]> {
+  async listAgents(
+    tenantId: string,
+    options: { limit?: number; offset?: number } = {},
+  ): Promise<AgentIdentity[]> {
     const db = getDb();
-    const rows = await db.select().from(agents).where(eq(agents.tenantId, tenantId));
+    const limit = Math.min(Math.max(Math.floor(options.limit ?? 100), 1), 200);
+    const offset = Math.min(Math.max(Math.floor(options.offset ?? 0), 0), 100_000);
+    const rows = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.tenantId, tenantId))
+      .limit(limit)
+      .offset(offset);
     if (rows.length === 0) return [];
 
     const agentIds = rows.map((r) => r.id);
@@ -288,8 +650,11 @@ export class Vault {
   /**
    * List all agent identities for a tenant (alias for listAgents).
    */
-  async listAgentsByTenant(tenantId: string): Promise<AgentIdentity[]> {
-    return this.listAgents(tenantId);
+  async listAgentsByTenant(
+    tenantId: string,
+    options: { limit?: number; offset?: number } = {},
+  ): Promise<AgentIdentity[]> {
+    return this.listAgents(tenantId, options);
   }
 
   /**
@@ -365,6 +730,7 @@ export class Vault {
     // 1. Try the multi-chain key table (new agents)
     // 2. Fall back to legacy single-key table (old EVM-only agents)
     let secretKey: string;
+    const venue = resolveSignVenueSelector(request);
     const [chainKey] = await db
       .select()
       .from(encryptedChainKeys)
@@ -372,30 +738,46 @@ export class Vault {
         and(
           eq(encryptedChainKeys.agentId, request.agentId),
           eq(encryptedChainKeys.chainFamily, chainFamilyToUse),
-          // Sprint 4: legacy lookup, restrict to NULL-venue row.
-          isNull(encryptedChainKeys.venue),
+          venue ? eq(encryptedChainKeys.venue, venue) : isNull(encryptedChainKeys.venue),
         ),
       );
 
     if (chainKey) {
-      secretKey = this.keyStore.decrypt({
-        ciphertext: chainKey.ciphertext,
-        iv: chainKey.iv,
-        tag: chainKey.tag,
-        salt: chainKey.salt,
-      });
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        {
+          tenantId: request.tenantId,
+          agentId: request.agentId,
+          chainFamily: chainFamilyToUse,
+          // Bind to the resolved venue selector so venue-scoped keys (provisioned
+          // with the venue in their AAD context) decrypt correctly; null for the
+          // default unscoped key.
+          venue: chainKey.venue ?? venue,
+        },
+      );
     } else {
+      if (venue) {
+        throw missingSigningKeyError(request.agentId, chainFamilyToUse, venue);
+      }
       // Fallback: legacy encrypted_keys table (EVM only)
       const [legacyKey] = await db
         .select()
         .from(encryptedKeys)
         .where(eq(encryptedKeys.agentId, request.agentId));
       if (!legacyKey) {
-        throw new Error(
-          `No signing key found for agent ${request.agentId} on chain family ${chainFamilyToUse}`,
-        );
+        throw missingSigningKeyError(request.agentId, chainFamilyToUse);
       }
-      secretKey = this.keyStore.decrypt(legacyKey as EncryptedKey);
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId: request.tenantId,
+        agentId: request.agentId,
+        chainFamily: chainFamilyToUse,
+        venue: null,
+      });
     }
 
     // Also resolve the wallet address for this chain (for Solana tx signing)
@@ -408,7 +790,7 @@ export class Vault {
           and(
             eq(agentWallets.agentId, request.agentId),
             eq(agentWallets.chainFamily, "solana"),
-            isNull(agentWallets.venue),
+            venue ? eq(agentWallets.venue, venue) : isNull(agentWallets.venue),
           ),
         );
       if (solWallet) _walletAddress = solWallet.address;
@@ -420,9 +802,24 @@ export class Vault {
     let hash: string;
 
     if (isSolana) {
+      if (request.walletAddress && _walletAddress) {
+        if (_walletAddress.toLowerCase() !== request.walletAddress.toLowerCase()) {
+          throw new Error(
+            `Wallet address mismatch: resolved ${_walletAddress} but request specified ${request.walletAddress}`,
+          );
+        }
+      }
       const rpcUrl = this.config.rpcUrl ?? resolveSolanaRpc(chainId);
-      hash = await signSolanaTransaction(secretKey, request.to, BigInt(request.value), rpcUrl);
+      hash = await signSolanaTransaction(secretKey, request.to, BigInt(request.value), rpcUrl, {
+        broadcast: shouldBroadcast,
+        // Attach adaptive priority fees (simulated CU limit + recent-fee-derived
+        // price, bounded by COMPUTE_BUDGET_BOUNDS). Estimation never throws and
+        // falls back to safe defaults on RPC error. Set STEWARD_SOLANA_PRIORITY_FEES=0
+        // to revert to the legacy no-compute-budget transfer.
+        computeBudget: process.env.STEWARD_SOLANA_PRIORITY_FEES === "0" ? false : {},
+      });
     } else {
+      assertEvmWalletAddressMatches(secretKey, request.walletAddress);
       const account = privateKeyToAccount(secretKey as `0x${string}`);
       const chain = CHAINS[chainId];
       if (!chain) {
@@ -478,6 +875,13 @@ export class Vault {
 
     const txId = options.txId ?? crypto.randomUUID();
     const signedAt = new Date();
+    const [existingTransaction] = await db
+      .select({ agentId: transactions.agentId })
+      .from(transactions)
+      .where(eq(transactions.id, txId));
+    if (existingTransaction && existingTransaction.agentId !== request.agentId) {
+      throw new Error("Transaction id already belongs to a different agent");
+    }
 
     await db
       .insert(transactions)
@@ -622,6 +1026,8 @@ export class Vault {
 
     let walletAddress: string;
 
+    let keyToStore = privateKey;
+
     if (chainType === "solana") {
       // For Solana, the private key should be a 64-byte hex string (seed + pubkey)
       // or a 32-byte hex seed - we'll handle both
@@ -632,9 +1038,15 @@ export class Vault {
       const normalizedKey = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
       const account = privateKeyToAccount(normalizedKey as `0x${string}`);
       walletAddress = account.address;
+      keyToStore = normalizedKey;
     }
 
-    const encryptedKey = this.keyStore.encrypt(privateKey);
+    const encryptedKey = await this.keyStore.encrypt(keyToStore, {
+      tenantId,
+      agentId,
+      chainFamily: chainType,
+      venue: null,
+    });
     const now = new Date();
 
     // Check if agent already exists
@@ -763,12 +1175,15 @@ export class Vault {
       );
 
     if (chainKey) {
-      secretKey = this.keyStore.decrypt({
-        ciphertext: chainKey.ciphertext,
-        iv: chainKey.iv,
-        tag: chainKey.tag,
-        salt: chainKey.salt,
-      });
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        { tenantId, agentId, chainFamily: chainFamilyToUse, venue: null },
+      );
     } else {
       // Fallback: legacy encrypted_keys table
       const [legacyKey] = await db
@@ -778,7 +1193,12 @@ export class Vault {
       if (!legacyKey) {
         throw new Error(`No signing key found for agent ${agentId}`);
       }
-      secretKey = this.keyStore.decrypt(legacyKey as EncryptedKey);
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId,
+        agentId,
+        chainFamily: chainFamilyToUse,
+        venue: null,
+      });
     }
 
     if (isSolana) {
@@ -791,12 +1211,203 @@ export class Vault {
   }
 
   /**
+   * Sign a pre-hashed 32-byte EVM digest with the agent's secp256k1 key.
+   * This is intentionally lower-level than signMessage and must remain guarded
+   * at API edges because raw signatures bypass transaction/message semantics.
+   */
+  async signRawHash(
+    tenantId: string,
+    agentId: string,
+    hash: `0x${string}`,
+  ): Promise<{ signature: string; hash: `0x${string}`; walletAddress: string }> {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+      throw new Error("hash must be a 32-byte hex string");
+    }
+
+    const db = getDb();
+    const [agentRow] = await db
+      .select({ walletAddress: agents.walletAddress })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+
+    if (!agentRow) {
+      throw new Error(`Agent ${agentId} not found for tenant ${tenantId}`);
+    }
+    if (detectChainType(agentRow.walletAddress) !== "evm") {
+      throw new Error("Raw secp256k1 signing requires an EVM agent");
+    }
+
+    let secretKey: string;
+    const [chainKey] = await db
+      .select()
+      .from(encryptedChainKeys)
+      .where(
+        and(
+          eq(encryptedChainKeys.agentId, agentId),
+          eq(encryptedChainKeys.chainFamily, "evm"),
+          isNull(encryptedChainKeys.venue),
+        ),
+      );
+
+    if (chainKey) {
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        { tenantId, agentId, chainFamily: "evm", venue: null },
+      );
+    } else {
+      const [legacyKey] = await db
+        .select()
+        .from(encryptedKeys)
+        .where(eq(encryptedKeys.agentId, agentId));
+      if (!legacyKey) {
+        throw new Error(`No EVM signing key for agent ${agentId}`);
+      }
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId,
+        agentId,
+        chainFamily: "evm",
+        venue: null,
+      });
+    }
+
+    const account = privateKeyToAccount(secretKey as `0x${string}`);
+    return {
+      signature: await account.sign({ hash }),
+      hash,
+      walletAddress: account.address,
+    };
+  }
+
+  /**
+   * Sign a raw 32-byte digest across signature curves. This is the cross-curve
+   * generalization of {@link signRawHash} and is intentionally lower-level than
+   * the transaction/message signers — it MUST stay guarded at API edges because
+   * raw signatures bypass transaction and message policy semantics.
+   *
+   * Curve dispatch (all require an exactly-32-byte payload so the edge cannot be
+   * abused to blind-sign a full transaction message):
+   *  - `secp256k1` → agent's EVM key, recoverable ECDSA via viem `account.sign`.
+   *  - `ed25519`   → agent's Solana key, detached Ed25519 over the 32 bytes.
+   *  - `stark`     → fail closed. No vetted starknet curve library is installed,
+   *                  and hand-rolling curve crypto in a money path is unacceptable.
+   */
+  async signRawDigest(
+    tenantId: string,
+    agentId: string,
+    curve: "secp256k1" | "ed25519" | "stark",
+    payloadHex: string,
+  ): Promise<{
+    signature: string;
+    curve: "secp256k1" | "ed25519";
+    payloadHex: `0x${string}`;
+    publicKey: string;
+  }> {
+    if (curve === "stark") {
+      throw new Error(
+        "stark curve raw signing is disabled: no vetted starknet signing library is installed",
+      );
+    }
+    if (curve !== "secp256k1" && curve !== "ed25519") {
+      throw new Error(`Unsupported raw-sign curve: ${String(curve)}`);
+    }
+
+    // Normalize + validate: a raw digest is exactly 32 bytes (64 hex chars).
+    const normalized = payloadHex.startsWith("0x") ? payloadHex.slice(2) : payloadHex;
+    if (!/^[0-9a-fA-F]{64}$/.test(normalized)) {
+      throw new Error("payloadHex must be a 32-byte hex string");
+    }
+    const payloadHex0x = `0x${normalized.toLowerCase()}` as `0x${string}`;
+
+    const db = getDb();
+    const [agentRow] = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+    if (!agentRow) {
+      throw new Error(`Agent ${agentId} not found for tenant ${tenantId}`);
+    }
+
+    // Curve selects which key family signs: secp256k1 → the agent's EVM key,
+    // ed25519 → the agent's Solana key. An agent provisioned via createAgent
+    // owns both, so we resolve the requested family directly rather than gating
+    // on the agent's "primary" wallet address. The tenant scoping above is the
+    // authorization boundary (the encrypted-key tables are keyed by agentId).
+    const chainFamily = curve === "secp256k1" ? "evm" : "solana";
+
+    let secretKey: string;
+    const [chainKey] = await db
+      .select()
+      .from(encryptedChainKeys)
+      .where(
+        and(
+          eq(encryptedChainKeys.agentId, agentId),
+          eq(encryptedChainKeys.chainFamily, chainFamily),
+          isNull(encryptedChainKeys.venue),
+        ),
+      );
+    if (chainKey) {
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        { tenantId, agentId, chainFamily, venue: null },
+      );
+    } else if (curve === "secp256k1") {
+      // Legacy encrypted_keys holds the EVM key only — a safe fallback for
+      // secp256k1. NEVER fall back here for ed25519: it would decrypt the EVM
+      // key under a Solana chainFamily context and produce a bogus signer.
+      const [legacyKey] = await db
+        .select()
+        .from(encryptedKeys)
+        .where(eq(encryptedKeys.agentId, agentId));
+      if (!legacyKey) {
+        throw new Error(`No evm signing key for agent ${agentId}`);
+      }
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId,
+        agentId,
+        chainFamily: "evm",
+        venue: null,
+      });
+    } else {
+      throw new Error(`No solana signing key for agent ${agentId}`);
+    }
+
+    if (curve === "ed25519") {
+      // Decode the validated 64-char hex to 32 bytes without depending on the
+      // Buffer global (vault.ts otherwise avoids Node globals).
+      const payloadBytes = new Uint8Array(32);
+      for (let i = 0; i < 32; i++) {
+        payloadBytes[i] = Number.parseInt(normalized.slice(i * 2, i * 2 + 2), 16);
+      }
+      const { signature, publicKey } = signEd25519Digest(secretKey, payloadBytes);
+      return { signature, curve, payloadHex: payloadHex0x, publicKey };
+    }
+
+    const account = privateKeyToAccount(secretKey as `0x${string}`);
+    return {
+      signature: await account.sign({ hash: payloadHex0x }),
+      curve,
+      payloadHex: payloadHex0x,
+      publicKey: account.address,
+    };
+  }
+
+  /**
    * Sign an EIP-7702 set-code authorization. Lets an EOA temporarily delegate
    * execution to smart-contract code per transaction (Pectra, May 2025).
    * Returns { contractAddress, chainId, nonce, r, s, yParity, v } which the
    * caller attaches to the `authorizationList` of a type-4 transaction.
    *
-   * Per EIP-7702, signing chainId=0 designates "any chain" — useful when the
+   * Per EIP-7702, signing chainId=0 designates "any chain" - useful when the
    * delegation target is chain-agnostic. The vault accepts 0 explicitly so
    * callers can opt in; default is the chainId on the request.
    */
@@ -844,19 +1455,27 @@ export class Vault {
         ),
       );
     if (chainKey) {
-      secretKey = this.keyStore.decrypt({
-        ciphertext: chainKey.ciphertext,
-        iv: chainKey.iv,
-        tag: chainKey.tag,
-        salt: chainKey.salt,
-      });
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        { tenantId, agentId, chainFamily: "evm", venue: null },
+      );
     } else {
       const [legacyKey] = await db
         .select()
         .from(encryptedKeys)
         .where(eq(encryptedKeys.agentId, agentId));
       if (!legacyKey) throw new Error(`No EVM signing key for agent ${agentId}`);
-      secretKey = this.keyStore.decrypt(legacyKey as EncryptedKey);
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId,
+        agentId,
+        chainFamily: "evm",
+        venue: null,
+      });
     }
 
     const account = privateKeyToAccount(secretKey as `0x${string}`);
@@ -914,12 +1533,20 @@ export class Vault {
       );
 
     if (chainKey) {
-      secretKey = this.keyStore.decrypt({
-        ciphertext: chainKey.ciphertext,
-        iv: chainKey.iv,
-        tag: chainKey.tag,
-        salt: chainKey.salt,
-      });
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        {
+          tenantId: request.tenantId,
+          agentId: request.agentId,
+          chainFamily: "evm",
+          venue: request.venue ?? null,
+        },
+      );
     } else {
       if (request.venue) {
         throw new Error(
@@ -934,7 +1561,12 @@ export class Vault {
       if (!legacyKey) {
         throw new Error(`No signing key found for agent ${request.agentId}`);
       }
-      secretKey = this.keyStore.decrypt(legacyKey as EncryptedKey);
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId: request.tenantId,
+        agentId: request.agentId,
+        chainFamily: "evm",
+        venue: null,
+      });
     }
 
     const account = privateKeyToAccount(secretKey as `0x${string}`);
@@ -953,6 +1585,89 @@ export class Vault {
     });
 
     return signature;
+  }
+
+  /**
+   * Sign an ERC-4337 EntryPoint v0.7 user operation hash with the agent's EVM key.
+   * The signature is EIP-191-prefixed, which matches common account implementations.
+   */
+  async signUserOperation(request: {
+    agentId: string;
+    tenantId: string;
+    userOperation: UnpackedUserOperationFields;
+    entryPoint?: `0x${string}`;
+    chainId: number;
+  }): Promise<{
+    signature: string;
+    userOperationHash: string;
+    entryPoint: string;
+    chainId: number;
+  }> {
+    const db = getDb();
+
+    const [agentRow] = await db
+      .select({ walletAddress: agents.walletAddress })
+      .from(agents)
+      .where(and(eq(agents.id, request.agentId), eq(agents.tenantId, request.tenantId)));
+
+    if (!agentRow) {
+      throw new Error(`Agent ${request.agentId} not found for tenant ${request.tenantId}`);
+    }
+
+    if (detectChainType(agentRow.walletAddress) === "solana") {
+      throw new Error("ERC-4337 user operation signing is not supported for Solana wallets");
+    }
+
+    const [chainKey] = await db
+      .select()
+      .from(encryptedChainKeys)
+      .where(
+        and(
+          eq(encryptedChainKeys.agentId, request.agentId),
+          eq(encryptedChainKeys.chainFamily, "evm"),
+          isNull(encryptedChainKeys.venue),
+        ),
+      );
+
+    let secretKey: string;
+    if (chainKey) {
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        { tenantId: request.tenantId, agentId: request.agentId, chainFamily: "evm", venue: null },
+      );
+    } else {
+      const [legacyKey] = await db
+        .select()
+        .from(encryptedKeys)
+        .where(eq(encryptedKeys.agentId, request.agentId));
+      if (!legacyKey) {
+        throw new Error(`No signing key found for agent ${request.agentId}`);
+      }
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId: request.tenantId,
+        agentId: request.agentId,
+        chainFamily: "evm",
+        venue: null,
+      });
+    }
+
+    const entryPoint = request.entryPoint ?? ENTRY_POINT_V07;
+    const packed = packUserOperation(request.userOperation);
+    const userOperationHash = getUserOperationHash(packed, entryPoint, request.chainId);
+    const account = privateKeyToAccount(secretKey as `0x${string}`);
+    const signature = await account.signMessage({ message: { raw: userOperationHash } });
+
+    return {
+      signature,
+      userOperationHash,
+      entryPoint,
+      chainId: request.chainId,
+    };
   }
 
   /**
@@ -995,12 +1710,20 @@ export class Vault {
       );
 
     if (chainKey) {
-      secretKey = this.keyStore.decrypt({
-        ciphertext: chainKey.ciphertext,
-        iv: chainKey.iv,
-        tag: chainKey.tag,
-        salt: chainKey.salt,
-      });
+      secretKey = await this.keyStore.decrypt(
+        {
+          ciphertext: chainKey.ciphertext,
+          iv: chainKey.iv,
+          tag: chainKey.tag,
+          salt: chainKey.salt,
+        },
+        {
+          tenantId: request.tenantId,
+          agentId: request.agentId,
+          chainFamily: "solana",
+          venue: null,
+        },
+      );
     } else {
       // Legacy path: only works if the walletAddress is a Solana address
       if (detectChainType(agentRow.walletAddress) !== "solana") {
@@ -1015,7 +1738,12 @@ export class Vault {
       if (!legacyKey) {
         throw new Error(`No Solana signing key found for agent ${request.agentId}`);
       }
-      secretKey = this.keyStore.decrypt(legacyKey as EncryptedKey);
+      secretKey = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+        tenantId: request.tenantId,
+        agentId: request.agentId,
+        chainFamily: "solana",
+        venue: null,
+      });
     }
 
     const keypair = restoreSolanaKeypair(secretKey);
@@ -1023,18 +1751,59 @@ export class Vault {
     const rpcUrl = this.config.rpcUrl ?? resolveSolanaRpc(chainId);
     const shouldBroadcast = request.broadcast !== false;
 
-    // Deserialize the transaction from base64
-    const { Transaction: SolTransaction, Connection } = await import("@solana/web3.js");
+    // Deserialize the transaction (legacy OR v0/versioned). A versioned message
+    // sets the high bit of its first byte; legacy Transaction.from() throws on it
+    // ("Versioned messages must be deserialized with VersionedMessage..."), so
+    // every v0 tx — the modern default, mandatory for address-lookup-table DeFi
+    // like Jupiter — would 500 at signing after passing the (version-aware)
+    // policy gate. Branch on the version byte so both shapes sign.
+    const {
+      Transaction: SolTransaction,
+      VersionedTransaction,
+      Connection,
+    } = await import("@solana/web3.js");
     const txBytes = Uint8Array.from(atob(request.transaction), (c) => c.charCodeAt(0));
-    const tx = SolTransaction.from(txBytes);
 
-    // Sign the transaction
-    tx.partialSign(keypair);
+    const requireEnvelope = (): { from: string; to: string; lamports: bigint } | null => {
+      if (request.expectedTo === undefined && request.expectedValue === undefined) return null;
+      if (request.expectedTo === undefined || request.expectedValue === undefined) {
+        throw new Error("Solana transaction policy envelope requires expectedTo and expectedValue");
+      }
+      return {
+        from: keypair.publicKey.toBase58(),
+        to: request.expectedTo,
+        lamports: BigInt(request.expectedValue),
+      };
+    };
+
+    let signedBytes: Uint8Array;
+    if (isVersionedTransactionBytes(txBytes)) {
+      const vtx = VersionedTransaction.deserialize(txBytes);
+      const envelope = requireEnvelope();
+      if (envelope) {
+        // The byte-level legacy assertion can't read a v0 message; verify the
+        // envelope via the version-aware parser instead.
+        assertParsedSolanaTransferMatches(request.transaction, envelope);
+      }
+      vtx.sign([keypair]);
+      signedBytes = vtx.serialize();
+    } else {
+      const tx = SolTransaction.from(txBytes);
+      const envelope = requireEnvelope();
+      if (envelope) {
+        assertSolanaTransferTransactionMatches(tx, {
+          from: keypair.publicKey,
+          to: envelope.to,
+          lamports: envelope.lamports,
+        });
+      }
+      tx.partialSign(keypair);
+      signedBytes = tx.serialize();
+    }
 
     if (shouldBroadcast) {
       const connection = new Connection(rpcUrl, "confirmed");
-      const rawTx = tx.serialize();
-      const sig = await connection.sendRawTransaction(rawTx, {
+      const sig = await connection.sendRawTransaction(signedBytes, {
         skipPreflight: false,
         preflightCommitment: "confirmed",
       });
@@ -1054,8 +1823,7 @@ export class Vault {
     }
 
     // Return serialized signed transaction as base64
-    const rawBytes = tx.serialize();
-    const serialized = btoa(Array.from(rawBytes, (b) => String.fromCharCode(b)).join(""));
+    const serialized = btoa(Array.from(signedBytes, (b) => String.fromCharCode(b)).join(""));
     return {
       signature: serialized,
       broadcast: false,
@@ -1072,15 +1840,28 @@ export class Vault {
   async exportPrivateKey(
     tenantId: string,
     agentId: string,
+    authorization?: ExportPrivateKeyAuthorization,
   ): Promise<{
     evm?: { privateKey: string; address: string };
     solana?: { privateKey: string; address: string };
   }> {
+    // Defense-in-depth: this returns plaintext key material, so it must never be
+    // invoked casually. Require an explicit break-glass authorization context that
+    // the (admin + MFA + audited) caller constructs, and emit a log entry every time.
+    if (!authorization?.breakGlass || !authorization.actorId?.trim()) {
+      throw new Error(
+        "exportPrivateKey requires an explicit break-glass authorization { breakGlass: true, actorId }",
+      );
+    }
+    console.warn(
+      `[Vault] BREAK-GLASS private key export: tenant=${tenantId} agent=${agentId} actor=${authorization.actorId} reason=${authorization.reason ?? "unspecified"}`,
+    );
+
     const db = getDb();
 
     // Verify agent belongs to this tenant
     const [agentRow] = await db
-      .select({ id: agents.id })
+      .select({ id: agents.id, tenantId: agents.tenantId })
       .from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
 
@@ -1106,12 +1887,15 @@ export class Vault {
       );
 
     if (evmChainKey) {
-      const pk = this.keyStore.decrypt({
-        ciphertext: evmChainKey.ciphertext,
-        iv: evmChainKey.iv,
-        tag: evmChainKey.tag,
-        salt: evmChainKey.salt,
-      });
+      const pk = await this.keyStore.decrypt(
+        {
+          ciphertext: evmChainKey.ciphertext,
+          iv: evmChainKey.iv,
+          tag: evmChainKey.tag,
+          salt: evmChainKey.salt,
+        },
+        { tenantId, agentId, chainFamily: "evm", venue: null },
+      );
       const [evmWallet] = await db
         .select({ address: agentWallets.address })
         .from(agentWallets)
@@ -1133,7 +1917,12 @@ export class Vault {
         .from(encryptedKeys)
         .where(eq(encryptedKeys.agentId, agentId));
       if (legacyKey) {
-        const pk = this.keyStore.decrypt(legacyKey as EncryptedKey);
+        const pk = await this.keyStore.decrypt(legacyKey as EncryptedKey, {
+          tenantId,
+          agentId,
+          chainFamily: "evm",
+          venue: null,
+        });
         result.evm = {
           privateKey: pk,
           address: privateKeyToAccount(pk as `0x${string}`).address,
@@ -1154,12 +1943,15 @@ export class Vault {
       );
 
     if (solChainKey) {
-      const pk = this.keyStore.decrypt({
-        ciphertext: solChainKey.ciphertext,
-        iv: solChainKey.iv,
-        tag: solChainKey.tag,
-        salt: solChainKey.salt,
-      });
+      const pk = await this.keyStore.decrypt(
+        {
+          ciphertext: solChainKey.ciphertext,
+          iv: solChainKey.iv,
+          tag: solChainKey.tag,
+          salt: solChainKey.salt,
+        },
+        { tenantId, agentId, chainFamily: "solana", venue: null },
+      );
       const [solWallet] = await db
         .select({ address: agentWallets.address })
         .from(agentWallets)
@@ -1311,6 +2103,125 @@ export class Vault {
   }
 
   /**
+   * Provision a fresh, venue-scoped wallet for an agent with default safety
+   * policies attached in the same DB transaction.
+   *
+   * This is the preferred onboarding path for venue wallets: the wallet is
+   * never born without its venue allowlist, leverage cap, spend limits, and
+   * withdrawal destination allowlist enabled.
+   */
+  async provisionVenueWallet(args: {
+    tenantId: string;
+    agentId: string;
+    venue: string;
+    chainFamily: "evm" | "solana";
+    approvedAddresses: string[];
+  }): Promise<{ address: string }> {
+    const { tenantId, agentId, venue, chainFamily, approvedAddresses } = args;
+    if (!tenantId) throw new Error("provisionVenueWallet requires a tenantId");
+    if (!agentId) throw new Error("provisionVenueWallet requires an agentId");
+    if (!venue) throw new Error("provisionVenueWallet requires a venue");
+    if (chainFamily !== "evm" && chainFamily !== "solana") {
+      throw new Error(`provisionVenueWallet: unsupported chainFamily ${chainFamily}`);
+    }
+    if (!Array.isArray(approvedAddresses)) {
+      throw new Error("provisionVenueWallet requires approvedAddresses");
+    }
+
+    const db = getDb();
+
+    const [agentRow] = await db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+    if (!agentRow) {
+      throw new Error(`Agent ${agentId} not found for tenant ${tenantId}`);
+    }
+
+    let address: string;
+    let secret: string;
+    if (chainFamily === "evm") {
+      const pk = generatePrivateKey();
+      const account = privateKeyToAccount(pk);
+      address = account.address;
+      secret = pk;
+    } else {
+      const kp = generateSolanaKeypair();
+      address = kp.publicKey;
+      secret = kp.secretKey;
+    }
+
+    // Bind the full keystore context (incl. venue) into the AEAD AAD, exactly as
+    // createWallet does. Every decrypt path (signTransaction, signTypedData,
+    // master-password rotation) supplies { tenantId, agentId, chainFamily, venue }
+    // and the no-AAD fallback is disabled in production — so encrypting WITHOUT
+    // the context made venue keys permanently undecryptable (silent custody loss).
+    const encrypted = await this.keyStore.encrypt(secret, {
+      tenantId,
+      agentId,
+      chainFamily,
+      venue,
+    });
+    const createdAt = new Date();
+    const policyRows = [
+      {
+        id: randomUUID(),
+        agentId,
+        type: "leverage-cap" as const,
+        enabled: true,
+        config: { maxLeverage: 5 },
+      },
+      {
+        id: randomUUID(),
+        agentId,
+        type: "venue-allowlist" as const,
+        enabled: true,
+        config: { allowedVenues: [venue] },
+      },
+      {
+        id: randomUUID(),
+        agentId,
+        type: "spending-limit" as const,
+        enabled: true,
+        config: { maxPerTxUsd: 2000, maxPerDayUsd: 2000, maxPerWeekUsd: 5000 },
+      },
+      {
+        id: randomUUID(),
+        agentId,
+        type: "approved-addresses" as const,
+        enabled: true,
+        config: { addresses: approvedAddresses, mode: "whitelist" },
+      },
+    ];
+
+    await db.transaction(async (tx) => {
+      await tx.insert(encryptedChainKeys).values({
+        agentId,
+        chainFamily,
+        venue,
+        purpose: "venue",
+        ciphertext: encrypted.ciphertext,
+        iv: encrypted.iv,
+        tag: encrypted.tag,
+        salt: encrypted.salt,
+      });
+
+      await tx.insert(agentWallets).values({
+        agentId,
+        chainFamily,
+        venue,
+        purpose: "venue",
+        address,
+        createdAt,
+      });
+
+      await tx.insert(policies).values(policyRows);
+    });
+
+    return { address };
+  }
+
+  /**
    * Provision a fresh, venue-scoped wallet for an agent.
    *
    * Generates a new keypair (EVM via viem's `generatePrivateKey`, Solana
@@ -1348,7 +2259,7 @@ export class Vault {
     // Verify the agent exists. Surfacing a clear error here beats a
     // foreign-key violation from Postgres.
     const [agentRow] = await db
-      .select({ id: agents.id })
+      .select({ id: agents.id, tenantId: agents.tenantId })
       .from(agents)
       .where(eq(agents.id, agentId));
     if (!agentRow) {
@@ -1368,7 +2279,12 @@ export class Vault {
       secret = kp.secretKey;
     }
 
-    const encrypted = this.keyStore.encrypt(secret);
+    const encrypted = await this.keyStore.encrypt(secret, {
+      tenantId: agentRow.tenantId,
+      agentId,
+      chainFamily: chainType,
+      venue,
+    });
     const createdAt = new Date();
 
     await db.transaction(async (tx) => {

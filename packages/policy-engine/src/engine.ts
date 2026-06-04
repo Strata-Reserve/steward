@@ -1,5 +1,23 @@
-import type { PolicyResult, PolicyRule, PriceOracle, SignRequest } from "@stwd/shared";
+import type {
+  PolicyResult,
+  PolicyRule,
+  PriceOracle,
+  SignRequest,
+  TypedDataDomain,
+  TypedDataField,
+} from "@stwd/shared";
 import { type EvaluatorContext, evaluatePolicy } from "./evaluators";
+import type { AggregationLookup } from "./evaluators/aggregation";
+import { type ManualApprovalSignal, resultRequiresManualApproval } from "./manual-approval";
+
+/**
+ * Policy results as produced internally by the engine. Identical to the public
+ * `PolicyResult` shape plus the optional, engine-honoured `requiresManualApproval`
+ * signal (see `./manual-approval`). The extra property is optional and
+ * structurally compatible, so these values are still valid `PolicyResult`s when
+ * surfaced on `EvaluationResult.results`.
+ */
+type EnginePolicyResult = PolicyResult & ManualApprovalSignal;
 
 export interface TransactionSimulationRequest extends SignRequest {
   kind?: "transaction";
@@ -33,6 +51,32 @@ export interface PolicyEvaluationContext {
   leverage?: number;
   /** Sprint 4: pre-computed USD value of the action. */
   valueUsd?: number;
+  /**
+   * Privy-style condition set items keyed by conditionSetId. Callers load these
+   * from tenant-scoped storage before evaluating policies.
+   */
+  conditionSets?: Record<string, string[]>;
+  /**
+   * Authoritative rolling-aggregate lookup for `aggregation` policies. The API
+   * wires this from a Redis-backed provider before evaluating; when absent,
+   * aggregation policies fail closed (deny).
+   */
+  aggregations?: AggregationLookup;
+  /**
+   * Decoded EIP-712 typed-data payload for `typed-data` policies. The API wires
+   * this from the validated sign-typed-data request body; absent on ordinary
+   * transaction signs.
+   */
+  typedData?: {
+    domain: TypedDataDomain;
+    types: Record<string, TypedDataField[]>;
+    primaryType: string;
+    value: Record<string, unknown>;
+  };
+  rawSigning?: {
+    chain: string;
+    curve: string;
+  };
 }
 
 export interface EvaluationResult {
@@ -119,8 +163,7 @@ export class PolicyEngine {
     ctx: PolicyEvaluationContext & { correlationId?: string },
   ): Promise<EvaluationResult> {
     if (policies.length === 0) {
-      // No policies = everything auto-approved (dangerous but valid for testing)
-      return { approved: true, results: [], requiresManualApproval: false };
+      return { approved: false, results: [], requiresManualApproval: false };
     }
 
     const evaluatorCtx: EvaluatorContext = {
@@ -134,28 +177,51 @@ export class PolicyEngine {
       venue: ctx.venue,
       leverage: ctx.leverage,
       valueUsd: ctx.valueUsd,
+      conditionSets: ctx.conditionSets,
+      aggregations: ctx.aggregations,
+      typedData: ctx.typedData,
+      rawSigning: ctx.rawSigning,
     };
 
-    const results: PolicyResult[] = await Promise.all(
+    const results: EnginePolicyResult[] = await Promise.all(
       policies.map((policy) => evaluatePolicy(policy, evaluatorCtx)),
     );
 
-    const hardPolicies = results.filter((r) => r.type !== "auto-approve-threshold");
-    const autoApproveResult = results.find((r) => r.type === "auto-approve-threshold");
+    if (policies.every((policy) => policy.enabled === false)) {
+      const evaluationResult = { approved: false, results, requiresManualApproval: false };
+      await this.emitAuditEvent(ctx, results, evaluationResult);
+      return evaluationResult;
+    }
 
+    const hardPolicies = results.filter((r) => r.type !== "auto-approve-threshold");
+    const autoApproveResults = results.filter((r) => r.type === "auto-approve-threshold");
+
+    // A hard policy either passed, failed-soft (explicitly requesting manual
+    // review), or failed-hard. The engine treats these three distinctly:
+    //   - any hard-fail            ⇒ outright reject (default-deny preserved)
+    //   - no hard-fail, but ≥1 soft ⇒ route to manual approval
+    //   - all pass                 ⇒ proceed to the auto-approve check
+    // `resultRequiresManualApproval` returns true ONLY for a non-passing result
+    // that explicitly opted in, so a plain failure (block, default-deny,
+    // missing inputs, unknown policy type) always counts as a hard-fail and
+    // cannot be upgraded to "needs manual approval".
+    const hardFailed = hardPolicies.some((r) => !r.passed && !resultRequiresManualApproval(r));
     const allHardPass = hardPolicies.every((r) => r.passed);
-    const autoApprovePass = autoApproveResult ? autoApproveResult.passed : true;
+
+    const autoApprovePass =
+      autoApproveResults.length === 0 || autoApproveResults.every((r) => r.passed);
 
     let evaluationResult: EvaluationResult;
-    if (allHardPass && autoApprovePass) {
-      evaluationResult = { approved: true, results, requiresManualApproval: false };
-    } else if (allHardPass && !autoApprovePass) {
-      // Hard policies pass but value exceeds auto-approve threshold
-      // Queue for manual approval
-      evaluationResult = { approved: false, results, requiresManualApproval: true };
-    } else {
-      // Hard policy failed - reject
+    if (hardFailed) {
+      // A hard policy failed without requesting manual review - reject.
       evaluationResult = { approved: false, results, requiresManualApproval: false };
+    } else if (allHardPass && autoApprovePass) {
+      evaluationResult = { approved: true, results, requiresManualApproval: false };
+    } else {
+      // No hard failure, but either a hard policy requested manual review
+      // (e.g. reputation-threshold `require-approval`) and/or the value exceeds
+      // the auto-approve threshold. Queue for manual approval rather than deny.
+      evaluationResult = { approved: false, results, requiresManualApproval: true };
     }
 
     await this.emitAuditEvent(ctx, results, evaluationResult);
