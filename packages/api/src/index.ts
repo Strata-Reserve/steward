@@ -27,6 +27,8 @@ import {
   RATE_LIMIT_WINDOW_MS,
 } from "./services/context";
 import { startRetentionScheduler } from "./services/retention";
+import { startTransactionReceiptPollingScheduler } from "./services/transaction-receipt-poller";
+import { startWebhookRetryScheduler } from "./services/webhook-retry-scheduler";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -47,33 +49,47 @@ validateJwtSecretEnv();
 const requestLog = new Map<string, { count: number; resetAt: number }>();
 let isShuttingDown = false;
 let cancelRetention: (() => void) | undefined;
+let cancelTransactionReceiptPolling: (() => void) | undefined;
+let cancelWebhookRetryScheduler: (() => void) | undefined;
 
-app.use("*", async (c, next) => {
-  if (c.req.path === "/health" || c.req.path === "/ready") return next();
+// Bun-only runtime gate: shutdown guard + in-memory IP rate limit.
+//
+// This runs in the `Bun.serve` fetch handler *before* the request reaches the
+// shared Hono `app`, so the in-memory rate-limit log (only safe in a single
+// long-lived process) never gets attached to the `app` instance that other
+// runtimes (Workers, tests) import. Returns a Response to short-circuit, or
+// `undefined` to let the request fall through to `app.fetch`.
+function runtimeGate(request: Request): Response | undefined {
+  const path = new URL(request.url).pathname;
+  if (path === "/health" || path === "/ready") return undefined;
 
   if (isShuttingDown) {
-    return c.json<ApiResponse>({ ok: false, error: "Server is shutting down" }, 503);
+    return Response.json({ ok: false, error: "Server is shutting down" } satisfies ApiResponse, {
+      status: 503,
+    });
   }
 
-  const forwardedFor = c.req.header("x-forwarded-for");
-  const ip = forwardedFor?.split(",")[0]?.trim() || c.req.header("x-real-ip") || "unknown";
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  const ip = forwardedFor?.split(",")[0]?.trim() || request.headers.get("x-real-ip") || "unknown";
   const now = Date.now();
   const current = requestLog.get(ip);
 
   if (!current || current.resetAt <= now) {
     requestLog.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
-    return next();
+    return undefined;
   }
 
   if (current.count >= RATE_LIMIT_MAX_REQUESTS) {
-    c.header("Retry-After", Math.ceil((current.resetAt - now) / 1000).toString());
-    return c.json<ApiResponse>({ ok: false, error: "Rate limit exceeded" }, 429);
+    return Response.json({ ok: false, error: "Rate limit exceeded" } satisfies ApiResponse, {
+      status: 429,
+      headers: { "Retry-After": Math.ceil((current.resetAt - now) / 1000).toString() },
+    });
   }
 
   current.count += 1;
   requestLog.set(ip, current);
-  return next();
-});
+  return undefined;
+}
 
 const requestLogCleanupTimer = setInterval(() => {
   const now = Date.now();
@@ -157,6 +173,8 @@ if (shouldUsePGLite()) {
 
 if (migrationsRan) {
   cancelRetention = startRetentionScheduler();
+  cancelTransactionReceiptPolling = startTransactionReceiptPollingScheduler();
+  cancelWebhookRetryScheduler = startWebhookRetryScheduler();
 }
 
 // ─── Redis + auth store initialization (non-blocking) ───────────────────────
@@ -179,7 +197,7 @@ const BIND_HOST = process.env.STEWARD_BIND_HOST || "127.0.0.1";
 const serverOptions = {
   hostname: BIND_HOST,
   port: PORT,
-  fetch: (request: Request) => app.fetch(request),
+  fetch: (request: Request) => runtimeGate(request) ?? app.fetch(request),
   idleTimeout: 30,
 } as Parameters<typeof Bun.serve>[0] & { hostname?: string };
 
@@ -194,6 +212,8 @@ const shutdown = async (signal: string) => {
   clearInterval(requestLogCleanupTimer);
   if (nonceCleanupTimer) clearInterval(nonceCleanupTimer);
   if (cancelRetention) cancelRetention();
+  if (cancelTransactionReceiptPolling) cancelTransactionReceiptPolling();
+  if (cancelWebhookRetryScheduler) cancelWebhookRetryScheduler();
   requestLog.clear();
 
   try {

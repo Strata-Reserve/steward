@@ -5,14 +5,17 @@
 // no third-party infra. Master password is fixed for determinism; the
 // underlying KeyStore still adds per-record IV + salt randomness.
 
-import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 
-import { getDb, tenants } from "@stwd/db";
+import { agentWallets, eq, getDb, policies, tenants } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { Vault } from "../vault";
 
 const MASTER_PASSWORD = "test-vault-venue-scope";
 const TENANT_ID = "test-tenant";
+
+setDefaultTimeout(30000);
 
 const openClients: Array<{ close: () => Promise<void> }> = [];
 
@@ -47,6 +50,56 @@ describe("Vault venue scoping (Sprint 4 Day 1)", () => {
       await client.close().catch(() => {});
     }
     openClients.length = 0;
+  });
+
+  test("provisionVenueWallet creates a venue wallet with all default policies enabled", async () => {
+    await vault.createAgent(TENANT_ID, "sol", "Sol");
+
+    const result = await vault.provisionVenueWallet({
+      tenantId: TENANT_ID,
+      agentId: "sol",
+      venue: "hyperliquid",
+      chainFamily: "evm",
+      approvedAddresses: ["0x1111111111111111111111111111111111111111"],
+    });
+
+    expect(result.address).toMatch(/^0x[0-9a-fA-F]{40}$/);
+
+    const walletRows = await getDb()
+      .select()
+      .from(agentWallets)
+      .where(eq(agentWallets.agentId, "sol"));
+    expect(
+      walletRows.some(
+        (row) =>
+          row.address === result.address &&
+          row.chainFamily === "evm" &&
+          row.venue === "hyperliquid",
+      ),
+    ).toBe(true);
+
+    const policyRows = await getDb().select().from(policies).where(eq(policies.agentId, "sol"));
+    const venuePolicies = policyRows.filter((row) =>
+      ["leverage-cap", "venue-allowlist", "spending-limit", "approved-addresses"].includes(
+        row.type,
+      ),
+    );
+
+    expect(venuePolicies).toHaveLength(4);
+    expect(venuePolicies.every((row) => row.enabled)).toBe(true);
+    expect(venuePolicies.map((row) => row.type).sort()).toEqual(
+      ["approved-addresses", "leverage-cap", "spending-limit", "venue-allowlist"].sort(),
+    );
+
+    const venueAllowlist = venuePolicies.find((row) => row.type === "venue-allowlist");
+    expect(venueAllowlist?.enabled).toBe(true);
+    expect(venueAllowlist?.config).toEqual({ allowedVenues: ["hyperliquid"] });
+
+    const approvedAddresses = venuePolicies.find((row) => row.type === "approved-addresses");
+    expect(approvedAddresses?.config).toEqual({
+      addresses: ["0x1111111111111111111111111111111111111111"],
+      mode: "whitelist",
+    });
   });
 
   test("createWallet provisions a venue-scoped EVM wallet and returns the address", async () => {
@@ -227,5 +280,21 @@ describe("Vault venue scoping (Sprint 4 Day 1)", () => {
     expect(Object.keys(wallet).sort()).toEqual(
       ["address", "agentId", "chainFamily", "purpose", "venue"].sort(),
     );
+  });
+
+  test("importKey stores normalized EVM keys when callers omit 0x", async () => {
+    await vault.createAgent(TENANT_ID, "import-agent", "Import Agent");
+    const privateKey = generatePrivateKey();
+    const barePrivateKey = privateKey.slice(2);
+
+    const imported = await vault.importKey(TENANT_ID, "import-agent", barePrivateKey, "evm");
+    const exported = await vault.exportPrivateKey(TENANT_ID, "import-agent", {
+      breakGlass: true,
+      actorId: "test-actor",
+      reason: "venue-scoping unit test: verify imported key round-trips",
+    });
+
+    expect(imported.walletAddress).toBe(privateKeyToAccount(privateKey).address);
+    expect(exported.evm?.privateKey).toBe(privateKey);
   });
 });

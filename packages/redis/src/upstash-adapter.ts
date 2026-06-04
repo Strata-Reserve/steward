@@ -29,7 +29,15 @@ export interface IoredisLike {
   // Strings
   set(key: string, value: string): Promise<string | null>;
   set(key: string, value: string, mode: "PX", ttlMs: number): Promise<string | null>;
+  set(
+    key: string,
+    value: string,
+    mode: "PX",
+    ttlMs: number,
+    condition: "NX",
+  ): Promise<string | null>;
   get(key: string): Promise<string | null>;
+  getdel(key: string): Promise<string | null>;
   del(...keys: string[]): Promise<number>;
   setex(key: string, ttlSeconds: number, value: string): Promise<string>;
   expire(key: string, ttlSeconds: number): Promise<number>;
@@ -56,6 +64,9 @@ export interface IoredisLike {
     count: "COUNT",
     countValue: number,
   ): Promise<[string, string[]]>;
+
+  // Scripting
+  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
 
   // Pipeline / transaction
   multi(): IoredisPipelineLike;
@@ -157,9 +168,17 @@ class UpstashPipeline implements IoredisPipelineLike {
 export function createUpstashIoredisAdapter(upstash: UpstashRedis): IoredisLike {
   return {
     // Strings
-    async set(key: string, value: string, mode?: "PX", ttlMs?: number): Promise<string | null> {
+    async set(
+      key: string,
+      value: string,
+      mode?: "PX",
+      ttlMs?: number,
+      condition?: "NX",
+    ): Promise<string | null> {
       if (mode === "PX" && typeof ttlMs === "number") {
-        return upstash.set(key, value, { px: ttlMs });
+        return condition === "NX"
+          ? upstash.set(key, value, { px: ttlMs, nx: true })
+          : upstash.set(key, value, { px: ttlMs });
       }
       return upstash.set(key, value);
     },
@@ -172,6 +191,26 @@ export function createUpstashIoredisAdapter(upstash: UpstashRedis): IoredisLike 
       // policy-cache double-parses, treats the value as corrupted, and deletes
       // the entry, defeating the cache under the Upstash driver.
       const raw = (await upstash.get<unknown>(key)) as unknown;
+      if (raw === null || raw === undefined) return null;
+      if (typeof raw === "string") return raw;
+      try {
+        return JSON.stringify(raw);
+      } catch {
+        return null;
+      }
+    },
+
+    async getdel(key: string): Promise<string | null> {
+      // Upstash supports GETDEL natively, preserving the atomic
+      // read-and-delete that one-time-token consumption relies on.
+      //
+      // Apply the same normalization as get(): Upstash auto-deserializes any
+      // value that looks like JSON, but our callers store values as strings
+      // and JSON.parse them themselves (e.g. consumeSiweNonce does
+      // JSON.parse(raw)). If we returned the deserialized object, the caller's
+      // JSON.parse would coerce it to "[object Object]" and silently lose the
+      // record. Normalizing back to a string keeps the round-trip intact.
+      const raw = (await upstash.getdel<unknown>(key)) as unknown;
       if (raw === null || raw === undefined) return null;
       if (typeof raw === "string") return raw;
       try {
@@ -263,6 +302,15 @@ export function createUpstashIoredisAdapter(upstash: UpstashRedis): IoredisLike 
     ): Promise<[string, string[]]> {
       const [next, keys] = await upstash.scan(cursor, { match: pattern, count: countValue });
       return [String(next), keys];
+    },
+
+    // Scripting — Upstash runs EVAL server-side, preserving the atomicity the
+    // rate-limiter/spend-tracker scripts rely on. ioredis takes positional
+    // (numKeys, ...keysThenArgs); Upstash takes (script, keys[], args[]).
+    async eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown> {
+      const keys = args.slice(0, numKeys).map(String);
+      const argv = args.slice(numKeys).map(String);
+      return upstash.eval(script, keys, argv);
     },
 
     // Pipeline / transaction

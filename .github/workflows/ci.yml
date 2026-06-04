@@ -4,6 +4,11 @@ on:
   push:
     branches: [develop, main]
 
+# Least-privilege default for all jobs. CI only lints/tests; nothing needs
+# write access. Escalate per-job if that ever changes.
+permissions:
+  contents: read
+
 jobs:
   ci:
     name: Lint + Typecheck
@@ -164,8 +169,14 @@ jobs:
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
           STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          # The whole api suite drives this one server from a single IP; the
+          # default 100-req/60s per-IP gate 429s the sharded test flood.
+          STEWARD_RATE_LIMIT_MAX_REQUESTS: "1000000"
         run: |
           bun run packages/api/src/index.ts > /tmp/steward-api-integration.log 2>&1 &
           echo $! > /tmp/steward-api-integration.pid
@@ -179,14 +190,30 @@ jobs:
           exit 1
 
       - name: Integration tests (API)
-        run: bun test --isolate packages/api
+        # ~57 of the api test files force an in-memory PGLite (a WASM Postgres) in
+        # their own beforeAll even though DATABASE_URL points at real Postgres.
+        # `bun test --isolate` runs every file in ONE process (it only gives each
+        # file a fresh global object, not a fresh process), so those WASM heaps
+        # accumulate and SIGKILL the 7GB runner (exit 137) around file ~140.
+        # run-tests-isolated.ts spawns a fresh `bun test` process PER FILE, so
+        # peak memory is bounded by TEST_JOBS concurrent files (not the suite
+        # size) and each process frees its WASM heap on exit. Reproduced in a
+        # 6GB-capped Linux container: the single `--isolate` process is killed
+        # at exit 137; a 6-way --shard split still OOMs (25 files/shard is too
+        # much); this runner at TEST_JOBS=2 finishes the full suite with zero
+        # OOM in ~2.3min. TEST_TIMEOUT=30000 absorbs per-file PGLite migration
+        # latency.
+        run: TEST_JOBS=2 TEST_TIMEOUT=30000 bun packages/api/scripts/run-tests-isolated.ts
         env:
           DATABASE_URL: "postgres://steward:steward_ci@localhost:5432/steward_test"
           PORT: "3299"
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
           STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
 
       - name: Stop API test server
@@ -230,8 +257,12 @@ jobs:
           STEWARD_BIND_HOST: "127.0.0.1"
           STEWARD_PGLITE_PATH: "/tmp/steward-fi-e2e-pglite"
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
+          STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
         run: |
           bun run start:local > /tmp/steward-fi-e2e.log 2>&1 &
@@ -285,11 +316,19 @@ jobs:
           POSTGRES_USER: "steward"
           POSTGRES_PASSWORD: "steward_ci"
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
+          STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
           STEWARD_AUDIT_HMAC_KEY: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
           STEWARD_KDF_SALT: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           STEWARD_ALLOW_INSECURE_DB: "true"
+          # Run the stack in non-prod mode for the functional e2e flow: the e2e
+          # script doesn't sign request-expiry / authorization-signature headers,
+          # which are enforced only when NODE_ENV=production (covered by unit tests).
+          NODE_ENV: "test"
+          STEWARD_ALLOW_STALE_SENSITIVE_REQUESTS: "true"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
           PORT: "3200"
           STEWARD_PROXY_PORT: "8080"
@@ -318,6 +357,7 @@ jobs:
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
           STEWARD_KDF_SALT: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           POSTGRES_DB: "steward_test"
           POSTGRES_USER: "steward"
