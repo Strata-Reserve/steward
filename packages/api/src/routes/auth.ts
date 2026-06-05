@@ -988,21 +988,117 @@ async function ensureUserTenantLink(
 async function provisionWalletForUser(
   userId: string,
   email: string,
+  opts?: { updateWalletAddress?: boolean },
 ): Promise<{ walletAddress: string; personalTenantId: string }> {
   const personalTenantId = await ensurePersonalTenant(userId, email);
   const vault = getVault();
   const result = await provisionUserWallet(vault, userId, email, personalTenantId);
   const db = getDb();
+  // For email/passkey/oauth users, `users.walletAddress` IS their identity and
+  // is set to the personal wallet. For third-party-wallet (SIWE/SIWS) users the
+  // `walletAddress` column is the LOOKUP KEY (the raw third-party credential) used
+  // by `findOrCreateWalletUser` on every subsequent login, so it MUST NOT be
+  // overwritten — doing so would orphan the row on the next login and re-split
+  // the identity. We still record `stewardWalletId` so the personal wallet is
+  // discoverable.
+  const updateWalletAddress = opts?.updateWalletAddress ?? true;
   await db
     .update(users)
     .set({
-      walletAddress: result.walletAddress,
+      ...(updateWalletAddress ? { walletAddress: result.walletAddress } : {}),
       stewardWalletId: result.agentId,
     })
     .where(eq(users.id, userId));
   // Also link user to their personal tenant
   await ensureUserTenantLink(userId, personalTenantId, "owner");
   return { walletAddress: result.walletAddress, personalTenantId };
+}
+
+// ─── Canonical session identity helpers ───────────────────────────────────────
+//
+// The Steward session token SUBJECT is the `address` claim. Downstream
+// consumers (e.g. Strata's tokenization backend) key a human's Party identity
+// on this subject and hash it into a stable `actor_id`. The subject MUST
+// therefore be STABLE for the same human across login methods and across
+// repeated logins via the same method — otherwise the human is orphaned from
+// their Party on re-login.
+//
+// The canonical subject for a user row is that user's Steward-managed personal
+// wallet (`provisionUserWallet`, keyed on the stable `user.id` via
+// `agentIdFor(userId)`). It is idempotent: the same `user.id` always resolves
+// to the same address, returning the existing wallet on "already exists". Email
+// and passkey paths already route through this. The wallet/SIWE/SIWS paths
+// historically minted the RAW external credential address as the subject, which
+// (a) is a different namespace from the personal wallet and (b) is tied to a
+// distinct `email: null` user row, splitting one human into two identities.
+//
+// `resolveSessionSubject` collapses every human login path onto the canonical
+// personal-wallet subject for the resolved user row. It NEVER merges two
+// distinct user rows — it only ensures a single user row has ONE stable subject.
+
+/**
+ * Resolve the canonical, stable session subject for an EXTERNAL-WALLET user row
+ * (SIWE / SIWS). These rows store the RAW third-party credential in
+ * `users.walletAddress` because it is the lookup key for `findOrCreateWalletUser`
+ * on every subsequent login — so the raw address must NOT be used as the subject
+ * (it lives in a different namespace from the personal wallet) and must NOT be
+ * overwritten.
+ *
+ * Instead we provision the user's Steward-managed personal wallet idempotently
+ * (keyed on the stable `user.id` via `agentIdFor(userId)`) and use ITS address
+ * as the subject. Because provisioning is idempotent per `user.id`, the SAME
+ * user row yields the SAME subject on every future login — fixing the rotation
+ * — while the lookup key (`walletAddress`) is preserved so the row keeps
+ * resolving to the same `user.id`.
+ *
+ * Fails closed for AVAILABILITY only: if vault provisioning is unavailable we
+ * fall back to the raw credential address so the user can still authenticate.
+ * This fallback is the legacy behaviour and is the only case where the subject
+ * is non-canonical; it never crosses identities (still scoped to this one
+ * user.id / credential).
+ *
+ * @param user             The resolved third-party-wallet user row.
+ * @param fallbackAddress  Raw third-party credential address (lookup key), used
+ *                         only if personal-wallet provisioning fails.
+ */
+async function resolveExternalWalletSubject(
+  user: typeof users.$inferSelect,
+  fallbackAddress: string,
+): Promise<string> {
+  // A non-empty, stable display name for provisioning. Wallet users have no
+  // email; derive a deterministic label from the credential.
+  const displayName = user.email ?? `wallet:${fallbackAddress}`;
+  try {
+    const { walletAddress } = await provisionWalletForUser(user.id, displayName, {
+      updateWalletAddress: false,
+    });
+    if (walletAddress) return walletAddress;
+  } catch (err) {
+    console.error("[Auth] resolveExternalWalletSubject: wallet provision failed:", err);
+  }
+  return fallbackAddress;
+}
+
+/**
+ * Build the identity claims embedded in a human session token.
+ *
+ * Always includes `userId`. Includes a `email` + `emailVerified: true` pair
+ * ONLY when the user row has a verified email. This lets downstream activation
+ * trust the email as a verified bridge for the human's Party WITHOUT ever
+ * embedding an unverified or absent email (fail-closed: no verified email →
+ * no email claim, downstream stays conservative).
+ *
+ * SECURITY: never embed an email that is not `emailVerified === true`. This is
+ * what prevents a wallet-only login (email: null) or an unverified-email row
+ * from impersonating a verified human's email-keyed identity downstream.
+ */
+export function buildIdentityClaims(user: typeof users.$inferSelect): Record<string, unknown> {
+  const claims: Record<string, unknown> = { userId: user.id };
+  if (user.email && user.emailVerified === true) {
+    claims.email = user.email;
+    claims.emailVerified = true;
+  }
+  return claims;
 }
 
 // ─── Request body helper ──────────────────────────────────────────────────────
@@ -1050,10 +1146,12 @@ async function completeEmailAuth(
   const { tenantId: resolvedTenantId } = tenantResult;
   await ensureUserTenantLink(user.id, resolvedTenantId);
 
-  const token = await createSessionToken(walletAddress ?? "", resolvedTenantId, {
-    userId: user.id,
-    email,
-  });
+  // `emailVerified` was just set true above; reflect that for claim building.
+  const token = await createSessionToken(
+    walletAddress ?? "",
+    resolvedTenantId,
+    buildIdentityClaims({ ...user, email, emailVerified: true }),
+  );
   const refreshToken = await createRefreshToken(user.id, resolvedTenantId);
 
   return {
@@ -1267,9 +1365,12 @@ auth.post("/verify", async (c) => {
     effectiveTenantId === tenantResult.tenant.id ? "owner" : "member",
   );
 
-  const token = await createSessionToken(address, effectiveTenantId, {
-    userId: user.id,
-  });
+  // Stable subject: route this wallet user onto their canonical personal
+  // wallet so the subject does not rotate across logins. Embed the verified
+  // email only if this same user row happens to carry one (it normally does
+  // not for a pure wallet user — email stays absent, fail-closed).
+  const subject = await resolveExternalWalletSubject(user, address);
+  const token = await createSessionToken(subject, effectiveTenantId, buildIdentityClaims(user));
   const refreshToken = await createRefreshToken(user.id, effectiveTenantId);
 
   const responseData: Record<string, unknown> = {
@@ -1371,9 +1472,11 @@ auth.post("/verify/solana", async (c) => {
     effectiveTenantId === tenantResult.tenant.id ? "owner" : "member",
   );
 
-  const token = await createSessionToken(body.publicKey, effectiveTenantId, {
-    userId: user.id,
-  });
+  // Stable subject: same canonicalization as SIWE. The descriptive `address`
+  // / `publicKey` fields below still report the Solana credential; only the
+  // token SUBJECT is canonicalized so it never rotates across logins.
+  const subject = await resolveExternalWalletSubject(user, body.publicKey);
+  const token = await createSessionToken(subject, effectiveTenantId, buildIdentityClaims(user));
   const refreshToken = await createRefreshToken(user.id, effectiveTenantId);
 
   const responseData: Record<string, unknown> = {
@@ -1464,14 +1567,26 @@ auth.post("/refresh", async (c) => {
 
   // Fetch user for token claims
   const [user] = await db.select().from(users).where(eq(users.id, record.userId));
-  const walletAddress = user?.walletAddress ?? "";
-  const email = user?.email ?? undefined;
 
-  // Issue new access token (15min)
-  const newAccessToken = await createSessionToken(walletAddress, record.tenantId, {
-    userId: record.userId,
-    ...(email ? { email } : {}),
-  });
+  // Reproduce the SAME subject the original login minted, so the subject is
+  // stable across refreshes (regression guard for the rotation bug):
+  //  - email/passkey/oauth users: `walletAddress` IS the canonical personal
+  //    wallet → use it directly.
+  //  - third-party-wallet (SIWE/SIWS) users: `walletAddress` is the raw lookup key
+  //    and the login subject is the personal wallet → resolve canonically.
+  //    These rows are identified by `email === null` (we never auto-link an
+  //    email onto a wallet row).
+  let subject = user?.walletAddress ?? "";
+  if (user && !user.email) {
+    subject = await resolveExternalWalletSubject(user, user.walletAddress ?? "");
+  }
+
+  // Issue new access token (24h). Embed verified email only (fail-closed).
+  const newAccessToken = await createSessionToken(
+    subject,
+    record.tenantId,
+    user ? buildIdentityClaims(user) : { userId: record.userId },
+  );
 
   // Issue new refresh token (rotation)
   const newRefreshToken = await createRefreshToken(record.userId, record.tenantId);
@@ -1660,10 +1775,12 @@ auth.post("/passkey/register/verify", async (c) => {
   const { tenantId } = tenantResult;
   await ensureUserTenantLink(user.id, tenantId);
 
-  const token = await createSessionToken(walletAddress ?? "", tenantId, {
-    userId: user.id,
-    email,
-  });
+  // emailVerified was set true above on register; embed the verified email.
+  const token = await createSessionToken(
+    walletAddress ?? "",
+    tenantId,
+    buildIdentityClaims({ ...user, email, emailVerified: true }),
+  );
   const registerRefreshToken = await createRefreshToken(user.id, tenantId);
 
   return c.json(
@@ -1822,10 +1939,12 @@ auth.post("/passkey/login/verify", async (c) => {
   const { tenantId } = tenantResult;
   await ensureUserTenantLink(user.id, tenantId);
 
-  const token = await createSessionToken(walletAddress ?? "", tenantId, {
-    userId: user.id,
-    email,
-  });
+  // Passkey login implies a verified email-keyed account; embed verified email.
+  const token = await createSessionToken(
+    walletAddress ?? "",
+    tenantId,
+    buildIdentityClaims({ ...user, email, emailVerified: true }),
+  );
   const loginRefreshToken = await createRefreshToken(user.id, tenantId);
 
   return c.json(
@@ -2322,10 +2441,14 @@ async function provisionOAuthUser(opts: {
     await ensureUserTenantLink(user.id, resolvedTenantId);
 
     // 5. Mint JWT + refresh token
-    const token = await createSessionToken(walletAddress ?? "", resolvedTenantId, {
-      userId: user.id,
-      email,
-    });
+    // Embed the email claim ONLY if the provider verified it (fail-closed):
+    // reflect the post-update emailVerified state computed above.
+    const emailVerified = user.emailVerified || providerUser.verified_email === true;
+    const token = await createSessionToken(
+      walletAddress ?? "",
+      resolvedTenantId,
+      buildIdentityClaims({ ...user, email, emailVerified }),
+    );
     const oauthRefreshToken = await createRefreshToken(user.id, resolvedTenantId);
 
     return {
