@@ -148,8 +148,36 @@ describeWithDatabase("wallet auth flows", () => {
     expect(tenant?.id).toBe(json.tenant.id);
 
     const payload = decodeJwtPayload(json.token);
-    expect(payload.address).toBe(account.address.toLowerCase());
+    // Token SUBJECT is now the canonical personal wallet (stable per user.id),
+    // NOT the raw third-party credential. The raw address still appears in the
+    // response body (json.address) and remains the user-row lookup key.
     expect(payload.userId).toBe(user?.id);
+    expect(typeof payload.address).toBe("string");
+    expect((payload.address as string).length).toBeGreaterThan(0);
+    expect(payload.address).not.toBe(account.address.toLowerCase());
+    // Wallet-only user: no verified email → no email claim (fail-closed).
+    expect(payload.email).toBeUndefined();
+    expect(payload.emailVerified).toBeUndefined();
+    // Personal wallet was provisioned (stewardWalletId recorded) but the
+    // lookup key (walletAddress) was NOT overwritten.
+    expect(user?.stewardWalletId).toBeTruthy();
+    expect(user?.walletAddress).toBe(account.address.toLowerCase());
+
+    // Stability regression: a SECOND login by the same wallet yields the SAME
+    // subject (the rotation bug fix).
+    const nonce2 = await fetchNonce();
+    const message2 = buildSiweMessage(account.address, nonce2);
+    const signature2 = await account.signMessage({ message: message2 });
+    const res2 = await fetch(`${BASE_URL}/auth/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: message2, signature: signature2 }),
+    });
+    expect(res2.status).toBe(200);
+    const json2 = (await res2.json()) as VerifyResponse;
+    const payload2 = decodeJwtPayload(json2.token);
+    expect(payload2.userId).toBe(payload.userId);
+    expect(payload2.address).toBe(payload.address);
   });
 
   it("rejects SIWS messages whose signed domain is not on the allowlist", async () => {
@@ -218,7 +246,9 @@ describeWithDatabase("wallet auth flows", () => {
       expect(json.address).toBe(account.address.toLowerCase());
 
       const payload = decodeJwtPayload(json.token);
-      expect(payload.address).toBe(account.address.toLowerCase());
+      // Subject is the canonical personal wallet, not the raw signer address.
+      expect(typeof payload.address).toBe("string");
+      expect(payload.address).not.toBe(account.address.toLowerCase());
     });
   }
 
@@ -257,7 +287,14 @@ describeWithDatabase("wallet auth flows", () => {
     expect(tenant?.id).toBe(`solana:${SOLANA_TEST_KEYPAIR.publicKey}`);
 
     const payload = decodeJwtPayload(json.token);
-    expect(payload.address).toBe(SOLANA_TEST_KEYPAIR.publicKey);
+    // Subject is the canonical personal wallet (stable per user.id), not the
+    // raw Solana public key (which still appears in json.address/publicKey).
     expect(payload.userId).toBe(user?.id);
+    expect(typeof payload.address).toBe("string");
+    expect(payload.address).not.toBe(SOLANA_TEST_KEYPAIR.publicKey);
+    expect(payload.email).toBeUndefined();
+    expect(user?.stewardWalletId).toBeTruthy();
+    // Lookup key preserved.
+    expect(user?.walletAddress).toBe(SOLANA_TEST_KEYPAIR.publicKey);
   });
 });
