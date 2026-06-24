@@ -84,6 +84,10 @@ import { generateNonce, SiweMessage } from "siwe";
 import { getAddress, verifyMessage as viemVerifyMessage } from "viem";
 import { trackAuditEvent } from "../services/audit";
 import { verifyEip1271 } from "../services/eip1271";
+import {
+  getGracedSuccessor,
+  rememberRotation,
+} from "../services/refresh-rotation-grace";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1755,8 +1759,25 @@ auth.post("/refresh", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "refreshToken is required" }, 400);
   }
 
+  // Hash once: used both to consume the row and to key rotation-grace lookups.
+  const presentedHash = hashToken(body.refreshToken);
+
   const record = await consumeRefreshToken(body.refreshToken);
   if (!record) {
+    // The row is gone — but this may be a CONCURRENT/retried refresh of a token
+    // that was rotated microseconds ago by a sibling tab/request, not a genuine
+    // logout. If we minted a successor for this exact token within the grace
+    // window, hand back the SAME successor so the race is idempotent and the
+    // session survives. (See services/refresh-rotation-grace.ts.)
+    const graced = getGracedSuccessor(presentedHash);
+    if (graced) {
+      return c.json({
+        ok: true,
+        token: graced.token,
+        refreshToken: graced.refreshToken,
+        expiresIn: graced.expiresIn,
+      });
+    }
     return c.json<ApiResponse>({ ok: false, error: "Invalid or expired refresh token" }, 401);
   }
 
@@ -1787,6 +1808,16 @@ auth.post("/refresh", async (c) => {
 
   // Issue new refresh token (rotation)
   const newRefreshToken = await createRefreshToken(record.userId, record.tenantId);
+
+  // Remember this successor keyed by the OLD token hash, so a concurrent /
+  // retried refresh of the same token (which already lost the consume race)
+  // is served this exact successor instead of a 401-logout, for a short grace
+  // window. Idempotent under races.
+  rememberRotation(presentedHash, {
+    token: newAccessToken,
+    refreshToken: newRefreshToken,
+    expiresIn: ACCESS_TOKEN_EXPIRY_SECONDS,
+  });
 
   return c.json({
     ok: true,
