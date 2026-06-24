@@ -176,10 +176,16 @@ export class PostgresBackend implements StoreBackend {
   async set(key: string, value: string, ttlMs: number): Promise<void> {
     await this.ensureTable();
     const db = getDb();
-    const expiresAt = new Date(Date.now() + ttlMs);
+    // Bind expires_at as an explicit ISO-8601 STRING cast to timestamptz, rather
+    // than passing a JS Date object as a bind parameter. Passing a Date binds
+    // inconsistently across the postgres-js / neon-http drivers on some runtimes
+    // (observed in prod: the parameterised INSERT failed at the driver layer,
+    // collapsing the whole store to the in-memory fallback). A string + explicit
+    // ::timestamptz cast is unambiguous everywhere.
+    const expiresAtIso = new Date(Date.now() + ttlMs).toISOString();
     await db.execute(sql`
       INSERT INTO auth_kv_store (id, namespace, value, expires_at)
-      VALUES (${key}, ${this.namespace}, ${value}, ${expiresAt})
+      VALUES (${key}, ${this.namespace}, ${value}, ${expiresAtIso}::timestamptz)
       ON CONFLICT (id, namespace) DO UPDATE
         SET value      = EXCLUDED.value,
             expires_at = EXCLUDED.expires_at
