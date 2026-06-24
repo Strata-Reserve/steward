@@ -12,7 +12,7 @@
  * constructors.  Neither store cares which backend it uses.
  */
 
-import { getSql } from "@stwd/db";
+import { getDb, sql } from "@stwd/db";
 
 // ─── Interface ────────────────────────────────────────────────────────────────
 
@@ -130,8 +130,18 @@ export class RedisBackend implements StoreBackend {
  * so no manual migration is strictly required — but the numbered SQL migration
  * in packages/db/drizzle/ is preferred for production deployments.
  *
- * Uses the postgres-js client (getSql()) for raw parameterised queries so that
- * this package does not need a direct drizzle-orm dependency.
+ * Uses the shared Drizzle client (getDb().execute(sql`...`)) for all queries.
+ *
+ * NOTE (2026-06-24): this previously used the raw postgres-js tagged-template
+ * client via getSql(). On the prod runtime that path threw "The string argument
+ * must be of type string" on the very first parameterised write, so EVERY auth
+ * store (token / challenge / siwe-nonce) silently fell back to in-memory —
+ * meaning every Steward restart/redeploy wiped all in-flight auth state
+ * (challenges, nonces, tokens), contributing to logouts and login failures.
+ * The Drizzle `db.execute(sql`...`)` path is the SAME one migrations and the
+ * /ready healthcheck use successfully, so routing through it makes the Postgres
+ * backend actually engage. Drizzle's `sql` tag handles param serialisation
+ * (incl. Date) reliably across the postgres-js and neon-http drivers.
  *
  * Expired rows are cleaned up lazily on read.
  */
@@ -144,14 +154,10 @@ export class PostgresBackend implements StoreBackend {
    */
   constructor(private readonly namespace: string) {}
 
-  private getSqlClient() {
-    return getSql();
-  }
-
   private async ensureTable(): Promise<void> {
     if (this.initialized) return;
-    const sql = this.getSqlClient();
-    await sql`
+    const db = getDb();
+    await db.execute(sql`
       CREATE TABLE IF NOT EXISTS auth_kv_store (
         id          TEXT        NOT NULL,
         namespace   TEXT        NOT NULL,
@@ -159,50 +165,64 @@ export class PostgresBackend implements StoreBackend {
         expires_at  TIMESTAMPTZ NOT NULL,
         PRIMARY KEY (id, namespace)
       )
-    `;
-    await sql`
+    `);
+    await db.execute(sql`
       CREATE INDEX IF NOT EXISTS auth_kv_store_expires_idx
         ON auth_kv_store (expires_at)
-    `;
+    `);
     this.initialized = true;
   }
 
   async set(key: string, value: string, ttlMs: number): Promise<void> {
     await this.ensureTable();
-    const sql = this.getSqlClient();
+    const db = getDb();
     const expiresAt = new Date(Date.now() + ttlMs);
-    await sql`
+    await db.execute(sql`
       INSERT INTO auth_kv_store (id, namespace, value, expires_at)
       VALUES (${key}, ${this.namespace}, ${value}, ${expiresAt})
       ON CONFLICT (id, namespace) DO UPDATE
         SET value      = EXCLUDED.value,
             expires_at = EXCLUDED.expires_at
-    `;
+    `);
   }
 
   async get(key: string): Promise<string | null> {
     await this.ensureTable();
-    const sql = this.getSqlClient();
-    const rows = await sql<Array<{ value: string }>>`
+    const db = getDb();
+    const result = await db.execute(sql`
       SELECT value
         FROM auth_kv_store
        WHERE id        = ${key}
          AND namespace = ${this.namespace}
          AND expires_at > now()
        LIMIT 1
-    `;
+    `);
+    const rows = extractRows<{ value: string }>(result);
     return rows[0]?.value ?? null;
   }
 
   async delete(key: string): Promise<void> {
     await this.ensureTable();
-    const sql = this.getSqlClient();
-    await sql`
+    const db = getDb();
+    await db.execute(sql`
       DELETE FROM auth_kv_store
        WHERE id        = ${key}
          AND namespace = ${this.namespace}
-    `;
+    `);
   }
+}
+
+/**
+ * Normalise `db.execute()` results across drivers. The postgres-js Drizzle
+ * driver returns the rows array directly; the neon-http driver returns a
+ * `{ rows }` shape. This reads rows from either without assuming a driver.
+ */
+function extractRows<T>(result: unknown): T[] {
+  if (Array.isArray(result)) return result as T[];
+  if (result && typeof result === "object" && Array.isArray((result as { rows?: unknown }).rows)) {
+    return (result as { rows: T[] }).rows;
+  }
+  return [];
 }
 
 // ─── Backend factory helper ───────────────────────────────────────────────────
