@@ -142,6 +142,10 @@ import {
   verifyCaptchaToken,
 } from "../services/auth-abuse";
 import { verifyEip1271 } from "../services/eip1271";
+import {
+  getGracedSuccessor,
+  rememberRotation,
+} from "../services/refresh-rotation-grace";
 import { buildSamlServiceProviderUrls } from "../services/saml-sso-config";
 import { lockUserSession } from "../services/session-lock";
 import { testAccountOtpMatches } from "../services/test-account-credentials";
@@ -7286,6 +7290,37 @@ auth.post("/refresh", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "refreshToken is required" }, 400);
   }
 
+  // Hash once: keys rotation-grace lookups (see services/refresh-rotation-grace.ts).
+  const presentedHash = hashToken(body.refreshToken);
+
+  // Rotation-grace check BEFORE touching the DB. If this exact token was
+  // rotated within the grace window (~20s), this is a benign CONCURRENT /
+  // retried refresh — multiple tabs sharing one stored refresh token, a tab
+  // waking from sleep firing scheduler + 401-retry refreshes, parallel API
+  // calls crossing the staleness boundary — NOT token theft. Hand back the
+  // SAME successor the winning request already received, so N concurrent
+  // refreshes converge on ONE successor and nobody is logged out.
+  //
+  // Ordering note (differs from the original fork patch, on purpose):
+  // upstream rotateRefreshTokenForUserSession() performs reuse DETECTION AND
+  // destructive revocation (deletes all the user's refresh rows) when it
+  // sees an already-consumed hash. Checking grace after that call would be
+  // too late — the benign race would revoke every session, including the
+  // graced successor. Grace-hit therefore short-circuits here with no DB
+  // write; grace-miss falls through to full upstream semantics, reuse
+  // detection included. Security posture matches the original patch: window
+  // is small (default 20s), bound to the exact prior token hash, and only
+  // ever returns the successor the legitimate client already holds.
+  const graced = getGracedSuccessor(presentedHash);
+  if (graced) {
+    return c.json({
+      ok: true,
+      token: graced.token,
+      refreshToken: graced.refreshToken,
+      expiresIn: graced.expiresIn,
+    });
+  }
+
   const rotatedRefresh = await rotateRefreshTokenForUserSession(body.refreshToken);
   if (rotatedRefresh.status === "reused") {
     const { issuedBefore: revokedBefore } = await revokeUserRefreshSessions(rotatedRefresh.userId);
@@ -7340,6 +7375,16 @@ auth.post("/refresh", async (c) => {
     throw err;
   }
   dispatchUserAuthenticated(record.tenantId, record.userId, "refresh");
+
+  // Remember this successor keyed by the OLD token hash, so a concurrent /
+  // retried refresh of the same token (which already lost the consume race)
+  // is served this exact successor instead of a 401-logout, for a short grace
+  // window. Idempotent under races.
+  rememberRotation(presentedHash, {
+    token: newAccessToken,
+    refreshToken: newRefreshToken,
+    expiresIn: ACCESS_TOKEN_EXPIRY_SECONDS,
+  });
 
   return c.json({
     ok: true,
