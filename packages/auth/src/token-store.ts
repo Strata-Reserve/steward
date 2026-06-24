@@ -49,6 +49,19 @@ export class TokenStore {
   }
 
   /**
+   * Atomically read-and-delete a hash (single-use semantics).
+   * Returns the stored value if present and unexpired, else null.
+   * Used for one-time codes (e.g. email OTP) where verification must burn
+   * the entry so a code cannot be replayed.
+   */
+  async consume(hash: string): Promise<string | null> {
+    const value = await this.backend.get(hash);
+    if (value === null) return null;
+    await this.backend.delete(hash);
+    return value;
+  }
+
+  /**
    * Delete a hash from the store (called after one-time token consumption).
    */
   delete(hash: string): void {

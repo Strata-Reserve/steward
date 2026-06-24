@@ -107,16 +107,23 @@ const _DEFAULT_TENANT_ID = process.env.STEWARD_DEFAULT_TENANT_ID || "default";
  * @param endpoint - Short name used as part of the Redis key
  * @param windowMs - Window length in milliseconds
  * @param max      - Maximum allowed requests in the window
+ * @param identifier - Optional extra key component. When supplied, the limiter
+ *                     buckets on this value INSTEAD of the client IP (e.g. a
+ *                     per-{tenant,email} brute-force limiter for OTP verify that
+ *                     must hold regardless of source IP). When omitted the
+ *                     limiter buckets on IP as before.
  */
 async function checkAuthRateLimit(
   c: Context,
   endpoint: string,
   windowMs: number,
   max: number,
+  identifier?: string,
 ): Promise<{ allowed: boolean; retryAfterSecs?: number }> {
   const ip =
     c.req.header("x-forwarded-for")?.split(",")[0].trim() ?? c.req.header("x-real-ip") ?? "unknown";
-  const key = `ratelimit:auth:${endpoint}:${ip}:${windowMs}`;
+  const bucket = identifier ? `id:${identifier}` : ip;
+  const key = `ratelimit:auth:${endpoint}:${bucket}:${windowMs}`;
 
   try {
     const redisMw = await import("../middleware/redis.js");
@@ -291,6 +298,14 @@ async function consumeSiweNonce(nonce: string): Promise<boolean> {
 let _challengeStore: ChallengeStore | null = null;
 let _tokenStore: TokenStore | null = null;
 let _oauthCodeStore: ChallengeStore | null = null;
+let _emailGrantStore: ChallengeStore | null = null;
+
+/**
+ * Verified-email grants (Privy-style OTP signup) are short-lived: 5 minutes is
+ * long enough for the user to receive the code, type it, and complete a Touch
+ * ID ceremony, short enough that a leaked grant is useless soon after.
+ */
+const EMAIL_GRANT_TTL_MS = 5 * 60 * 1000;
 
 /**
  * One-time OAuth nonce-exchange codes (response_type=code) live for 60s —
@@ -336,6 +351,13 @@ export async function initAuthStores(usePostgres = false): Promise<void> {
     backend: challengeBackend,
     ttlMs: OAUTH_CODE_TTL_MS,
   });
+  // Reuse the challenge backend (Postgres/Redis when available) for the
+  // short-lived verified-email grants so they survive worker restarts and are
+  // shared across isolates. The 5-min TTL is enforced at write time.
+  _emailGrantStore = new ChallengeStore({
+    backend: challengeBackend,
+    ttlMs: EMAIL_GRANT_TTL_MS,
+  });
 
   // Reset singletons so they pick up the new stores on next use
   _passkeyAuth = null;
@@ -356,6 +378,67 @@ function getOAuthCodeStore(): ChallengeStore {
 function getTokenStore(): TokenStore {
   _tokenStore ??= new TokenStore();
   return _tokenStore;
+}
+
+function getEmailGrantStore(): ChallengeStore {
+  _emailGrantStore ??= new ChallengeStore({ ttlMs: EMAIL_GRANT_TTL_MS });
+  return _emailGrantStore;
+}
+
+// ─── Verified-email grants (Privy-style OTP signup) ────────────────────────────
+//
+// POST /email/otp/verify exchanges a correct 6-digit code for a short-lived,
+// single-use grant proving ownership of {email, tenantId}. The passkey
+// register endpoints accept this grant IN PLACE OF a session so a BRAND-NEW
+// user can go email → code → Touch ID without ever holding a session, while
+// keeping unverified registration (account pre-hijack / email squatting)
+// impossible: no inbox proof, no first passkey.
+
+function emailGrantKey(grant: string): string {
+  return `email-otp-grant:${hashSha256Hex(grant)}`;
+}
+
+/** Mint a single-use grant bound to {email, tenantId}; return the raw token. */
+async function issueEmailGrant(email: string, tenantId: string): Promise<string> {
+  const grantBytes = new Uint8Array(32);
+  crypto.getRandomValues(grantBytes);
+  const grant = uint8ArrayToBase64url(grantBytes);
+  getEmailGrantStore().set(emailGrantKey(grant), JSON.stringify({ email, tenantId }));
+  return grant;
+}
+
+/** Consume (single-use) a grant; true only if it matches {email, tenantId}. */
+async function consumeEmailGrant(
+  grant: string,
+  email: string,
+  tenantId: string,
+): Promise<boolean> {
+  if (!grant || grant.length > 256) return false;
+  const stored = await getEmailGrantStore().consume(emailGrantKey(grant));
+  if (!stored) return false;
+  try {
+    const payload = JSON.parse(stored) as { email?: string; tenantId?: string };
+    return payload.email === email && payload.tenantId === tenantId;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Peek (non-consuming) at a grant for the options phase. The grant is only
+ * CONSUMED at register/verify so a failed/cancelled WebAuthn ceremony does not
+ * burn the user's verification.
+ */
+async function peekEmailGrant(grant: string, email: string, tenantId: string): Promise<boolean> {
+  if (!grant || grant.length > 256) return false;
+  const stored = await getEmailGrantStore().get(emailGrantKey(grant));
+  if (!stored) return false;
+  try {
+    const payload = JSON.parse(stored) as { email?: string; tenantId?: string };
+    return payload.email === email && payload.tenantId === tenantId;
+  } catch {
+    return false;
+  }
 }
 
 let _passkeyAuth: PasskeyAuth | null = null;
@@ -1881,15 +1964,56 @@ auth.post("/passkey/register/options", async (c) => {
   const body = await safeJsonParse<{
     email: string;
     authenticatorAttachment?: "platform" | "cross-platform";
+    emailGrant?: string;
+    tenantId?: string;
   }>(c);
   if (!body?.email) {
     return c.json<ApiResponse>({ ok: false, error: "email is required" }, 400);
   }
 
   const email = body.email.toLowerCase().trim();
-  const user = await findOrCreateUser(email);
-
   const db = getDb();
+
+  // ── Anti-email-squatting gate ────────────────────────────────────────────
+  // A BRAND-NEW user (no row yet, or an unverified row with no credentials)
+  // must prove inbox ownership with a verified-email grant from
+  // /email/otp/verify before they can mint a first passkey. Otherwise an
+  // attacker could register a passkey against someone else's email and squat
+  // the account before the real owner ever signs up.
+  //
+  // An EXISTING verified user (or any user that already holds a credential)
+  // adding another passkey is allowed to proceed via the existing flow — a
+  // valid session bearer OR their already-verified state — so re-registration
+  // is never broken.
+  const [existingUser] = await db.select().from(users).where(eq(users.email, email));
+  const existingCredCount = existingUser
+    ? (
+        await db
+          .select({ credentialId: authenticators.credentialId })
+          .from(authenticators)
+          .where(eq(authenticators.userId, existingUser.id))
+      ).length
+    : 0;
+  const isBrandNew =
+    !existingUser || (existingUser.emailVerified === false && existingCredCount === 0);
+
+  if (isBrandNew) {
+    const resolvedTenantId =
+      c.req.header("X-Steward-Tenant")?.trim() || body.tenantId?.trim() || _DEFAULT_TENANT_ID;
+    const grant = c.req.header("X-Steward-Email-Grant")?.trim() || body.emailGrant?.trim();
+    // Peek (not consume): the grant is only burned at register/verify so a
+    // cancelled Touch ID prompt doesn't cost the user their verification.
+    const grantOk = grant ? await peekEmailGrant(grant, email, resolvedTenantId) : false;
+    if (!grantOk) {
+      return c.json<ApiResponse>(
+        { ok: false, error: "Email verification required before passkey registration" },
+        401,
+      );
+    }
+  }
+
+  const user = existingUser ?? (await findOrCreateUser(email));
+
   const existingCreds = await db
     .select({ credentialId: authenticators.credentialId })
     .from(authenticators)
@@ -1928,6 +2052,7 @@ auth.post("/passkey/register/verify", async (c) => {
     email: string;
     response: Record<string, unknown>;
     tenantId?: string;
+    emailGrant?: string;
   }>(c);
 
   if (!body?.email || !body?.response) {
@@ -1946,6 +2071,34 @@ auth.post("/passkey/register/verify", async (c) => {
       },
       404,
     );
+  }
+
+  // ── Anti-email-squatting gate (CONSUME phase) ───────────────────────────────
+  // A brand-new user (unverified, no credentials yet) must present a valid
+  // verified-email grant, which we CONSUME here so it is strictly single-use:
+  // a grant burned on a successful first registration can never be replayed.
+  // The options phase only PEEKed the grant, so a cancelled Touch ID ceremony
+  // left it intact for the retry that reaches this point.
+  const existingCredCount = (
+    await db
+      .select({ credentialId: authenticators.credentialId })
+      .from(authenticators)
+      .where(eq(authenticators.userId, user.id))
+  ).length;
+  const isBrandNew = user.emailVerified === false && existingCredCount === 0;
+  if (isBrandNew) {
+    const resolvedTenantId =
+      c.req.header("X-Steward-Tenant")?.trim() || body.tenantId?.trim() || _DEFAULT_TENANT_ID;
+    const grant = c.req.header("X-Steward-Email-Grant")?.trim() || body.emailGrant?.trim();
+    const grantOk = grant
+      ? await consumeEmailGrant(grant, email, resolvedTenantId)
+      : false;
+    if (!grantOk) {
+      return c.json<ApiResponse>(
+        { ok: false, error: "Email verification required before passkey registration" },
+        401,
+      );
+    }
   }
 
   let verification: Awaited<ReturnType<PasskeyAuth["verifyRegistration"]>>;
@@ -2294,6 +2447,109 @@ auth.post("/email/verify", async (c) => {
   }
 
   return c.json(buildAuthResponse(authResult.token, authResult.refreshToken, authResult.user));
+});
+
+// ── Email OTP (Privy-style verified-email signup) ────────────────────────────
+//
+// POST /auth/email/otp/send    — email a 6-digit one-time code.
+// POST /auth/email/otp/verify  — exchange a correct code for a short-lived,
+//                                single-use verified-email GRANT. The grant
+//                                unlocks passkey registration for that exact
+//                                {email, tenant} without a session, enabling
+//                                email → code → Touch ID signup while keeping
+//                                unverified registration (pre-hijack) closed.
+//
+// This path is ADDITIVE: it does not weaken or replace the magic-link
+// (/email/send → /email/verify) flow above.
+
+auth.post("/email/otp/send", async (c) => {
+  const rl = await checkAuthRateLimit(c, "email-otp-send", 60_000, 3);
+  if (!rl.allowed) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Too many requests. Please try again later." },
+      429,
+    );
+  }
+  const body = await safeJsonParse<{ email: string; tenantId?: string }>(c);
+  if (!body?.email) {
+    return c.json<ApiResponse>({ ok: false, error: "email is required" }, 400);
+  }
+
+  const email = body.email.toLowerCase().trim();
+  const resolvedTenantId = c.req.header("X-Steward-Tenant") || body.tenantId || _DEFAULT_TENANT_ID;
+
+  // Per-destination cap so a single inbox can't be flooded regardless of IP.
+  const emailRl = await checkAuthRateLimit(
+    c,
+    "email-otp-send-destination",
+    10 * 60_000,
+    5,
+    `${resolvedTenantId}:${email}`,
+  );
+  if (!emailRl.allowed) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Too many requests. Please try again later." },
+      429,
+    );
+  }
+
+  const emailAuth = await getEmailAuthForTenant(resolvedTenantId);
+  const { expiresAt } = await emailAuth.sendOtp(email, { tenantId: resolvedTenantId });
+
+  return c.json<ApiResponse<{ expiresAt: string }>>({
+    ok: true,
+    data: { expiresAt: expiresAt.toISOString() },
+  });
+});
+
+auth.post("/email/otp/verify", async (c) => {
+  const rl = await checkAuthRateLimit(c, "email-otp-verify", 60_000, 10);
+  if (!rl.allowed) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Too many verification attempts. Try again later." },
+      429,
+    );
+  }
+
+  const body = await safeJsonParse<{ email: string; code: string; tenantId?: string }>(c);
+  if (!body?.email || !body?.code) {
+    return c.json<ApiResponse>({ ok: false, error: "email and code are required" }, 400);
+  }
+
+  const email = body.email.toLowerCase().trim();
+  const code = body.code.trim();
+  const resolvedTenantId = c.req.header("X-Steward-Tenant") || body.tenantId || _DEFAULT_TENANT_ID;
+
+  // Per-{tenant,email} brute-force limiter so 6 digits can't be guessed:
+  // 5 attempts / 10 min regardless of source IP.
+  const attemptRl = await checkAuthRateLimit(
+    c,
+    "email-otp-verify-target",
+    10 * 60_000,
+    5,
+    `${resolvedTenantId}:${email}`,
+  );
+  if (!attemptRl.allowed) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Too many verification attempts. Try again later." },
+      429,
+    );
+  }
+
+  const emailAuth = await getEmailAuthForTenant(resolvedTenantId);
+  const valid = await emailAuth.verifyOtp(email, code, resolvedTenantId);
+  if (!valid) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid or expired code" }, 401);
+  }
+
+  // Mint a short-lived, single-use grant proving ownership of {email, tenant}.
+  // The passkey register endpoints exchange it for a first credential.
+  const emailGrant = await issueEmailGrant(email, resolvedTenantId);
+
+  return c.json<ApiResponse<{ emailGrant: string }>>({
+    ok: true,
+    data: { emailGrant },
+  });
 });
 
 // ── OAuth authorization-code flow ─────────────────────────────────────────────
