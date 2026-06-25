@@ -233,6 +233,11 @@ jobs:
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          # Deterministic email capture for the OTP-gated passkey smoke flow:
+          # exposes the mock inbox at GET /auth/test/inbox/:email so the smoke
+          # test can read the emailed 6-digit OTP code. Non-production only
+          # (isMockEmailEnabled() rejects EMAIL_PROVIDER=mock when NODE_ENV=production).
+          EMAIL_PROVIDER: "mock"
         run: |
           bun run start:local > /tmp/steward-fi-e2e.log 2>&1 &
           echo $! > /tmp/steward-fi-e2e.pid
