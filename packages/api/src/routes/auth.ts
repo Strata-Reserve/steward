@@ -712,6 +712,24 @@ async function loadTenantEmailConfig(tenantId: string): Promise<TenantEmailConfi
   return row?.emailConfig ?? null;
 }
 
+/**
+ * Resolve a tenant's human display name (e.g. "Strata") for branding the
+ * verification-code email's subject/copy. Returns null when the tenant has no
+ * row or no name, in which case the caller falls back to a neutral default.
+ */
+async function loadTenantDisplayName(tenantId: string): Promise<string | null> {
+  try {
+    const db = getDb();
+    const [row] = await db
+      .select({ name: tenants.name })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId));
+    return row?.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function createEmailAuthForTenant(tenantId: string): Promise<EmailAuth> {
   const emailConfig = await loadTenantEmailConfig(tenantId);
 
@@ -2494,7 +2512,11 @@ auth.post("/email/otp/send", async (c) => {
   }
 
   const emailAuth = await getEmailAuthForTenant(resolvedTenantId);
-  const { expiresAt } = await emailAuth.sendOtp(email, { tenantId: resolvedTenantId });
+  const tenantName = await loadTenantDisplayName(resolvedTenantId);
+  const { expiresAt } = await emailAuth.sendOtp(email, {
+    tenantId: resolvedTenantId,
+    ...(tenantName ? { tenantName } : {}),
+  });
 
   return c.json<ApiResponse<{ expiresAt: string }>>({
     ok: true,

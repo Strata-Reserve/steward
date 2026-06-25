@@ -5,6 +5,7 @@ import type { EmailProvider } from "./email-provider";
 import { ConsoleProvider } from "./email-provider";
 import {
   renderTemplate as defaultTemplateRenderer,
+  renderOtpTemplate,
   type MagicLinkTemplateData,
   type RenderedMagicLinkTemplate,
 } from "./email-templates";
@@ -104,15 +105,6 @@ function decodeOtpPayload(value: string): OtpPayload {
     // Fall through to legacy raw-email form.
   }
   return { email: value };
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 function hashToken(token: string): string {
@@ -216,36 +208,21 @@ export class EmailAuth {
 
     const minutes = Math.floor(this.tokenTtlMs / (60 * 1000));
     const brand = context.tenantName || "Steward";
-    const subject = `Your ${brand} verification code is ${code}`;
-    const text = [
-      `Your ${brand} verification code is: ${code}`,
-      "",
-      `It expires in ${minutes} minutes. If you didn't request this, ignore this email.`,
-    ].join("\n");
-    const escapedBrand = escapeHtml(brand);
-    const escapedCode = escapeHtml(code);
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background-color:#0b0a09;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#0b0a09;min-height:100vh;">
-    <tr><td align="center" style="padding:60px 24px;">
-      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:420px;">
-        <tr><td style="background-color:#141210;border:1px solid #2a2722;padding:40px 32px;">
-          <div style="font-size:18px;font-weight:700;color:#e8e5e0;padding-bottom:8px;">${escapedBrand} verification code</div>
-          <div style="font-size:13px;color:#9c9788;line-height:1.5;padding-bottom:24px;">Enter this code to verify your email. It expires in ${minutes} minutes.</div>
-          <div style="text-align:center;padding-bottom:24px;">
-            <span style="display:inline-block;background-color:#0b0a09;border:1px solid #2a2722;color:#e8e5e0;font-size:32px;font-weight:700;letter-spacing:0.35em;padding:16px 24px 16px 32px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">${escapedCode}</span>
-          </div>
-          <div style="border-top:1px solid #2a2722;padding-top:20px;font-size:11px;color:#9c9788;line-height:1.5;">If you didn't request this code, you can safely ignore this email.</div>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>`;
-
-    await this.provider.send(email, subject, text, html, { replyTo: this.replyTo });
+    // Render the code email through the same per-tenant templateId used for
+    // magic links, so a branded tenant (e.g. templateId "strata") gets its
+    // branded code card instead of the generic dark fallback.
+    const rendered = renderOtpTemplate(this.templateId, {
+      code,
+      expiresInMinutes: minutes,
+      brand,
+    });
+    // NOTE: deliberately do NOT apply `this.subjectOverride` here. That override
+    // is the tenant's MAGIC-LINK subject (e.g. "Sign in to ..."), which is wrong
+    // for a verification-code email. The OTP subject must carry the code, so we
+    // always use the rendered OTP subject.
+    await this.provider.send(email, rendered.subject, rendered.text, rendered.html, {
+      replyTo: this.replyTo,
+    });
 
     return { expiresAt };
   }
