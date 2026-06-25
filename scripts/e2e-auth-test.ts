@@ -257,21 +257,136 @@ async function testProviderDiscovery() {
 }
 
 /**
- * (b) Passkey Registration Options
+ * Drive the verified-email OTP grant flow for a brand-new email:
+ *   POST /auth/email/otp/send  → emails a 6-digit code
+ *   GET  /auth/test/inbox/:email → (mock-email mode only) returns the email
+ *                                  text so the harness can read the code
+ *   POST /auth/email/otp/verify → exchanges the code for a single-use grant
+ *
+ * Returns the opaque grant token, or null when the test inbox is unavailable
+ * (i.e. the target is NOT running EMAIL_PROVIDER=mock — e.g. live prod), in
+ * which case the gated-success leg is skipped rather than weakened or faked.
+ * This mirrors exactly how the unit tests obtain the code (MockEmailInbox /
+ * the /auth/test/inbox endpoint), without ever bypassing the gate.
+ */
+async function obtainEmailGrant(
+  email: string,
+): Promise<{ grant: string } | { unavailable: string }> {
+  // (a) request the code
+  const sendRes = await api("POST", "/auth/email/otp/send", { body: { email } });
+  if (sendRes.status === 404) {
+    return { unavailable: "/auth/email/otp/send not deployed on this version" };
+  }
+  if (sendRes.status === 429) {
+    return { unavailable: "rate limited on otp/send" };
+  }
+  if (sendRes.status !== 200 || sendRes.data?.ok !== true) {
+    return {
+      unavailable: `otp/send unexpected: status=${sendRes.status} ${JSON.stringify(sendRes.data)}`,
+    };
+  }
+
+  // (b) read the code from the mock inbox (test/dev only). Same mechanism the
+  //     unit tests use; returns 404 when EMAIL_PROVIDER!=mock so we cannot and
+  //     do not try to read codes from a real provider.
+  const inboxRes = await api("GET", `/auth/test/inbox/${encodeURIComponent(email)}`);
+  if (inboxRes.status === 404) {
+    return {
+      unavailable: "mock email inbox unavailable (EMAIL_PROVIDER!=mock); cannot read OTP code",
+    };
+  }
+  if (inboxRes.status !== 200 || typeof inboxRes.data?.text !== "string") {
+    return {
+      unavailable: `inbox unexpected: status=${inboxRes.status} ${JSON.stringify(inboxRes.data)}`,
+    };
+  }
+  const codeMatch = inboxRes.data.text.match(/\b(\d{6})\b/);
+  if (!codeMatch) {
+    return { unavailable: "no 6-digit code found in captured OTP email" };
+  }
+  const code = codeMatch[1] as string;
+
+  // (c) exchange the code for a single-use grant
+  const verifyRes = await api("POST", "/auth/email/otp/verify", { body: { email, code } });
+  if (verifyRes.status !== 200 || verifyRes.data?.ok !== true) {
+    return {
+      unavailable: `otp/verify unexpected: status=${verifyRes.status} ${JSON.stringify(verifyRes.data)}`,
+    };
+  }
+  const grant = verifyRes.data?.data?.emailGrant;
+  if (typeof grant !== "string" || grant.length < 10) {
+    return { unavailable: "otp/verify did not return an emailGrant" };
+  }
+  return { grant };
+}
+
+/**
+ * (b) Passkey Registration Options — OTP-gated anti-squatting flow.
+ *
+ * PR #6 (feat/email-otp-anti-squatting) closes an email-squatting hole: a
+ * BRAND-NEW email can no longer mint a passkey without first proving inbox
+ * ownership via an email OTP grant. This test now exercises BOTH guarantees:
+ *
+ *   1. NEGATIVE (security guarantee): passkey/register/options for a brand-new
+ *      email WITHOUT a grant must be REJECTED (401).
+ *   2. POSITIVE (gated happy path): email → code → grant → register/options
+ *      WITH the grant succeeds and returns WebAuthn creation options.
+ *
+ * Each subtest uses a unique brand-new email so the negative assertion always
+ * exercises the ungated path. The positive leg requires the mock email inbox
+ * (EMAIL_PROVIDER=mock); against a target without it (e.g. live prod) the
+ * positive leg is SKIPPED rather than weakened — the negative gate is always
+ * asserted.
  */
 async function testPasskeyRegistrationOptions() {
+  const stamp = Date.now();
+
+  // ── 1. NEGATIVE: brand-new email, no grant → must be rejected ──────────────
+  const newEmailNoGrant = `e2e-nogrant-${stamp}@steward.fi`;
   try {
     const { status, data } = await api("POST", "/auth/passkey/register/options", {
-      body: { email: "e2e-test@steward.fi" },
+      body: { email: newEmailNoGrant },
     });
 
     if (status === 404) {
       skip("Passkey registration options", "endpoint not deployed on this version");
       return;
     }
+
+    if (status === 401) {
+      pass(
+        "Passkey registration rejected without OTP grant",
+        "brand-new email with no grant correctly returns 401",
+      );
+    } else {
+      fail(
+        "Passkey registration rejected without OTP grant",
+        `expected 401 for ungated brand-new email, got ${status}: ${data?.error || JSON.stringify(data)}`,
+      );
+      // Hard security regression — do not continue to the happy path.
+      return;
+    }
+  } catch (e: any) {
+    fail("Passkey registration rejected without OTP grant", e.message);
+    return;
+  }
+
+  // ── 2. POSITIVE: email → code → grant → register/options succeeds ──────────
+  const newEmailGated = `e2e-gated-${stamp}@steward.fi`;
+  try {
+    const grantResult = await obtainEmailGrant(newEmailGated);
+    if ("unavailable" in grantResult) {
+      skip("Passkey registration options (OTP-gated)", grantResult.unavailable);
+      return;
+    }
+
+    const { status, data } = await api("POST", "/auth/passkey/register/options", {
+      body: { email: newEmailGated, emailGrant: grantResult.grant },
+    });
+
     if (status !== 200) {
       fail(
-        "Passkey registration options",
+        "Passkey registration options (OTP-gated)",
         `status=${status}: ${data?.error || JSON.stringify(data)}`,
       );
       return;
@@ -284,17 +399,17 @@ async function testPasskeyRegistrationOptions() {
 
     if (hasChallenge && hasRp && hasUser) {
       pass(
-        "Passkey registration options",
+        "Passkey registration options (OTP-gated)",
         `rp=${data.rp.name}, challenge=${data.challenge.slice(0, 12)}...`,
       );
     } else {
       fail(
-        "Passkey registration options",
+        "Passkey registration options (OTP-gated)",
         `missing fields: challenge=${hasChallenge}, rp=${hasRp}, user=${hasUser}`,
       );
     }
   } catch (e: any) {
-    fail("Passkey registration options", e.message);
+    fail("Passkey registration options (OTP-gated)", e.message);
   }
 }
 
