@@ -358,6 +358,8 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
     replyTo?: string;
     templateId?: string;
     subjectOverride?: string;
+    magicLinkBaseUrl?: string;
+    magicLinkCallbackPath?: string;
   }>(c);
 
   if (!body) {
@@ -371,10 +373,16 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
   if (
     !isOptionalString(body.replyTo) ||
     !isOptionalString(body.templateId) ||
-    !isOptionalString(body.subjectOverride)
+    !isOptionalString(body.subjectOverride) ||
+    !isOptionalString(body.magicLinkBaseUrl) ||
+    !isOptionalString(body.magicLinkCallbackPath)
   ) {
     return c.json<ApiResponse>(
-      { ok: false, error: "replyTo, templateId, and subjectOverride must be non-empty strings" },
+      {
+        ok: false,
+        error:
+          "replyTo, templateId, subjectOverride, magicLinkBaseUrl, and magicLinkCallbackPath must be non-empty strings",
+      },
       400,
     );
   }
@@ -387,6 +395,14 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
     ...(body.replyTo ? { replyTo: body.replyTo.trim() } : {}),
     ...(body.templateId ? { templateId: body.templateId.trim() } : {}),
     ...(body.subjectOverride ? { subjectOverride: body.subjectOverride.trim() } : {}),
+    // Magic-link routing: when set, links are built against this origin +
+    // callback path (so the click lands on the tenant's app route, e.g.
+    // https://app.stratareserve.co/auth/callback) instead of Steward's
+    // built-in /auth/callback/email default.
+    ...(body.magicLinkBaseUrl ? { magicLinkBaseUrl: body.magicLinkBaseUrl.trim() } : {}),
+    ...(body.magicLinkCallbackPath
+      ? { magicLinkCallbackPath: body.magicLinkCallbackPath.trim() }
+      : {}),
   };
 
   const [existingConfig] = await db
