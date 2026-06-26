@@ -36,8 +36,14 @@ export class TokenStore {
    * @param email  Email address tied to this token
    * @param ttlMs  Time-to-live in milliseconds (default 10 min)
    */
-  store(hash: string, email: string, ttlMs: number = DEFAULT_TTL_MS): void {
-    void this.backend.set(hash, email, ttlMs);
+  async store(hash: string, email: string, ttlMs: number = DEFAULT_TTL_MS): Promise<void> {
+    // MUST await the backend write. Previously this fire-and-forget'd the
+    // promise (`void this.backend.set(...)`), which races the Postgres/Redis
+    // commit against an immediate read: a one-time OTP code returned to the
+    // client could be entered + verified (consume → backend.get) BEFORE its
+    // row landed, yielding a false "invalid or expired code". Magic links
+    // happened to work only because email-delivery latency hid the race.
+    await this.backend.set(hash, email, ttlMs);
   }
 
   /**

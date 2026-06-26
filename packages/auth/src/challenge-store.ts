@@ -41,9 +41,19 @@ export class ChallengeStore {
     }
   }
 
-  /** Store a challenge for a given key (userId or email). Overwrites any existing entry. */
-  set(key: string, challenge: string): void {
-    void this.backend.set(key, challenge, this.ttlMs);
+  /**
+   * Store a challenge for a given key (userId or email). Overwrites any
+   * existing entry.
+   *
+   * MUST be awaited by callers that read the value in a SUBSEQUENT request.
+   * Previously fire-and-forget (`void this.backend.set(...)`), which races the
+   * async Postgres/Redis commit: e.g. an email grant issued at /otp/verify and
+   * PEEKed at /passkey/register/options in the very next request could miss,
+   * surfacing a false "Email verification required before passkey
+   * registration". Returns a Promise so callers can await the durable write.
+   */
+  async set(key: string, challenge: string): Promise<void> {
+    await this.backend.set(key, challenge, this.ttlMs);
   }
 
   /**

@@ -164,8 +164,9 @@ export class EmailAuth {
     const tokenHash = hashToken(token);
     const expiresAt = new Date(Date.now() + this.tokenTtlMs);
 
-    // Persist hash → email with TTL
-    this.tokenStore.store(tokenHash, email, this.tokenTtlMs);
+    // Persist hash → email with TTL. MUST await: the link is emailed right
+    // after, and the verify endpoint reads this row.
+    await this.tokenStore.store(tokenHash, email, this.tokenTtlMs);
 
     // Build and send the email
     const magicLink = buildMagicLink(this.baseUrl, this.callbackPath, token, email);
@@ -200,7 +201,10 @@ export class EmailAuth {
     const expiresAt = new Date(Date.now() + this.tokenTtlMs);
 
     // Store the HASH of {email,tenant,code} -> payload, single-use on verify.
-    this.tokenStore.store(
+    // MUST await: we return 200 to the client immediately after, and the very
+    // next request can be the verify (consume) — an unawaited write races the
+    // DB commit and produces a false "invalid or expired code".
+    await this.tokenStore.store(
       otpStoreKey(email, context.tenantId, code),
       encodeOtpPayload({ email, tenantId: context.tenantId }),
       this.tokenTtlMs,

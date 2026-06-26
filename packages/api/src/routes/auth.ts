@@ -403,7 +403,10 @@ async function issueEmailGrant(email: string, tenantId: string): Promise<string>
   const grantBytes = new Uint8Array(32);
   crypto.getRandomValues(grantBytes);
   const grant = uint8ArrayToBase64url(grantBytes);
-  getEmailGrantStore().set(emailGrantKey(grant), JSON.stringify({ email, tenantId }));
+  // MUST await: the client exchanges this grant at /passkey/register/options
+  // (PEEK) in the immediate next request; an unawaited write races the DB
+  // commit and yields a false "Email verification required".
+  await getEmailGrantStore().set(emailGrantKey(grant), JSON.stringify({ email, tenantId }));
   return grant;
 }
 
@@ -814,7 +817,7 @@ export function clearOAuthTokenKeyStoreForTests(): void {
  * this — the only writer of the code store is the `/oauth/<provider>/callback`
  * handler.
  */
-export function _seedOAuthExchangeCodeForTests(
+export async function _seedOAuthExchangeCodeForTests(
   code: string,
   payload: {
     token: string;
@@ -824,7 +827,7 @@ export function _seedOAuthExchangeCodeForTests(
     expiresAt?: number;
     expiresIn?: number;
   },
-): void {
+): Promise<void> {
   const fullPayload = {
     token: payload.token,
     refreshToken: payload.refreshToken,
@@ -833,7 +836,7 @@ export function _seedOAuthExchangeCodeForTests(
     expiresAt: payload.expiresAt ?? Date.now() + OAUTH_CODE_TTL_MS,
     expiresIn: payload.expiresIn ?? ACCESS_TOKEN_EXPIRY_SECONDS,
   };
-  getOAuthCodeStore().set(`oauth-code:${code}`, JSON.stringify(fullPayload));
+  await getOAuthCodeStore().set(`oauth-code:${code}`, JSON.stringify(fullPayload));
 }
 
 export function _clearOAuthCodeStoreForTests(): void {
@@ -2655,7 +2658,7 @@ auth.get("/oauth/:provider/authorize", async (c) => {
     responseType,
     ...(codeVerifier ? { codeVerifier } : {}),
   });
-  getChallengeStore().set(`oauth:${state}`, statePayload);
+  await getChallengeStore().set(`oauth:${state}`, statePayload);
 
   return c.redirect(authUrl, 302);
 });
@@ -2818,7 +2821,7 @@ auth.get("/oauth/:provider/callback", async (c) => {
       expiresAt,
       expiresIn: ACCESS_TOKEN_EXPIRY_SECONDS,
     });
-    getOAuthCodeStore().set(`oauth-code:${code}`, codePayload);
+    await getOAuthCodeStore().set(`oauth-code:${code}`, codePayload);
     redirectUrl.searchParams.set("code", code);
     return c.redirect(redirectUrl.toString(), 302);
   }

@@ -127,8 +127,10 @@ export class PasskeyAuth {
       },
     });
 
-    // Store the challenge so we can verify it later
-    this.challenges.set(userId, regOptions.challenge);
+    // Store the challenge so we can verify it later. MUST await: the very next
+    // request is the register/verify which reads this challenge; an unawaited
+    // write races the DB commit and breaks WebAuthn verification.
+    await this.challenges.set(userId, regOptions.challenge);
 
     return regOptions;
   }
@@ -206,7 +208,8 @@ export class PasskeyAuth {
       })),
     });
 
-    this.challenges.set(email, authOptions.challenge);
+    // MUST await: login/verify reads this challenge in the next request.
+    await this.challenges.set(email, authOptions.challenge);
 
     return authOptions;
   }
