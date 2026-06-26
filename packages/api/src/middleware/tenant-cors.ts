@@ -52,7 +52,7 @@ export function invalidateTenantCorsCache(tenantId: string): void {
 
 const ALLOW_METHODS = "GET, POST, PUT, DELETE, OPTIONS";
 const ALLOW_HEADERS =
-  "Content-Type, X-Steward-Tenant, X-Steward-Key, X-Steward-Platform-Key, Authorization";
+  "Content-Type, X-Steward-Tenant, X-Steward-Key, X-Steward-Platform-Key, X-Steward-Email-Grant, Idempotency-Key, Authorization";
 const EXPOSE_HEADERS = "Content-Length, X-Request-Id";
 const MAX_AGE = "86400";
 
