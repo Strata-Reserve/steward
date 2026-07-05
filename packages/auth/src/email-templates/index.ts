@@ -4,6 +4,7 @@ import {
   renderDefaultTemplate,
 } from "./default";
 import { renderElizaCloudTemplate } from "./elizacloud";
+import { renderStrataTemplate } from "./strata";
 
 export type { MagicLinkTemplateData, RenderedMagicLinkTemplate } from "./default";
 
@@ -13,6 +14,10 @@ export function renderTemplate(
 ): RenderedMagicLinkTemplate {
   if (templateId === "elizacloud") {
     return renderElizaCloudTemplate(data);
+  }
+
+  if (templateId === "strata") {
+    return renderStrataTemplate(data);
   }
 
   return renderDefaultTemplate(data);
