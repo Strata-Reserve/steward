@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { MockEmailInbox } from "@stwd/auth";
-import { authenticators, closeDb, getDb, tenants, users } from "@stwd/db";
+import { authenticators, closeDb, getDb, tenantConfigs, tenants, users } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
 import { eq } from "drizzle-orm";
 import { authRoutes, clearEmailAuthTenantCacheForTests, initAuthStores } from "../routes/auth";
@@ -231,5 +231,85 @@ describe("email OTP anti-squatting flow", () => {
     expect(res.status).toBe(200);
     const options = (await res.json()) as { challenge?: string };
     expect(options.challenge).toBeTruthy();
+  });
+});
+
+// OTP email BRANDING (Strata QA 2026-07-07): the code email must be branded with
+// the TENANT's name, never the hardcoded "Steward" fallback. The /email/otp/send
+// route now resolves the tenant brand (tenant_configs.display_name, then
+// tenants.name) and passes it to EmailAuth.sendOtp so the subject/body read
+// "Your <Tenant> verification code" with zero "Steward" leakage.
+describe("email OTP tenant branding", () => {
+  const BRANDED_TENANT = "branded-tenant";
+
+  beforeAll(async () => {
+    process.env.STEWARD_PGLITE_MEMORY = "true";
+    process.env.STEWARD_MASTER_PASSWORD = "otp-test-master-password";
+    process.env.APP_URL = "https://app.example.com";
+    process.env.EMAIL_FROM = "Test <login@example.com>";
+    process.env.EMAIL_PROVIDER = "mock";
+    delete process.env.RESEND_API_KEY;
+
+    const { db, client } = await createPGLiteDb("memory://");
+    setPGLiteOverride(db, async () => {
+      await client.close();
+    });
+    await initAuthStores(true);
+
+    await getDb()
+      .insert(tenants)
+      .values({ id: BRANDED_TENANT, name: "Strata Reserve", apiKeyHash: "hash" })
+      .onConflictDoNothing();
+  });
+
+  afterAll(async () => {
+    clearEmailAuthTenantCacheForTests();
+    await closeDb();
+    delete process.env.STEWARD_PGLITE_MEMORY;
+    delete process.env.STEWARD_MASTER_PASSWORD;
+    delete process.env.APP_URL;
+    delete process.env.EMAIL_FROM;
+    delete process.env.EMAIL_PROVIDER;
+  });
+
+  beforeEach(() => {
+    MockEmailInbox.clear();
+  });
+
+  async function sendBrandedOtp(email: string): Promise<Response> {
+    return authRoutes.request("/email/otp/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, tenantId: BRANDED_TENANT }),
+    });
+  }
+
+  it("OTP subject/body uses the tenant name and NEVER says 'Steward'", async () => {
+    const email = `brand-${Date.now()}@example.com`;
+    const res = await sendBrandedOtp(email);
+    expect(res.status).toBe(200);
+    const msg = MockEmailInbox.last(email);
+    expect(msg).toBeTruthy();
+    expect(msg!.subject).toContain("Strata Reserve");
+    expect(msg!.subject).not.toContain("Steward");
+    expect(msg!.text).not.toContain("Steward");
+  });
+
+  it("tenant_configs.display_name overrides tenants.name for the OTP brand", async () => {
+    await getDb()
+      .insert(tenantConfigs)
+      .values({ tenantId: BRANDED_TENANT, displayName: "Strata Reserve Markets" })
+      .onConflictDoUpdate({
+        target: tenantConfigs.tenantId,
+        set: { displayName: "Strata Reserve Markets" },
+      });
+    clearEmailAuthTenantCacheForTests();
+    const email = `brand2-${Date.now()}@example.com`;
+    const res = await sendBrandedOtp(email);
+    expect(res.status).toBe(200);
+    const msg = MockEmailInbox.last(email);
+    expect(msg).toBeTruthy();
+    expect(msg!.subject).toContain("Strata Reserve Markets");
+    expect(msg!.subject).not.toContain("Steward");
   });
 });
