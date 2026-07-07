@@ -712,6 +712,41 @@ async function loadTenantEmailConfig(tenantId: string): Promise<TenantEmailConfi
   return row?.emailConfig ?? null;
 }
 
+/**
+ * Resolve the human-facing BRAND NAME for a tenant, used to brand outbound
+ * auth emails (e.g. the email-OTP verification-code message). Prefers the
+ * tenant's configured display name, then the tenant row's `name`. Returns
+ * undefined when no tenant/name resolves so callers fall back to their own
+ * default.
+ *
+ * WHY (Strata QA 2026-07-07): the email-OTP path did NOT pass a tenant name to
+ * EmailAuth.sendOtp, so the OTP email `brand` fell back to the hardcoded
+ * "Steward" — the login code email read "Your Steward verification code is …"
+ * for a Strata Reserve user. Resolving + passing the tenant brand makes the
+ * subject/body say the tenant's name ("Strata Reserve") with zero "Steward"
+ * leakage. Best-effort + fail-open: any lookup error yields undefined and the
+ * OTP still sends (never block login on a branding lookup).
+ */
+async function resolveTenantBrandName(tenantId: string): Promise<string | undefined> {
+  try {
+    const db = getDb();
+    const [cfg] = await db
+      .select({ displayName: tenantConfigs.displayName })
+      .from(tenantConfigs)
+      .where(eq(tenantConfigs.tenantId, tenantId));
+    const configured = cfg?.displayName?.trim();
+    if (configured) return configured;
+    const [row] = await db
+      .select({ name: tenants.name })
+      .from(tenants)
+      .where(eq(tenants.id, tenantId));
+    const name = row?.name?.trim();
+    return name && name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function createEmailAuthForTenant(tenantId: string): Promise<EmailAuth> {
   const emailConfig = await loadTenantEmailConfig(tenantId);
 
@@ -2494,7 +2529,15 @@ auth.post("/email/otp/send", async (c) => {
   }
 
   const emailAuth = await getEmailAuthForTenant(resolvedTenantId);
-  const { expiresAt } = await emailAuth.sendOtp(email, { tenantId: resolvedTenantId });
+  // Brand the OTP email with the tenant's name so the code email reads
+  // "Your <Tenant> verification code" instead of the hardcoded "Steward"
+  // fallback (Strata QA 2026-07-07). Best-effort; undefined → EmailAuth's own
+  // default applies.
+  const tenantName = await resolveTenantBrandName(resolvedTenantId);
+  const { expiresAt } = await emailAuth.sendOtp(email, {
+    tenantId: resolvedTenantId,
+    ...(tenantName ? { tenantName } : {}),
+  });
 
   return c.json<ApiResponse<{ expiresAt: string }>>({
     ok: true,
