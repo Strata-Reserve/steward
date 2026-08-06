@@ -208,10 +208,17 @@ export class PostgresBackend implements StoreBackend {
   async set(key: string, value: string, ttlMs: number): Promise<void> {
     await this.ensureTable();
     const sql = this.getSqlClient();
-    const expiresAt = new Date(Date.now() + ttlMs);
+    // Bind expires_at as an explicit ISO-8601 STRING cast to timestamptz, rather
+    // than passing a JS Date object as a bind parameter. Passing a Date binds
+    // inconsistently across drivers on some runtimes (observed live: the
+    // parameterised INSERT failed at the driver layer with "Received an instance
+    // of Date", collapsing every auth store to the in-memory fallback). A string
+    // + explicit ::timestamptz cast is unambiguous everywhere.
+    // Forward-port of 224e210/00b8680 (pre-upstream-sync fix, #5).
+    const expiresAtIso = new Date(Date.now() + ttlMs).toISOString();
     await sql`
       INSERT INTO auth_kv_store (id, namespace, value, expires_at)
-      VALUES (${key}, ${this.namespace}, ${value}, ${expiresAt})
+      VALUES (${key}, ${this.namespace}, ${value}, ${expiresAtIso}::timestamptz)
       ON CONFLICT (id, namespace) DO UPDATE
         SET value      = EXCLUDED.value,
             expires_at = EXCLUDED.expires_at
@@ -221,10 +228,11 @@ export class PostgresBackend implements StoreBackend {
   async setIfNotExists(key: string, value: string, ttlMs: number): Promise<boolean> {
     await this.ensureTable();
     const sql = this.getSqlClient();
-    const expiresAt = new Date(Date.now() + ttlMs);
+    // ISO string + ::timestamptz cast — see comment in set().
+    const expiresAtIso = new Date(Date.now() + ttlMs).toISOString();
     const rows = await sql<Array<{ id: string }>>`
       INSERT INTO auth_kv_store (id, namespace, value, expires_at)
-      VALUES (${key}, ${this.namespace}, ${value}, ${expiresAt})
+      VALUES (${key}, ${this.namespace}, ${value}, ${expiresAtIso}::timestamptz)
       ON CONFLICT (id, namespace) DO NOTHING
       RETURNING id
     `;
