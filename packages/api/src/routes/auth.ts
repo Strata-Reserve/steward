@@ -142,10 +142,7 @@ import {
   verifyCaptchaToken,
 } from "../services/auth-abuse";
 import { verifyEip1271 } from "../services/eip1271";
-import {
-  getGracedSuccessor,
-  rememberRotation,
-} from "../services/refresh-rotation-grace";
+import { getGracedSuccessor, rememberRotation } from "../services/refresh-rotation-grace";
 import { buildSamlServiceProviderUrls } from "../services/saml-sso-config";
 import { lockUserSession } from "../services/session-lock";
 import { testAccountOtpMatches } from "../services/test-account-credentials";
