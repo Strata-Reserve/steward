@@ -1,0 +1,64 @@
+---
+title: "Application principal threat model"
+description: "Authority, abuse cases, and security invariants for the proposal-only application boundary."
+---
+
+# Application principal threat model
+
+## Authority model
+
+| State | Sole writer | Readers |
+|---|---|---|
+| Principal capabilities, owner assignments, expiry, revocation | tenant-admin principal management routes | application auth middleware, operators |
+| Credential hash, expiry, revocation | tenant-admin principal management routes | application auth middleware |
+| Application wallet ownership | `ApplicationBoundaryService.ensureApplicationWallet` | application address command, operators |
+| Prepared transaction intent | `ApplicationBoundaryService.prepareApplicationTransaction` | proposal command, future review/execution authority |
+| Proposal | `ApplicationBoundaryService.proposeApplicationTransaction` | future review/execution authority |
+| Signature/broadcast state | existing Vault/execution authorities; **not this boundary** | existing consumers |
+
+The immutable audit actor is the authenticated application principal ID. No request field can override it.
+
+## Protected assets
+
+Private keys, transaction signatures, broadcasts, tenant administration, policy management, arbitrary wallet/agent creation, secrets, webhooks, and resources assigned to other principals or tenants.
+
+## Attacker model
+
+Assume an attacker can fully compromise Strata's application server and steal its application key ID and secret. Also assume it can choose arbitrary HTTP methods, paths, headers, owner references, wallet IDs, transaction bytes, idempotency keys, and replay timing.
+
+## Invariants
+
+1. Application credentials authenticate only under `/application/*`.
+2. `authType=application-principal` never satisfies tenant-level or agent access checks.
+3. The global deny guard runs before legacy handlers, including older public handlers.
+4. Capabilities default deny and are checked before parsing/command execution.
+5. Wallet access requires both tenant ID and principal ID ownership predicates.
+6. Wallet creation is restricted to pre-assigned owner references and deterministic internal identities.
+7. Prepared intents and proposals are immutable, persisted, hash-bound, and idempotent.
+8. Reuse of an idempotency key with a different request fails with `409`.
+9. Proposal creation writes no `transactions` row and calls no sign/broadcast method.
+10. Principal and credential expiry/revocation are enforced on every request.
+11. Unknown key IDs and wrong secrets receive the same generic response; secret comparison is timing-safe and performed on the unknown-key path with a dummy hash.
+12. Raw secrets are returned only at create/rotate and are never stored or audited.
+
+## Abuse cases and controls
+
+| Abuse case | Control | Test evidence |
+|---|---|---|
+| Call sign/import/export/RPC/approve/reject | global namespace deny + distinct auth type | complete vault route matrix |
+| Mint agent token, delete agent, change policy | global namespace deny | agent route matrix |
+| Manage tenants/policies/webhooks/secrets | global namespace deny | admin route matrix |
+| Mix application and tenant credentials | application-header deny happens before tenant auth | route matrix uses application headers on every legacy family |
+| Create arbitrary owner wallet | assigned `ownerReferences` check in command service | unassigned owner returns 403 + audit |
+| Read another principal's wallet | tenant + principal ownership predicates | cross-principal 404 |
+| Replay changed transaction | canonical hash + unique principal/idempotency key | 409 conflict test |
+| Continue after key rotation/revocation/expiry | per-request credential/principal state checks | lifecycle tests |
+| Forge audit identity | actor ID comes only from authenticated context | audit row assertions |
+| Trigger synchronous execution | proposal table is separate; no Vault sign call or transaction row | proposal test asserts zero transaction rows |
+
+## Residual risks
+
+- SHA-256 is appropriate for uniformly random 256-bit secrets; it is not suitable for human passwords. Operators must use generated secrets only.
+- Database compromise can alter principal rows. The tamper-evident audit key must remain separate from database credentials.
+- Wallet ensure creates encrypted custody material internally. It does not sign, but operators should alert on unexpected wallet creation volume.
+- A future proposal consumer is a new execution boundary and requires its own authorization, replay, approval, and threat-model review. Application credentials must never be accepted by that consumer as execution authorization.

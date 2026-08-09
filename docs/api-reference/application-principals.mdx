@@ -1,0 +1,113 @@
+---
+title: "Application principals"
+description: "Least-privilege proposal-only custody API for product backends."
+---
+
+# Application principals
+
+Application credentials use two headers and are valid only on `/application/*`:
+
+```http
+X-Steward-Application-Key-Id: apk_...
+X-Steward-Application-Secret: aps_...
+```
+
+Do not send tenant keys, agent tokens, or internal agent IDs from application code.
+
+## Administrator lifecycle
+
+Tenant owner/admin or tenant API-key authentication is required.
+
+### Create
+
+`POST /application-principals`
+
+```json
+{
+  "name": "Strata API",
+  "capabilities": [
+    "ensure_wallet",
+    "read_wallet_address",
+    "prepare_transaction",
+    "propose_transaction"
+  ],
+  "ownerReferences": ["investor:party_123"],
+  "expiresAt": "2027-08-09T00:00:00.000Z",
+  "credentialExpiresAt": "2026-11-09T00:00:00.000Z"
+}
+```
+
+The response contains `credential.secret` once. Store it in the deployment secret manager.
+
+### Rotate
+
+`POST /application-principals/:principalId/rotate`
+
+```json
+{ "credentialExpiresAt": "2026-12-09T00:00:00.000Z" }
+```
+
+Rotation atomically revokes all active old credentials and returns one new credential.
+
+### Revoke
+
+`POST /application-principals/:principalId/revoke`
+
+Revocation immediately invalidates the principal and every credential.
+
+## Application contract
+
+### Ensure Wallet
+
+`POST /application/wallets/ensure`
+
+```json
+{ "ownerReference": "investor:party_123", "chainFamily": "evm" }
+```
+
+Returns a stable application `wallet.id` and address. Repeating the command returns the same wallet. The owner reference must be assigned to the principal.
+
+### Read Wallet Address
+
+`GET /application/wallets/:walletId/address`
+
+Returns only a wallet owned by the authenticated principal. Foreign resources return `404`.
+
+### Prepare Transaction
+
+`POST /application/transactions/prepare`
+
+```json
+{
+  "idempotencyKey": "close-intent:cii_123:v1",
+  "walletId": "aw_...",
+  "network": { "type": "evm", "chainId": 8453 },
+  "transaction": {
+    "to": "0x1111111111111111111111111111111111111111",
+    "value": "0",
+    "data": "0x1234"
+  }
+}
+```
+
+The response is an immutable canonical intent with a SHA-256 `requestHash`. Decimal values and hex/address casing are canonicalized. The same idempotency key + request returns the same ID; changed content returns `409`.
+
+### Propose Transaction
+
+`POST /application/transactions/propose`
+
+```json
+{
+  "idempotencyKey": "close-proposal:cii_123:v1",
+  "preparedTransactionId": "ati_..."
+}
+```
+
+Returns `202` with a persisted `status: "proposed"` record. This command does **not** sign, approve, execute, or broadcast. Replays return the same proposal.
+
+## Errors
+
+- `401` invalid, expired, rotated, or revoked credential
+- `403` missing capability or unassigned owner reference
+- `404` resource not owned by this principal
+- `409` idempotency conflict or incompatible resource

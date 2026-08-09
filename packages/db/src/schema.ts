@@ -157,6 +157,140 @@ export const agents = pgTable(
   }),
 );
 
+// ─── Capability-oriented application boundary ───────────────────────────────
+// Application principals authenticate only the narrow `/application/*`
+// command surface and own only the resources recorded below.
+export const applicationPrincipals = pgTable(
+  "application_principals",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 })
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 255 }).notNull(),
+    auditIdentity: varchar("audit_identity", { length: 255 }).notNull(),
+    capabilities: text("capabilities").array().notNull(),
+    ownerReferences: text("owner_references").array().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => ({
+    tenantIdx: index("application_principals_tenant_idx").on(table.tenantId),
+    activeIdx: index("application_principals_active_idx")
+      .on(table.tenantId, table.expiresAt)
+      .where(sql`${table.revokedAt} IS NULL`),
+  }),
+);
+
+export const applicationPrincipalCredentials = pgTable(
+  "application_principal_credentials",
+  {
+    keyId: varchar("key_id", { length: 64 }).primaryKey(),
+    principalId: varchar("principal_id", { length: 64 })
+      .notNull()
+      .references(() => applicationPrincipals.id, { onDelete: "cascade" }),
+    secretHash: text("secret_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    principalIdx: index("application_principal_credentials_principal_idx").on(table.principalId),
+    activeIdx: index("application_principal_credentials_active_idx")
+      .on(table.principalId, table.expiresAt)
+      .where(sql`${table.revokedAt} IS NULL`),
+  }),
+);
+
+export const applicationWallets = pgTable(
+  "application_wallets",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 })
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    principalId: varchar("principal_id", { length: 64 })
+      .notNull()
+      .references(() => applicationPrincipals.id, { onDelete: "cascade" }),
+    ownerReference: varchar("owner_reference", { length: 255 }).notNull(),
+    chainFamily: chainFamilyEnum("chain_family").notNull(),
+    stewardAgentId: varchar("steward_agent_id", { length: 64 })
+      .notNull()
+      .references(() => agents.id, { onDelete: "restrict" }),
+    address: varchar("address", { length: 128 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    ownerChainUnique: uniqueIndex("application_wallets_principal_owner_chain_idx").on(
+      table.principalId,
+      table.ownerReference,
+      table.chainFamily,
+    ),
+    tenantPrincipalIdx: index("application_wallets_tenant_principal_idx").on(
+      table.tenantId,
+      table.principalId,
+    ),
+  }),
+);
+
+export const applicationTransactionIntents = pgTable(
+  "application_transaction_intents",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 })
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    principalId: varchar("principal_id", { length: 64 })
+      .notNull()
+      .references(() => applicationPrincipals.id, { onDelete: "cascade" }),
+    walletId: varchar("wallet_id", { length: 64 })
+      .notNull()
+      .references(() => applicationWallets.id, { onDelete: "restrict" }),
+    idempotencyKey: varchar("idempotency_key", { length: 255 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    intent: jsonb("intent").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    idempotencyUnique: uniqueIndex("application_transaction_intents_idempotency_idx").on(
+      table.principalId,
+      table.idempotencyKey,
+    ),
+    tenantPrincipalIdx: index("application_transaction_intents_tenant_principal_idx").on(
+      table.tenantId,
+      table.principalId,
+    ),
+  }),
+);
+
+export const applicationTransactionProposals = pgTable(
+  "application_transaction_proposals",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 })
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    principalId: varchar("principal_id", { length: 64 })
+      .notNull()
+      .references(() => applicationPrincipals.id, { onDelete: "cascade" }),
+    intentId: varchar("intent_id", { length: 64 })
+      .notNull()
+      .references(() => applicationTransactionIntents.id, { onDelete: "restrict" }),
+    idempotencyKey: varchar("idempotency_key", { length: 255 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    status: varchar("status", { length: 32 }).notNull().default("proposed"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    idempotencyUnique: uniqueIndex("application_transaction_proposals_idempotency_idx").on(
+      table.principalId,
+      table.idempotencyKey,
+    ),
+    intentIdx: index("application_transaction_proposals_intent_idx").on(table.intentId),
+  }),
+);
+
 export const encryptedKeys = pgTable(
   "encrypted_keys",
   {

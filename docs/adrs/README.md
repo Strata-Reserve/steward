@@ -22,6 +22,7 @@ with the code.
 | [0002](./0002-runtime-choice.mdx) | Why Bun and Hono | Accepted |
 | [0003](./0003-deployment-model.mdx) | Single container, multiple services deploy | Accepted |
 | [0004](./0004-policy-enforcement-model.mdx) | Where policies are enforced | Accepted |
+| [0005](./0005-capability-application-principals.mdx) | Capability-oriented application principals | Accepted |
 
 ## Related
 

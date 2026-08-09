@@ -1,0 +1,44 @@
+---
+title: "Capability-oriented application principals"
+status: "Accepted"
+date: "2026-08-09"
+---
+
+## Context
+
+A product backend must request custody operations without receiving a tenant administrator key, an agent token, or any route capable of signing or broadcasting. Existing tenant keys are control-plane credentials and existing agent tokens expose implementation concepts. Neither is a safe application contract.
+
+## Decision
+
+Steward has a first-class, tenant-bound **application principal** with an immutable principal ID/audit identity, an allowlist of capabilities, assigned owner references, principal expiry, and independently rotatable/revocable credentials. Credential records contain a key ID and SHA-256 hash of a 256-bit random secret; plaintext is returned once.
+
+Application credentials are accepted only under `/application/*`. The entire legacy route surface rejects their headers before handler logic, even if mixed with another credential. The application command service is the sole writer for application wallets, prepared intents, and proposals.
+
+The v1 contract contains exactly four capabilities:
+
+- `ensure_wallet`
+- `read_wallet_address`
+- `prepare_transaction`
+- `propose_transaction`
+
+`Prepare Transaction` persists an immutable, canonical intent. `Propose Transaction` persists a proposal referencing that intent. Neither command invokes a signer, broadcaster, approval resolver, or legacy vault signing route.
+
+Internal agent/wallet representation remains private to Steward. Public DTOs expose wallet IDs, owner references, chain families, addresses, prepared transaction IDs, and proposal IDs only.
+
+## Consequences
+
+- Compromise is bounded to four explicit commands and assigned owner references.
+- Revocation does not rotate a tenant key or affect unrelated principals.
+- Stable idempotency keys yield deterministic IDs and conflict on payload drift.
+- The first release prepares EVM transactions only; Solana wallet address custody is supported, but Solana transaction preparation needs a future typed DTO.
+- A future execution worker may consume proposals, but it must remain a separate authority and must not widen this principal's capabilities.
+
+## Constitutional analysis
+
+No Position, ownership, settlement, issuance, or lifecycle state changes. The proposal is a custody request, not a Strata Transaction Engine transaction. `ApplicationBoundaryService` owns all application resource state. Commands are explicit and immutable audit events identify the authenticated principal. No frontend/projection authority, new economic writer, archetype fork, or ADR-level constitutional amendment is introduced.
+
+## Related
+
+- [Application principal threat model](../security/application-principal-threat-model.mdx)
+- [Application principal API](../api-reference/application-principals.mdx)
+- [Operations runbook](../runbooks/application-principal-operations.md)

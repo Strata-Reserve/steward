@@ -28,6 +28,7 @@ import { Vault } from "@stwd/vault";
 import { WebhookDispatcher } from "@stwd/webhooks";
 import { and, eq, gte, sql } from "drizzle-orm";
 import type { Context, Next } from "hono";
+import type { ApplicationPrincipalContext } from "./application-boundary";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -273,7 +274,13 @@ export type AppVariables = {
   userId?: string;
   tenantRole?: string;
   agentScope?: string;
-  authType?: "api-key" | "session-jwt" | "agent-token" | "dashboard-jwt";
+  authType?:
+    | "api-key"
+    | "session-jwt"
+    | "agent-token"
+    | "dashboard-jwt"
+    | "application-principal";
+  applicationPrincipal?: ApplicationPrincipalContext;
 };
 
 // ─── Shared query helpers ─────────────────────────────────────────────────────
@@ -366,6 +373,19 @@ export async function tenantAuth(
   options?: { requireTenantMatch?: string },
 ) {
   await defaultTenantReady;
+
+  // Application credentials are valid only on the dedicated capability
+  // namespace. Reject them before considering any tenant/session credential so
+  // they can never inherit legacy tenant-level authority by credential mixing.
+  if (
+    c.req.header("X-Steward-Application-Key-Id") ||
+    c.req.header("X-Steward-Application-Secret")
+  ) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Application credentials are not accepted on this route" },
+      403,
+    );
+  }
 
   const authHeader = c.req.header("Authorization");
   if (authHeader?.startsWith("Bearer ")) {
@@ -470,6 +490,7 @@ export async function sessionAuth(c: Context<{ Variables: AppVariables }>, next:
 }
 
 export function requireAgentAccess(c: Context<{ Variables: AppVariables }>): boolean {
+  if (c.get("authType") === "application-principal") return false;
   const agentScope = c.get("agentScope");
   if (!agentScope) return true;
   return agentScope === c.req.param("agentId");
@@ -477,6 +498,7 @@ export function requireAgentAccess(c: Context<{ Variables: AppVariables }>): boo
 
 export function requireTenantLevel(c: Context<{ Variables: AppVariables }>): boolean {
   const authType = c.get("authType");
+  if (authType === "application-principal") return false;
   if (authType === "api-key") return true;
   if (authType === "agent-token") return false;
 

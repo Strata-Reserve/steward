@@ -21,10 +21,13 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { logger } from "hono/logger";
 import { requireAgentJwt } from "./middleware/agent-jwt";
+import { applicationPrincipalAuth } from "./middleware/application-principal";
 import { correlationId } from "./middleware/correlation";
 import { securityHeaders } from "./middleware/security-headers";
 import { tenantCors } from "./middleware/tenant-cors";
 import { agentRoutes } from "./routes/agents";
+import { applicationRoutes } from "./routes/application";
+import { applicationPrincipalAdminRoutes } from "./routes/application-principals";
 import { approvalRoutes } from "./routes/approvals";
 import { auditRoutes } from "./routes/audit";
 import { authRoutes } from "./routes/auth";
@@ -77,6 +80,24 @@ app.use("*", tenantCors);
 app.use("*", logger());
 app.use("*", correlationId);
 
+// Application credentials are accepted nowhere except the capability
+// namespace. This guard also covers legacy/public handlers that predate the
+// tenant middleware and therefore cannot accidentally inherit app authority.
+app.use("*", async (c, next) => {
+  const hasApplicationCredential =
+    Boolean(c.req.header("X-Steward-Application-Key-Id")) ||
+    Boolean(c.req.header("X-Steward-Application-Secret"));
+  const isApplicationCommand =
+    c.req.path === "/application" || c.req.path.startsWith("/application/");
+  if (hasApplicationCredential && !isApplicationCommand) {
+    return c.json(
+      { ok: false, error: "Application credentials are not accepted on this route" },
+      403,
+    );
+  }
+  return await next();
+});
+
 app.use(
   "*",
   bodyLimit({
@@ -87,6 +108,11 @@ app.use(
 );
 
 // ─── Auth middleware per route group ──────────────────────────────────────────
+
+app.use("/application", (c, next) => applicationPrincipalAuth(c, next));
+app.use("/application/*", (c, next) => applicationPrincipalAuth(c, next));
+app.use("/application-principals", (c, next) => tenantAuth(c, next));
+app.use("/application-principals/*", (c, next) => tenantAuth(c, next));
 
 app.use("/agents", (c, next) => tenantAuth(c, next));
 app.use("/agents/*", (c, next) => tenantAuth(c, next));
@@ -148,6 +174,8 @@ app.route("/auth", authRoutes);
 app.route("/platform", platformRoutes);
 app.route("/user", userRoutes);
 app.route("/agents", agentRoutes);
+app.route("/application", applicationRoutes);
+app.route("/application-principals", applicationPrincipalAdminRoutes);
 app.route("/vault", vaultRoutes);
 app.route("/secrets", secretsRoutes);
 // tenantConfigRoutes mounted FIRST so its literal `/config` discovery handler
