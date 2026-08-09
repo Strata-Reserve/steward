@@ -274,12 +274,7 @@ export type AppVariables = {
   userId?: string;
   tenantRole?: string;
   agentScope?: string;
-  authType?:
-    | "api-key"
-    | "session-jwt"
-    | "agent-token"
-    | "dashboard-jwt"
-    | "application-principal";
+  authType?: "api-key" | "session-jwt" | "agent-token" | "dashboard-jwt" | "application-principal";
   applicationPrincipal?: ApplicationPrincipalContext;
 };
 
