@@ -820,4 +820,68 @@ describe.serial("application principal custody boundary", () => {
       "Application credentials are not accepted",
     );
   });
+
+  /**
+   * The independent security review probed these by hand and they all held, but
+   * a probe that lives only in a review document is not a control — it protects
+   * the commit it was run against and nothing after it. Encoding them here makes
+   * the negative authorization matrix a STANDING artifact.
+   *
+   * Note the sibling test above already enumerates `app.routes` dynamically, so
+   * newly mounted routes are covered automatically. What that cannot cover is
+   * paths that never appear in the route table: normalization tricks aimed at
+   * reaching a custody route while dodging the `/application/*` prefix guard.
+   */
+  it("denies application credentials on path-normalization attempts against custody routes", async () => {
+    const issued = await issuePrincipal("Normalization", ["wallet:ensure"], ["owner:norm"]);
+    const attempts = [
+      "/application/../vault/x/sign",
+      "/application/..%2fvault/x/sign",
+      "//application/wallets/ensure",
+      "/Application/wallets/ensure",
+      "/APPLICATION/wallets/ensure",
+      "/application//../vault/x/sign",
+      "/./application/../vault/x/sign",
+    ];
+    let sawGuardDenial = false;
+    for (const path of attempts) {
+      const response = await app.request(path, {
+        method: "POST",
+        headers: applicationHeaders(issued),
+        body: "{}",
+      });
+      // 401 = committed to application auth and rejected. 403 = the prefix
+      // guard denied it. 404 = the encoded path matched no route at all
+      // (`%2f` is not decoded into a separator, which is itself the safe
+      // behaviour). All three mean the request never reached a custody handler.
+      //
+      // A blanket `>= 400` would let this pass even if EVERY path merely
+      // 404'd — a guard proven to work by never being invoked. The
+      // `sawGuardDenial` assertion below forecloses that: at least one path
+      // must reach the guard and be actively denied 403.
+      expect([401, 403, 404], `POST ${path} -> ${response.status}`).toContain(response.status);
+      if (response.status === 403) sawGuardDenial = true;
+    }
+    // Proves the loop above is not vacuous: the guard was genuinely exercised.
+    expect(sawGuardDenial).toBe(true);
+  });
+
+  it("rejects every application-credential header combination on a custody route", async () => {
+    const issued = await issuePrincipal("Header mixes", ["wallet:ensure"], ["owner:mix"]);
+    const base = { "Content-Type": "application/json" };
+    const keyId = { "X-Steward-Application-Key-Id": issued.credential.keyId };
+    const secret = { "X-Steward-Application-Secret": issued.credential.secret };
+    const mixes: Array<[string, Record<string, string>]> = [
+      ["key-id only", { ...base, ...keyId }],
+      ["secret only", { ...base, ...secret }],
+      ["both", { ...base, ...keyId, ...secret }],
+      ["empty key-id", { ...base, "X-Steward-Application-Key-Id": "" }],
+      ["whitespace key-id", { ...base, "X-Steward-Application-Key-Id": "   " }],
+      ["empty secret", { ...base, ...keyId, "X-Steward-Application-Secret": "" }],
+    ];
+    for (const [label, headers] of mixes) {
+      const response = await app.request("/vault/x/sign", { method: "POST", headers, body: "{}" });
+      expect(response.status, `custody sign with ${label}`).toBe(403);
+    }
+  });
 });
