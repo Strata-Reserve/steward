@@ -36,7 +36,10 @@ const EVM_UINT256_MAX_DIGITS = 78;
 // 1MB body limit / 2 hex chars per byte, with headroom. Bounded for the same
 // reason: `data` is lowercased and canonically JSON-hashed downstream.
 const EVM_CALLDATA_MAX_CHARS = 262_144;
-const prepareSchema = z
+// Exported so regression tests bind to the REAL schema rather than a private
+// re-implementation. A delta review showed the first suite tested a copy, so
+// reverting the source left every test green.
+export const prepareApplicationTransactionSchema = z
   .object({
     walletId: z.string().min(1).max(64),
     network: z.object({ type: z.literal("evm"), chainId: z.number().int().positive() }).strict(),
@@ -193,7 +196,7 @@ applicationRoutes.post("/transactions/prepare", async (c) => {
   const capability = "transaction:prepare" as const;
   if (!requireApplicationCapability(c, capability)) return forbidden(c, capability);
   const raw = await safeJsonParse<unknown>(c);
-  const parsed = prepareSchema.safeParse(raw);
+  const parsed = prepareApplicationTransactionSchema.safeParse(raw);
   const idempotencyKey = c.req.header("Idempotency-Key");
   if (!parsed.success || !isValidIdempotencyKey(idempotencyKey)) {
     return invalidRequest(c, capability);

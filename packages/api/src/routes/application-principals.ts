@@ -6,6 +6,7 @@ import {
 import { and, eq, isNull } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { z } from "zod";
+import { clearApplicationSelectorKnownGood } from "../middleware/application-principal";
 import {
   APPLICATION_CAPABILITIES,
   generateApplicationCredential,
@@ -187,6 +188,16 @@ applicationPrincipalAdminRoutes.post("/:principalId/rotate", async (c) => {
   }
   const credential = generateApplicationCredential();
   const rotatedAt = new Date();
+  const supersededKeyIds = await db
+    .select({ keyId: applicationPrincipalCredentials.keyId })
+    .from(applicationPrincipalCredentials)
+    .where(
+      and(
+        eq(applicationPrincipalCredentials.tenantId, tenantId),
+        eq(applicationPrincipalCredentials.principalId, principalId),
+        isNull(applicationPrincipalCredentials.revokedAt),
+      ),
+    );
   await db.transaction(async (tx) => {
     await tx
       .update(applicationPrincipalCredentials)
@@ -206,6 +217,11 @@ applicationPrincipalAdminRoutes.post("/:principalId/rotate", async (c) => {
       expiresAt: credentialExpiresAt,
     });
   });
+  // Superseded key IDs must lose known-good standing, or a rotated-away
+  // credential keeps a prioritised share of the auth rate-limit budget forever.
+  // It is already DENIED by the auth gate - this governs resource budget, not
+  // authority.
+  for (const superseded of supersededKeyIds) clearApplicationSelectorKnownGood(superseded.keyId);
   await writeAuditEvent({
     tenantId,
     actorType: "user",
@@ -245,6 +261,15 @@ applicationPrincipalAdminRoutes.post("/:principalId/revoke", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Application principal not found" }, 404);
   const revokedAt = principal.revokedAt ?? new Date();
   if (!principal.revokedAt) {
+    const revokedKeyIds = await db
+      .select({ keyId: applicationPrincipalCredentials.keyId })
+      .from(applicationPrincipalCredentials)
+      .where(
+        and(
+          eq(applicationPrincipalCredentials.tenantId, tenantId),
+          eq(applicationPrincipalCredentials.principalId, principalId),
+        ),
+      );
     await db.transaction(async (tx) => {
       await tx
         .update(applicationPrincipals)
@@ -266,6 +291,10 @@ applicationPrincipalAdminRoutes.post("/:principalId/revoke", async (c) => {
           ),
         );
     });
+    // Revoked credentials must lose known-good standing. They are already
+    // DENIED by the auth gate; this releases their prioritised share of the
+    // auth rate-limit budget so a revoked key cannot hold it indefinitely.
+    for (const revoked of revokedKeyIds) clearApplicationSelectorKnownGood(revoked.keyId);
     await writeAuditEvent({
       tenantId,
       actorType: "user",
