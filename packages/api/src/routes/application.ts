@@ -1,23 +1,44 @@
 import { type Context, Hono } from "hono";
+import { z } from "zod";
 import { requireApplicationCapability } from "../middleware/application-principal";
 import {
   ApplicationBoundaryError,
-  ensureApplicationWallet,
+  type ApplicationCapability,
   isValidApplicationReference,
+  isValidIdempotencyKey,
+} from "../services/application-boundary";
+import {
   prepareApplicationTransaction,
   proposeApplicationTransaction,
-  readApplicationWalletAddress,
-} from "../services/application-boundary";
-import { writeAuditEvent } from "../services/audit";
+} from "../services/application-proposals";
 import {
-  type ApiResponse,
-  type AppVariables,
-  isValidAddress,
-  safeJsonParse,
-} from "../services/context";
+  ensureApplicationWallet,
+  readApplicationWalletAddress,
+} from "../services/application-wallets";
+import { writeAuditEvent } from "../services/audit";
+import { type ApiResponse, type AppVariables, safeJsonParse } from "../services/context";
 
 export const applicationRoutes = new Hono<{ Variables: AppVariables }>();
 type AppContext = Context<{ Variables: AppVariables }>;
+
+const ensureSchema = z.object({ resourceId: z.string().min(1).max(255) }).strict();
+const prepareSchema = z
+  .object({
+    walletId: z.string().min(1).max(64),
+    network: z.object({ type: z.literal("evm"), chainId: z.number().int().positive() }).strict(),
+    transaction: z
+      .object({
+        to: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
+        value: z.string().regex(/^\d+$/),
+        data: z
+          .string()
+          .regex(/^0x(?:[0-9a-fA-F]{2})*$/)
+          .optional(),
+      })
+      .strict(),
+  })
+  .strict();
+const proposeSchema = z.object({ preparedTransactionId: z.string().min(1).max(64) }).strict();
 
 function requestMetadata(c: AppContext) {
   return {
@@ -30,8 +51,9 @@ function requestMetadata(c: AppContext) {
 async function auditApplicationAction(
   c: AppContext,
   action: string,
+  capability: ApplicationCapability,
   resourceType: string,
-  resourceId: string,
+  resourceId: string | null,
   metadata: Record<string, unknown> = {},
 ) {
   const principal = c.get("applicationPrincipal")!;
@@ -42,46 +64,83 @@ async function auditApplicationAction(
     action,
     resourceType,
     resourceId,
-    metadata: { auditIdentity: principal.id, ...metadata },
+    metadata: {
+      credentialKeyId: principal.credentialKeyId,
+      capability,
+      ...metadata,
+    },
     ...requestMetadata(c),
   });
 }
 
-function forbidden(c: AppContext, capability: string) {
-  return c.json<ApiResponse>(
-    { ok: false, error: `Missing application capability: ${capability}` },
-    403,
+async function forbidden(c: AppContext, capability: ApplicationCapability) {
+  await auditApplicationAction(
+    c,
+    "application.command.denied",
+    capability,
+    "application_command",
+    null,
+    { reason: "capability_denied" },
   );
+  return c.json<ApiResponse>({ ok: false, error: "Application command denied" }, 403);
 }
 
-function commandError(c: AppContext, error: unknown) {
+async function invalidRequest(c: AppContext, capability: ApplicationCapability) {
+  await auditApplicationAction(
+    c,
+    "application.command.denied",
+    capability,
+    "application_command",
+    null,
+    { reason: "invalid_request" },
+  );
+  return c.json<ApiResponse>({ ok: false, error: "Invalid application command" }, 400);
+}
+
+async function commandError(c: AppContext, capability: ApplicationCapability, error: unknown) {
   if (error instanceof ApplicationBoundaryError) {
+    await auditApplicationAction(
+      c,
+      "application.command.denied",
+      capability,
+      "application_command",
+      null,
+      { reason: error.code },
+    );
     return c.json<ApiResponse>({ ok: false, error: error.message }, error.status);
   }
   throw error;
 }
 
 applicationRoutes.post("/wallets/ensure", async (c) => {
-  if (!requireApplicationCapability(c, "ensure_wallet")) return forbidden(c, "ensure_wallet");
-  const principal = c.get("applicationPrincipal")!;
-  const body = await safeJsonParse<{ ownerReference?: string; chainFamily?: "evm" | "solana" }>(c);
-  if (!body) return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
-  if (!isValidApplicationReference(body.ownerReference)) {
-    return c.json<ApiResponse>({ ok: false, error: "ownerReference is invalid" }, 400);
-  }
-  if (body.chainFamily !== "evm" && body.chainFamily !== "solana") {
-    return c.json<ApiResponse>({ ok: false, error: 'chainFamily must be "evm" or "solana"' }, 400);
+  const capability = "wallet:ensure" as const;
+  if (!requireApplicationCapability(c, capability)) return forbidden(c, capability);
+  const raw = await safeJsonParse<unknown>(c);
+  const parsed = ensureSchema.safeParse(raw);
+  const idempotencyKey = c.req.header("Idempotency-Key");
+  if (
+    !parsed.success ||
+    !isValidApplicationReference(parsed.data.resourceId) ||
+    !isValidIdempotencyKey(idempotencyKey)
+  ) {
+    return invalidRequest(c, capability);
   }
   try {
-    const result = await ensureApplicationWallet(principal, body.ownerReference, body.chainFamily);
+    const result = await ensureApplicationWallet(
+      c.get("applicationPrincipal")!,
+      parsed.data.resourceId,
+      idempotencyKey,
+    );
     await auditApplicationAction(
       c,
       "application.wallet.ensure",
+      capability,
       "application_wallet",
       result.wallet.id,
       {
-        ownerReference: body.ownerReference,
-        chainFamily: body.chainFamily,
+        resourceKind: result.wallet.resourceKind,
+        resourceId: result.wallet.resourceId,
+        requestHash: result.requestHash,
         replay: !result.created,
       },
     );
@@ -90,24 +149,13 @@ applicationRoutes.post("/wallets/ensure", async (c) => {
       result.created ? 201 : 200,
     );
   } catch (error) {
-    if (error instanceof ApplicationBoundaryError && error.code === "owner_not_assigned") {
-      await auditApplicationAction(
-        c,
-        "application.wallet.ensure.denied",
-        "owner_reference",
-        body.ownerReference,
-        {
-          reason: error.code,
-        },
-      );
-    }
-    return commandError(c, error);
+    return commandError(c, capability, error);
   }
 });
 
 applicationRoutes.get("/wallets/:walletId/address", async (c) => {
-  if (!requireApplicationCapability(c, "read_wallet_address"))
-    return forbidden(c, "read_wallet_address");
+  const capability = "wallet:address:read" as const;
+  if (!requireApplicationCapability(c, capability)) return forbidden(c, capability);
   try {
     const wallet = await readApplicationWalletAddress(
       c.get("applicationPrincipal")!,
@@ -116,73 +164,42 @@ applicationRoutes.get("/wallets/:walletId/address", async (c) => {
     await auditApplicationAction(
       c,
       "application.wallet_address.read",
+      capability,
       "application_wallet",
       wallet.id,
     );
     return c.json<ApiResponse>({ ok: true, data: wallet });
   } catch (error) {
-    return commandError(c, error);
+    return commandError(c, capability, error);
   }
 });
 
 applicationRoutes.post("/transactions/prepare", async (c) => {
-  if (!requireApplicationCapability(c, "prepare_transaction"))
-    return forbidden(c, "prepare_transaction");
-  const body = await safeJsonParse<{
-    idempotencyKey?: string;
-    walletId?: string;
-    network?: { type?: "evm"; chainId?: number };
-    transaction?: { to?: string; value?: string; data?: string };
-  }>(c);
-  if (!body) return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
-  if (!isValidApplicationReference(body.idempotencyKey)) {
-    return c.json<ApiResponse>({ ok: false, error: "idempotencyKey is invalid" }, 400);
-  }
-  if (typeof body.walletId !== "string")
-    return c.json<ApiResponse>({ ok: false, error: "walletId is required" }, 400);
-  if (body.network?.type !== "evm") {
-    return c.json<ApiResponse>(
-      { ok: false, error: "This contract currently prepares EVM transactions only" },
-      400,
-    );
-  }
-  if (!Number.isSafeInteger(body.network.chainId) || (body.network.chainId ?? 0) <= 0) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "network.chainId must be a positive integer" },
-      400,
-    );
-  }
-  const tx = body.transaction;
-  if (!tx || !isValidAddress(tx.to))
-    return c.json<ApiResponse>({ ok: false, error: "transaction.to is invalid" }, 400);
-  if (typeof tx.value !== "string" || !/^\d+$/.test(tx.value)) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "transaction.value must be an unsigned decimal string" },
-      400,
-    );
-  }
-  if (tx.data !== undefined && !/^0x(?:[0-9a-fA-F]{2})*$/.test(tx.data)) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "transaction.data must be even-length hex" },
-      400,
-    );
+  const capability = "transaction:prepare" as const;
+  if (!requireApplicationCapability(c, capability)) return forbidden(c, capability);
+  const raw = await safeJsonParse<unknown>(c);
+  const parsed = prepareSchema.safeParse(raw);
+  const idempotencyKey = c.req.header("Idempotency-Key");
+  if (!parsed.success || !isValidIdempotencyKey(idempotencyKey)) {
+    return invalidRequest(c, capability);
   }
   try {
     const result = await prepareApplicationTransaction(c.get("applicationPrincipal")!, {
-      idempotencyKey: body.idempotencyKey,
-      walletId: body.walletId,
-      chainId: body.network.chainId!,
-      to: tx.to!,
-      value: tx.value,
-      ...(tx.data !== undefined ? { data: tx.data } : {}),
+      idempotencyKey,
+      walletId: parsed.data.walletId,
+      chainId: parsed.data.network.chainId,
+      to: parsed.data.transaction.to,
+      value: parsed.data.transaction.value,
+      ...(parsed.data.transaction.data !== undefined ? { data: parsed.data.transaction.data } : {}),
     });
     await auditApplicationAction(
       c,
       "application.transaction.prepare",
+      capability,
       "application_transaction_intent",
       result.preparedTransaction.id,
       {
-        walletId: body.walletId,
+        walletId: parsed.data.walletId,
         requestHash: result.requestHash,
         replay: !result.created,
       },
@@ -195,29 +212,28 @@ applicationRoutes.post("/transactions/prepare", async (c) => {
       result.created ? 201 : 200,
     );
   } catch (error) {
-    return commandError(c, error);
+    return commandError(c, capability, error);
   }
 });
 
 applicationRoutes.post("/transactions/propose", async (c) => {
-  if (!requireApplicationCapability(c, "propose_transaction"))
-    return forbidden(c, "propose_transaction");
-  const body = await safeJsonParse<{ idempotencyKey?: string; preparedTransactionId?: string }>(c);
-  if (!body) return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
-  if (!isValidApplicationReference(body.idempotencyKey)) {
-    return c.json<ApiResponse>({ ok: false, error: "idempotencyKey is invalid" }, 400);
-  }
-  if (typeof body.preparedTransactionId !== "string") {
-    return c.json<ApiResponse>({ ok: false, error: "preparedTransactionId is required" }, 400);
+  const capability = "transaction:propose" as const;
+  if (!requireApplicationCapability(c, capability)) return forbidden(c, capability);
+  const raw = await safeJsonParse<unknown>(c);
+  const parsed = proposeSchema.safeParse(raw);
+  const idempotencyKey = c.req.header("Idempotency-Key");
+  if (!parsed.success || !isValidIdempotencyKey(idempotencyKey)) {
+    return invalidRequest(c, capability);
   }
   try {
     const result = await proposeApplicationTransaction(c.get("applicationPrincipal")!, {
-      idempotencyKey: body.idempotencyKey,
-      preparedTransactionId: body.preparedTransactionId,
+      idempotencyKey,
+      preparedTransactionId: parsed.data.preparedTransactionId,
     });
     await auditApplicationAction(
       c,
       "application.transaction.propose",
+      capability,
       "application_transaction_proposal",
       result.proposal.id,
       {
@@ -231,6 +247,6 @@ applicationRoutes.post("/transactions/propose", async (c) => {
       result.created ? 202 : 200,
     );
   } catch (error) {
-    return commandError(c, error);
+    return commandError(c, capability, error);
   }
 });

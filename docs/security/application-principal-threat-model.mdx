@@ -9,56 +9,59 @@ description: "Authority, abuse cases, and security invariants for the proposal-o
 
 | State | Sole writer | Readers |
 |---|---|---|
-| Principal capabilities, owner assignments, expiry, revocation | tenant-admin principal management routes | application auth middleware, operators |
+| Principal capability, resource assignment, expiry, revocation | tenant-admin principal management routes | application auth middleware, operators |
 | Credential hash, expiry, revocation | tenant-admin principal management routes | application auth middleware |
-| Application wallet ownership | `ApplicationBoundaryService.ensureApplicationWallet` | application address command, operators |
-| Prepared transaction intent | `ApplicationBoundaryService.prepareApplicationTransaction` | proposal command, future review/execution authority |
-| Proposal | `ApplicationBoundaryService.proposeApplicationTransaction` | future review/execution authority |
+| Agent, encrypted keys, public addresses, application binding | `Vault.ensureApplicationWallet` atomic command | application address command, operators |
+| Durable operation idempotency | owning application command transaction | owning command on replay |
+| Prepared transaction intent | proposal-only persistence module | proposal command, future separately authorized consumer |
+| Proposal | proposal-only persistence module | future separately authorized consumer |
 | Signature/broadcast state | existing Vault/execution authorities; **not this boundary** | existing consumers |
 
-The immutable audit actor is the authenticated application principal ID. No request field can override it.
+The durable authenticated principal ID is the immutable audit actor. Credential selector, capability, request ID, and resource IDs are derived from server context and command results, never caller identity fields.
 
 ## Protected assets
 
-Private keys, transaction signatures, broadcasts, tenant administration, policy management, arbitrary wallet/agent creation, secrets, webhooks, and resources assigned to other principals or tenants.
+Private keys, signatures, broadcasts, approvals, tenant administration, policy management, arbitrary wallet/agent assignment, secrets, webhooks, and resources assigned to other principals or tenants.
 
 ## Attacker model
 
-Assume an attacker can fully compromise Strata's application server and steal its application key ID and secret. Also assume it can choose arbitrary HTTP methods, paths, headers, owner references, wallet IDs, transaction bytes, idempotency keys, and replay timing.
+Assume an attacker fully compromises the product backend and steals its application credential. It can choose arbitrary methods, paths, headers, IDs, bytes, idempotency keys, request timing, and concurrent replicas. It cannot write Steward's database directly.
 
 ## Invariants
 
-1. Application credentials authenticate only under `/application/*`.
-2. `authType=application-principal` never satisfies tenant-level or agent access checks.
-3. The global deny guard runs before legacy handlers, including older public handlers.
-4. Capabilities default deny and are checked before parsing/command execution.
-5. Wallet access requires both tenant ID and principal ID ownership predicates.
-6. Wallet creation is restricted to pre-assigned owner references and deterministic internal identities.
-7. Prepared intents and proposals are immutable, persisted, hash-bound, and idempotent.
-8. Reuse of an idempotency key with a different request fails with `409`.
-9. Proposal creation writes no `transactions` row and calls no sign/broadcast method.
-10. Principal and credential expiry/revocation are enforced on every request.
-11. Unknown key IDs and wrong secrets receive the same generic response; secret comparison is timing-safe and performed on the unknown-key path with a dummy hash.
-12. Raw secrets are returned only at create/rotate and are never stored or audited.
+1. Application credentials authenticate only the four exact `/application/*` operations.
+2. `application-principal` never satisfies tenant-level or agent-access helpers.
+3. The global deny guard runs before every non-application handler and resource lookup.
+4. Capabilities and status are closed PostgreSQL enums and exact-match runtime values; no wildcard/prefix/case normalization exists.
+5. Every application relation and lookup carries both tenant and principal scope; composite foreign keys reject cross-scope composition.
+6. Assigned resources, wallet bindings, idempotency records, intents, and proposals reject updates.
+7. Wallet ensure atomically commits agent, encrypted EVM/Solana keys, EVM/Solana addresses, binding, and idempotency—or no rows.
+8. Full resource tuples are stored and compared. A deterministic-ID collision never reassigns or returns an occupied wallet.
+9. All writes require durable PostgreSQL idempotency scoped by tenant, principal, operation, and key.
+10. Proposal persistence has no signing/RPC/approval/broadcast import and writes neither `transactions` nor `approval_queue`.
+11. Exact proposal IDs cannot be consumed by any legacy sign/approve/reject route.
+12. Credential/principal revocation and expiry are read from authoritative storage on every request.
+13. Unknown/malformed/revoked/expired credentials share a generic response; every attempt performs one selector lookup and one timing-safe comparison, with a dummy hash on misses.
+14. Raw secrets are returned only once at create/rotate and never stored, logged, or audited.
 
 ## Abuse cases and controls
 
 | Abuse case | Control | Test evidence |
 |---|---|---|
-| Call sign/import/export/RPC/approve/reject | global namespace deny + distinct auth type | complete vault route matrix |
-| Mint agent token, delete agent, change policy | global namespace deny | agent route matrix |
-| Manage tenants/policies/webhooks/secrets | global namespace deny | admin route matrix |
-| Mix application and tenant credentials | application-header deny happens before tenant auth | route matrix uses application headers on every legacy family |
-| Create arbitrary owner wallet | assigned `ownerReferences` check in command service | unassigned owner returns 403 + audit |
-| Read another principal's wallet | tenant + principal ownership predicates | cross-principal 404 |
-| Replay changed transaction | canonical hash + unique principal/idempotency key | 409 conflict test |
-| Continue after key rotation/revocation/expiry | per-request credential/principal state checks | lifecycle tests |
-| Forge audit identity | actor ID comes only from authenticated context | audit row assertions |
-| Trigger synchronous execution | proposal table is separate; no Vault sign call or transaction row | proposal test asserts zero transaction rows |
+| Call any legacy/public/admin route | global namespace deny + distinct auth type | dynamic enumeration of every mounted method/path plus explicit custody matrix |
+| Smuggle execution fields | strict schemas reject unknown keys | `broadcast`, approval, signature, signed transaction, status, actor and scope field matrix |
+| Create arbitrary wallet/reassign agent | immutable assigned resource + no caller agent input | unassigned resource and ownership-mutation tests |
+| Cross principal/tenant composition | composite foreign keys and predicates | direct foreign-key rejection and cross-principal 404 tests |
+| Race wallet creation | one Vault transaction + PostgreSQL idempotency | concurrent ensure and injected-failure rollback tests |
+| Replay changed transaction | canonical hash + scoped operation idempotency | replay, payload drift, cross-operation, and real PostgreSQL concurrency tests |
+| Enumerate keys | high-entropy selector, uniform lookup/compare/failure, auth rate limit | malformed/unknown/wrong/expired response assertions and static middleware review |
+| Forge audit identity | actor/credential identity from authenticated context | audit actor and metadata assertions; strict forged-field rejection |
+| Turn proposal into execution | separate tables/module; proposal IDs absent from executable state | exact-ID sign/approve/reject matrix, zero Vault calls and zero transaction rows |
+| Break migration on live data | additive schema and no legacy-row rewrite | migration test over populated two-tenant agents/transactions |
 
 ## Residual risks
 
-- SHA-256 is appropriate for uniformly random 256-bit secrets; it is not suitable for human passwords. Operators must use generated secrets only.
-- Database compromise can alter principal rows. The tamper-evident audit key must remain separate from database credentials.
-- Wallet ensure creates encrypted custody material internally. It does not sign, but operators should alert on unexpected wallet creation volume.
-- A future proposal consumer is a new execution boundary and requires its own authorization, replay, approval, and threat-model review. Application credentials must never be accepted by that consumer as execution authorization.
+- SHA-256 is appropriate only because application secrets are uniformly random 256-bit values.
+- Database-superuser compromise can bypass constraints/triggers. Database access remains a separate privileged boundary.
+- The per-process authentication limiter complements upstream limits; deployment ingress must retain global abuse controls.
+- Any future proposal consumer is a new execution authority and requires its own authorization, replay, approval, and threat-model review. Application credentials must never authorize that consumer.

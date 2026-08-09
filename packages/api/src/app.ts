@@ -85,8 +85,8 @@ app.use("*", correlationId);
 // tenant middleware and therefore cannot accidentally inherit app authority.
 app.use("*", async (c, next) => {
   const hasApplicationCredential =
-    Boolean(c.req.header("X-Steward-Application-Key-Id")) ||
-    Boolean(c.req.header("X-Steward-Application-Secret"));
+    c.req.header("X-Steward-Application-Key-Id") !== undefined ||
+    c.req.header("X-Steward-Application-Secret") !== undefined;
   const isApplicationCommand =
     c.req.path === "/application" || c.req.path.startsWith("/application/");
   if (hasApplicationCredential && !isApplicationCommand) {

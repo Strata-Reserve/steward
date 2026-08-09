@@ -1,6 +1,9 @@
 import {
   agents,
   agentWallets,
+  applicationIdempotencyRecords,
+  applicationPrincipalResources,
+  applicationWallets,
   encryptedChainKeys,
   encryptedKeys,
   getDb,
@@ -106,6 +109,31 @@ export interface SignTransactionOptions {
   status?: TxStatus;
 }
 
+export interface EnsureApplicationWalletInput {
+  tenantId: string;
+  principalId: string;
+  resourceKind: "wallet_owner";
+  resourceId: string;
+  idempotencyKey: string;
+  requestHash: string;
+  walletId: string;
+  agentId: string;
+  name: string;
+}
+
+export interface EnsuredApplicationWallet {
+  id: string;
+  tenantId: string;
+  principalId: string;
+  resourceKind: "wallet_owner";
+  resourceId: string;
+  stewardAgentId: string;
+  addresses: { evm: string; solana: string };
+  createdAt: Date;
+}
+
+type VaultTransaction = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
+
 /**
  * Vault - the core signing service.
  *
@@ -131,6 +159,79 @@ export class Vault {
    *
    * @param chainType - Deprecated; ignored. Both chain families are always generated.
    */
+  private generateAgentMaterial() {
+    const evmPrivateKey = generatePrivateKey();
+    const evmAccount = privateKeyToAccount(evmPrivateKey);
+    const solanaKeypair = generateSolanaKeypair();
+    return {
+      evmAddress: evmAccount.address,
+      solanaAddress: solanaKeypair.publicKey,
+      evmEncrypted: this.keyStore.encrypt(evmPrivateKey),
+      solanaEncrypted: this.keyStore.encrypt(solanaKeypair.secretKey),
+    };
+  }
+
+  private async persistAgentMaterial(
+    tx: VaultTransaction,
+    input: {
+      tenantId: string;
+      agentId: string;
+      name: string;
+      platformId?: string;
+      createdAt: Date;
+    },
+    material: ReturnType<Vault["generateAgentMaterial"]>,
+  ) {
+    await tx.insert(agents).values({
+      id: input.agentId,
+      tenantId: input.tenantId,
+      name: input.name,
+      walletAddress: material.evmAddress,
+      platformId: input.platformId,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    await tx.insert(encryptedKeys).values({
+      agentId: input.agentId,
+      ciphertext: material.evmEncrypted.ciphertext,
+      iv: material.evmEncrypted.iv,
+      tag: material.evmEncrypted.tag,
+      salt: material.evmEncrypted.salt,
+    });
+    await tx.insert(encryptedChainKeys).values([
+      {
+        agentId: input.agentId,
+        chainFamily: "evm",
+        ciphertext: material.evmEncrypted.ciphertext,
+        iv: material.evmEncrypted.iv,
+        tag: material.evmEncrypted.tag,
+        salt: material.evmEncrypted.salt,
+      },
+      {
+        agentId: input.agentId,
+        chainFamily: "solana",
+        ciphertext: material.solanaEncrypted.ciphertext,
+        iv: material.solanaEncrypted.iv,
+        tag: material.solanaEncrypted.tag,
+        salt: material.solanaEncrypted.salt,
+      },
+    ]);
+    await tx.insert(agentWallets).values([
+      {
+        agentId: input.agentId,
+        chainFamily: "evm",
+        address: material.evmAddress,
+        createdAt: input.createdAt,
+      },
+      {
+        agentId: input.agentId,
+        chainFamily: "solana",
+        address: material.solanaAddress,
+        createdAt: input.createdAt,
+      },
+    ]);
+  }
+
   async createAgent(
     tenantId: string,
     agentId: string,
@@ -143,84 +244,147 @@ export class Vault {
       .select()
       .from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+    if (existingAgent) throw new Error(`Agent ${agentId} already exists for tenant ${tenantId}`);
 
-    if (existingAgent) {
-      throw new Error(`Agent ${agentId} already exists for tenant ${tenantId}`);
-    }
-
-    // ── Generate EVM keypair ─────────────────────────────────────────────
-    const evmPrivateKey = generatePrivateKey();
-    const evmAccount = privateKeyToAccount(evmPrivateKey);
-    const evmAddress = evmAccount.address;
-
-    // ── Generate Solana keypair ──────────────────────────────────────────
-    const solKp = generateSolanaKeypair();
-    const solanaAddress = solKp.publicKey;
-
-    // ── Encrypt both keys ────────────────────────────────────────────────
-    const evmEncrypted = this.keyStore.encrypt(evmPrivateKey);
-    const solEncrypted = this.keyStore.encrypt(solKp.secretKey);
-
+    const material = this.generateAgentMaterial();
     const createdAt = new Date();
-
-    // ── Persist all rows atomically - roll back everything on any failure ─
-    await db.transaction(async (tx) => {
-      // ── Persist agent row (walletAddress = EVM for backward compat) ────
-      await tx.insert(agents).values({
-        id: agentId,
-        tenantId,
-        name,
-        walletAddress: evmAddress,
-        platformId,
-        createdAt,
-        updatedAt: createdAt,
-      });
-
-      // ── Legacy encrypted_keys table (EVM key only, backward compat) ────
-      await tx.insert(encryptedKeys).values({
-        agentId,
-        ciphertext: evmEncrypted.ciphertext,
-        iv: evmEncrypted.iv,
-        tag: evmEncrypted.tag,
-        salt: evmEncrypted.salt,
-      });
-
-      // ── Multi-chain key storage ──────────────────────────────────────
-      await tx.insert(encryptedChainKeys).values([
-        {
-          agentId,
-          chainFamily: "evm",
-          ciphertext: evmEncrypted.ciphertext,
-          iv: evmEncrypted.iv,
-          tag: evmEncrypted.tag,
-          salt: evmEncrypted.salt,
-        },
-        {
-          agentId,
-          chainFamily: "solana",
-          ciphertext: solEncrypted.ciphertext,
-          iv: solEncrypted.iv,
-          tag: solEncrypted.tag,
-          salt: solEncrypted.salt,
-        },
-      ]);
-
-      // ── Multi-chain public address storage ───────────────────────────
-      await tx.insert(agentWallets).values([
-        { agentId, chainFamily: "evm", address: evmAddress, createdAt },
-        { agentId, chainFamily: "solana", address: solanaAddress, createdAt },
-      ]);
-    });
-
+    await db.transaction((tx) =>
+      this.persistAgentMaterial(tx, { tenantId, agentId, name, platformId, createdAt }, material),
+    );
     return {
       id: agentId,
       tenantId,
       name,
-      walletAddress: evmAddress,
-      walletAddresses: { evm: evmAddress, solana: solanaAddress },
+      walletAddress: material.evmAddress,
+      walletAddresses: { evm: material.evmAddress, solana: material.solanaAddress },
       platformId,
       createdAt,
     };
+  }
+
+  /**
+   * Atomically ensures an application-owned wallet. The application binding,
+   * agent, encrypted keys, public addresses, and durable idempotency record
+   * commit in one Vault-owned PostgreSQL transaction.
+   */
+  async ensureApplicationWallet(
+    input: EnsureApplicationWalletInput,
+  ): Promise<{ wallet: EnsuredApplicationWallet; created: boolean }> {
+    const db = getDb();
+    return db.transaction(async (tx) => {
+      const [assignment] = await tx
+        .select({ resourceId: applicationPrincipalResources.resourceId })
+        .from(applicationPrincipalResources)
+        .where(
+          and(
+            eq(applicationPrincipalResources.tenantId, input.tenantId),
+            eq(applicationPrincipalResources.principalId, input.principalId),
+            eq(applicationPrincipalResources.resourceKind, input.resourceKind),
+            eq(applicationPrincipalResources.resourceId, input.resourceId),
+          ),
+        );
+      if (!assignment) throw new Error("application_wallet_owner_not_assigned");
+
+      const insertedIdempotency = await tx
+        .insert(applicationIdempotencyRecords)
+        .values({
+          tenantId: input.tenantId,
+          principalId: input.principalId,
+          operation: "wallet_ensure",
+          idempotencyKey: input.idempotencyKey,
+          requestHash: input.requestHash,
+          responseId: input.walletId,
+        })
+        .onConflictDoNothing({
+          target: [
+            applicationIdempotencyRecords.tenantId,
+            applicationIdempotencyRecords.principalId,
+            applicationIdempotencyRecords.operation,
+            applicationIdempotencyRecords.idempotencyKey,
+          ],
+        })
+        .returning({ responseId: applicationIdempotencyRecords.responseId });
+      const [idempotency] = await tx
+        .select()
+        .from(applicationIdempotencyRecords)
+        .where(
+          and(
+            eq(applicationIdempotencyRecords.tenantId, input.tenantId),
+            eq(applicationIdempotencyRecords.principalId, input.principalId),
+            eq(applicationIdempotencyRecords.operation, "wallet_ensure"),
+            eq(applicationIdempotencyRecords.idempotencyKey, input.idempotencyKey),
+          ),
+        );
+      if (!idempotency) throw new Error("application_wallet_idempotency_missing");
+      if (
+        idempotency.requestHash !== input.requestHash ||
+        idempotency.responseId !== input.walletId
+      ) {
+        throw new Error("application_wallet_idempotency_conflict");
+      }
+
+      const [existing] = await tx
+        .select()
+        .from(applicationWallets)
+        .where(
+          and(
+            eq(applicationWallets.tenantId, input.tenantId),
+            eq(applicationWallets.principalId, input.principalId),
+            eq(applicationWallets.resourceKind, input.resourceKind),
+            eq(applicationWallets.resourceId, input.resourceId),
+          ),
+        );
+      if (existing) {
+        if (existing.id !== input.walletId || existing.stewardAgentId !== input.agentId) {
+          throw new Error("application_wallet_deterministic_identity_collision");
+        }
+        return { wallet: existing, created: false };
+      }
+      if (insertedIdempotency.length === 0) {
+        throw new Error("application_wallet_idempotency_response_missing");
+      }
+
+      const [occupiedWalletId] = await tx
+        .select({ id: applicationWallets.id })
+        .from(applicationWallets)
+        .where(eq(applicationWallets.id, input.walletId));
+      if (occupiedWalletId) throw new Error("application_wallet_id_collision");
+
+      const [occupiedAgent] = await tx
+        .select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.id, input.agentId));
+      if (occupiedAgent) throw new Error("application_wallet_agent_id_collision");
+
+      const material = this.generateAgentMaterial();
+      const createdAt = new Date();
+      await this.persistAgentMaterial(
+        tx,
+        {
+          tenantId: input.tenantId,
+          agentId: input.agentId,
+          name: input.name,
+          platformId: `application-principal:${input.principalId}`,
+          createdAt,
+        },
+        material,
+      );
+      const [wallet] = await tx
+        .insert(applicationWallets)
+        .values({
+          id: input.walletId,
+          tenantId: input.tenantId,
+          principalId: input.principalId,
+          resourceKind: input.resourceKind,
+          resourceId: input.resourceId,
+          stewardAgentId: input.agentId,
+          addresses: { evm: material.evmAddress, solana: material.solanaAddress },
+          createdAt,
+        })
+        .returning();
+      if (!wallet) throw new Error("application_wallet_persistence_failed");
+      return { wallet, created: true };
+    });
   }
 
   /**

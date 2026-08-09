@@ -485,18 +485,18 @@ export async function sessionAuth(c: Context<{ Variables: AppVariables }>, next:
 }
 
 export function requireAgentAccess(c: Context<{ Variables: AppVariables }>): boolean {
-  if (c.get("authType") === "application-principal") return false;
-  const agentScope = c.get("agentScope");
-  if (!agentScope) return true;
-  return agentScope === c.req.param("agentId");
+  const authType = c.get("authType");
+  if (authType === "agent-token") {
+    const agentScope = c.get("agentScope");
+    return Boolean(agentScope) && agentScope === c.req.param("agentId");
+  }
+  return authType === "api-key" || authType === "session-jwt" || authType === "dashboard-jwt";
 }
 
 export function requireTenantLevel(c: Context<{ Variables: AppVariables }>): boolean {
   const authType = c.get("authType");
-  if (authType === "application-principal") return false;
   if (authType === "api-key") return true;
-  if (authType === "agent-token") return false;
-
+  if (authType !== "session-jwt" && authType !== "dashboard-jwt") return false;
   const tenantRole = c.get("tenantRole");
   return tenantRole === "owner" || tenantRole === "admin";
 }

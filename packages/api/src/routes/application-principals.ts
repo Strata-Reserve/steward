@@ -1,10 +1,14 @@
-import { applicationPrincipalCredentials, applicationPrincipals } from "@stwd/db";
+import {
+  applicationPrincipalCredentials,
+  applicationPrincipalResources,
+  applicationPrincipals,
+} from "@stwd/db";
 import { and, eq, isNull } from "drizzle-orm";
 import { type Context, Hono } from "hono";
+import { z } from "zod";
 import {
   APPLICATION_CAPABILITIES,
   generateApplicationCredential,
-  isApplicationCapability,
   isValidApplicationReference,
   parseFutureExpiry,
 } from "../services/application-boundary";
@@ -13,12 +17,26 @@ import {
   type ApiResponse,
   type AppVariables,
   db,
-  isNonEmptyString,
   requireTenantLevel,
   safeJsonParse,
 } from "../services/context";
 
 export const applicationPrincipalAdminRoutes = new Hono<{ Variables: AppVariables }>();
+
+const capabilitySchema = z.enum(APPLICATION_CAPABILITIES);
+const resourceSchema = z
+  .object({ kind: z.literal("wallet_owner"), id: z.string().min(1).max(255) })
+  .strict();
+const createSchema = z
+  .object({
+    name: z.string().trim().min(1).max(255),
+    capabilities: z.array(capabilitySchema).min(1).max(4),
+    resources: z.array(resourceSchema).min(1).max(100),
+    expiresAt: z.string(),
+    credentialExpiresAt: z.string(),
+  })
+  .strict();
+const rotateSchema = z.object({ credentialExpiresAt: z.string() }).strict();
 
 function requestMetadata(c: Context<{ Variables: AppVariables }>) {
   return {
@@ -35,40 +53,14 @@ applicationPrincipalAdminRoutes.post("/", async (c) => {
       403,
     );
   }
-  const body = await safeJsonParse<{
-    name?: string;
-    capabilities?: unknown[];
-    ownerReferences?: unknown[];
-    expiresAt?: string;
-    credentialExpiresAt?: string;
-  }>(c);
-  if (!body) return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
-  if (!isNonEmptyString(body.name) || body.name.trim().length > 255) {
-    return c.json<ApiResponse>({ ok: false, error: "name must be 1-255 characters" }, 400);
+  const raw = await safeJsonParse<unknown>(c);
+  const parsed = createSchema.safeParse(raw);
+  if (!parsed.success) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid application principal request" }, 400);
   }
-  if (
-    !Array.isArray(body.capabilities) ||
-    body.capabilities.length === 0 ||
-    !body.capabilities.every(isApplicationCapability)
-  ) {
-    return c.json<ApiResponse>(
-      {
-        ok: false,
-        error: `capabilities must contain only: ${APPLICATION_CAPABILITIES.join(", ")}`,
-      },
-      400,
-    );
-  }
-  if (
-    !Array.isArray(body.ownerReferences) ||
-    body.ownerReferences.length === 0 ||
-    body.ownerReferences.length > 100 ||
-    !body.ownerReferences.every(isValidApplicationReference)
-  ) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "ownerReferences must contain 1-100 valid owner references" },
-      400,
-    );
+  const body = parsed.data;
+  if (!body.resources.every((resource) => isValidApplicationReference(resource.id))) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid assigned resource id" }, 400);
   }
   const expiresAt = parseFutureExpiry(body.expiresAt);
   if (!expiresAt) {
@@ -88,21 +80,32 @@ applicationPrincipalAdminRoutes.post("/", async (c) => {
   const tenantId = c.get("tenantId");
   const principalId = `app_${crypto.randomUUID().replaceAll("-", "")}`;
   const capabilities = [...new Set(body.capabilities)].sort();
-  const ownerReferences = [...new Set(body.ownerReferences)].sort();
+  const resources = [
+    ...new Map(
+      body.resources.map((resource) => [`${resource.kind}:${resource.id}`, resource]),
+    ).values(),
+  ];
   const credential = generateApplicationCredential();
 
   await db.transaction(async (tx) => {
     await tx.insert(applicationPrincipals).values({
       id: principalId,
       tenantId,
-      name: body.name!.trim(),
-      auditIdentity: principalId,
+      name: body.name,
       capabilities,
-      ownerReferences,
       expiresAt,
     });
+    await tx.insert(applicationPrincipalResources).values(
+      resources.map((resource) => ({
+        tenantId,
+        principalId,
+        resourceKind: resource.kind,
+        resourceId: resource.id,
+      })),
+    );
     await tx.insert(applicationPrincipalCredentials).values({
       keyId: credential.keyId,
+      tenantId,
       principalId,
       secretHash: credential.secretHash,
       expiresAt: credentialExpiresAt,
@@ -118,9 +121,9 @@ applicationPrincipalAdminRoutes.post("/", async (c) => {
     resourceId: principalId,
     metadata: {
       capabilities,
-      ownerReferences,
+      resources,
       expiresAt: expiresAt.toISOString(),
-      keyId: credential.keyId,
+      credentialKeyId: credential.keyId,
     },
     ...requestMetadata(c),
   });
@@ -131,9 +134,9 @@ applicationPrincipalAdminRoutes.post("/", async (c) => {
       data: {
         principal: {
           id: principalId,
-          name: body.name.trim(),
+          name: body.name,
           capabilities,
-          ownerReferences,
+          resources,
           expiresAt: expiresAt.toISOString(),
           auditIdentity: principalId,
         },
@@ -161,16 +164,21 @@ applicationPrincipalAdminRoutes.post("/:principalId/rotate", async (c) => {
     .select()
     .from(applicationPrincipals)
     .where(
-      and(eq(applicationPrincipals.id, principalId), eq(applicationPrincipals.tenantId, tenantId)),
+      and(eq(applicationPrincipals.tenantId, tenantId), eq(applicationPrincipals.id, principalId)),
     );
   if (!principal)
     return c.json<ApiResponse>({ ok: false, error: "Application principal not found" }, 404);
   if (principal.revokedAt || principal.expiresAt.getTime() <= Date.now()) {
     return c.json<ApiResponse>({ ok: false, error: "Application principal is inactive" }, 409);
   }
-  const body = await safeJsonParse<{ credentialExpiresAt?: string }>(c);
-  if (!body) return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
-  const credentialExpiresAt = parseFutureExpiry(body.credentialExpiresAt, principal.expiresAt);
+  const raw = await safeJsonParse<unknown>(c);
+  const parsed = rotateSchema.safeParse(raw);
+  if (!parsed.success)
+    return c.json<ApiResponse>({ ok: false, error: "Invalid rotation request" }, 400);
+  const credentialExpiresAt = parseFutureExpiry(
+    parsed.data.credentialExpiresAt,
+    principal.expiresAt,
+  );
   if (!credentialExpiresAt) {
     return c.json<ApiResponse>(
       { ok: false, error: "credentialExpiresAt must be future and no later than principal expiry" },
@@ -185,12 +193,14 @@ applicationPrincipalAdminRoutes.post("/:principalId/rotate", async (c) => {
       .set({ revokedAt: rotatedAt })
       .where(
         and(
+          eq(applicationPrincipalCredentials.tenantId, tenantId),
           eq(applicationPrincipalCredentials.principalId, principalId),
           isNull(applicationPrincipalCredentials.revokedAt),
         ),
       );
     await tx.insert(applicationPrincipalCredentials).values({
       keyId: credential.keyId,
+      tenantId,
       principalId,
       secretHash: credential.secretHash,
       expiresAt: credentialExpiresAt,
@@ -203,7 +213,7 @@ applicationPrincipalAdminRoutes.post("/:principalId/rotate", async (c) => {
     action: "application_principal.credential.rotate",
     resourceType: "application_principal",
     resourceId: principalId,
-    metadata: { keyId: credential.keyId, expiresAt: credentialExpiresAt.toISOString() },
+    metadata: { credentialKeyId: credential.keyId, expiresAt: credentialExpiresAt.toISOString() },
     ...requestMetadata(c),
   });
   return c.json<ApiResponse>({
@@ -229,7 +239,7 @@ applicationPrincipalAdminRoutes.post("/:principalId/revoke", async (c) => {
     .select()
     .from(applicationPrincipals)
     .where(
-      and(eq(applicationPrincipals.id, principalId), eq(applicationPrincipals.tenantId, tenantId)),
+      and(eq(applicationPrincipals.tenantId, tenantId), eq(applicationPrincipals.id, principalId)),
     );
   if (!principal)
     return c.json<ApiResponse>({ ok: false, error: "Application principal not found" }, 404);
@@ -239,12 +249,18 @@ applicationPrincipalAdminRoutes.post("/:principalId/revoke", async (c) => {
       await tx
         .update(applicationPrincipals)
         .set({ revokedAt })
-        .where(eq(applicationPrincipals.id, principalId));
+        .where(
+          and(
+            eq(applicationPrincipals.tenantId, tenantId),
+            eq(applicationPrincipals.id, principalId),
+          ),
+        );
       await tx
         .update(applicationPrincipalCredentials)
         .set({ revokedAt })
         .where(
           and(
+            eq(applicationPrincipalCredentials.tenantId, tenantId),
             eq(applicationPrincipalCredentials.principalId, principalId),
             isNull(applicationPrincipalCredentials.revokedAt),
           ),
