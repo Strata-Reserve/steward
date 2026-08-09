@@ -213,10 +213,7 @@ describe("email OTP anti-squatting flow", () => {
   it("an already-verified user with a credential can re-register WITHOUT a grant", async () => {
     const email = `existing-verified-${Date.now()}@example.com`;
     const db = getDb();
-    const [u] = await db
-      .insert(users)
-      .values({ email, emailVerified: true })
-      .returning();
+    const [u] = await db.insert(users).values({ email, emailVerified: true }).returning();
     await db.insert(authenticators).values({
       userId: u!.id,
       credentialId: `cred-${Date.now()}`,

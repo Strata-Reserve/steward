@@ -84,10 +84,7 @@ import { generateNonce, SiweMessage } from "siwe";
 import { getAddress, verifyMessage as viemVerifyMessage } from "viem";
 import { trackAuditEvent } from "../services/audit";
 import { verifyEip1271 } from "../services/eip1271";
-import {
-  getGracedSuccessor,
-  rememberRotation,
-} from "../services/refresh-rotation-grace";
+import { getGracedSuccessor, rememberRotation } from "../services/refresh-rotation-grace";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -408,11 +405,7 @@ async function issueEmailGrant(email: string, tenantId: string): Promise<string>
 }
 
 /** Consume (single-use) a grant; true only if it matches {email, tenantId}. */
-async function consumeEmailGrant(
-  grant: string,
-  email: string,
-  tenantId: string,
-): Promise<boolean> {
+async function consumeEmailGrant(grant: string, email: string, tenantId: string): Promise<boolean> {
   if (!grant || grant.length > 256) return false;
   const stored = await getEmailGrantStore().consume(emailGrantKey(grant));
   if (!stored) return false;
@@ -2108,9 +2101,7 @@ auth.post("/passkey/register/verify", async (c) => {
     const resolvedTenantId =
       c.req.header("X-Steward-Tenant")?.trim() || body.tenantId?.trim() || _DEFAULT_TENANT_ID;
     const grant = c.req.header("X-Steward-Email-Grant")?.trim() || body.emailGrant?.trim();
-    const grantOk = grant
-      ? await consumeEmailGrant(grant, email, resolvedTenantId)
-      : false;
+    const grantOk = grant ? await consumeEmailGrant(grant, email, resolvedTenantId) : false;
     if (!grantOk) {
       return c.json<ApiResponse>(
         { ok: false, error: "Email verification required before passkey registration" },

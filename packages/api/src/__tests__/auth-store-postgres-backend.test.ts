@@ -14,9 +14,9 @@
  * the brittleness the fix removes.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { PostgresBackend } from "@stwd/auth";
 import { closeDb } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
-import { PostgresBackend } from "@stwd/auth";
 
 beforeAll(async () => {
   process.env.STEWARD_PGLITE_MEMORY = "true";
