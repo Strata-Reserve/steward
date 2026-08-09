@@ -22,6 +22,20 @@ export const applicationRoutes = new Hono<{ Variables: AppVariables }>();
 type AppContext = Context<{ Variables: AppVariables }>;
 
 const ensureSchema = z.object({ resourceId: z.string().min(1).max(255) }).strict();
+// uint256 max (2^256-1) is 78 decimal digits; anything longer is not a
+// representable EVM value. Bounding this is a SECURITY control, not tidiness:
+// `prepareApplicationTransaction` calls BigInt(command.value), whose decimal ->
+// binary conversion is superlinear, and the runtime is a single-threaded event
+// loop. Unbounded, a valid LEAST-PRIVILEGE principal could block the API for
+// every tenant (measured: 200k digits => 666ms of blocking; ~1M digits fits
+// inside the 1MB body limit and throws a BigInt OOM that surfaces as a 500).
+// Rejecting oversized input at the schema means the expensive conversion is
+// never reached. Capability checks do not help here — the cost is paid by an
+// authorized caller — so the bound is the control.
+const EVM_UINT256_MAX_DIGITS = 78;
+// 1MB body limit / 2 hex chars per byte, with headroom. Bounded for the same
+// reason: `data` is lowercased and canonically JSON-hashed downstream.
+const EVM_CALLDATA_MAX_CHARS = 262_144;
 const prepareSchema = z
   .object({
     walletId: z.string().min(1).max(64),
@@ -29,10 +43,11 @@ const prepareSchema = z
     transaction: z
       .object({
         to: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-        value: z.string().regex(/^\d+$/),
+        value: z.string().regex(/^\d+$/).max(EVM_UINT256_MAX_DIGITS),
         data: z
           .string()
           .regex(/^0x(?:[0-9a-fA-F]{2})*$/)
+          .max(EVM_CALLDATA_MAX_CHARS)
           .optional(),
       })
       .strict(),

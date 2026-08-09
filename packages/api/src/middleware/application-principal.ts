@@ -17,6 +17,35 @@ const AUTH_MAX_TRACKED_SELECTORS = 10_000;
 const authBuckets = new Map<string, { count: number; resetAt: number }>();
 let globalAuthBucket = { count: 0, resetAt: 0 };
 
+// A rate limiter that denies LEGITIMATE callers when saturated is a free DoS:
+// the attacker pays nothing and authorized principals are locked out. Both
+// original failure modes were reachable WITHOUT any valid credential:
+//
+//   1. the global counter was incremented for every request and, once tripped,
+//      429'd valid credentials too;
+//   2. `size >= MAX_TRACKED -> return true` denied any principal not ALREADY in
+//      the map, so filling the map with junk selectors locked out new legitimate
+//      principals while staying under the global cap.
+//
+// Both are fixed by making saturation cost the ATTACKER rather than the user:
+// evict least-recently-used instead of denying, and scope the global ceiling to
+// selectors that have never successfully authenticated. A malformed or unknown
+// selector is cheap to shed; a known-good one is never collateral damage.
+const knownGoodSelectors = new Set<string>();
+const KNOWN_GOOD_MAX = 10_000;
+
+/** Called after a credential successfully authenticates. */
+export function markApplicationSelectorKnownGood(selector: string): void {
+  if (!selector) return;
+  // Bounded, LRU-ish: re-inserting refreshes recency via delete+add.
+  knownGoodSelectors.delete(selector);
+  knownGoodSelectors.add(selector);
+  if (knownGoodSelectors.size > KNOWN_GOOD_MAX) {
+    const oldest = knownGoodSelectors.values().next();
+    if (!oldest.done) knownGoodSelectors.delete(oldest.value);
+  }
+}
+
 function applicationAuthRateLimited(selector: string): boolean {
   const now = Date.now();
   if (globalAuthBucket.resetAt <= now) {
@@ -25,13 +54,29 @@ function applicationAuthRateLimited(selector: string): boolean {
       if (value.resetAt <= now) authBuckets.delete(candidate);
     }
   }
-  globalAuthBucket.count += 1;
-  if (globalAuthBucket.count > AUTH_GLOBAL_MAX_ATTEMPTS) return true;
 
   const key = selector || "malformed";
+  const wellFormed = KEY_ID_RE.test(key);
+  const knownGood = wellFormed && knownGoodSelectors.has(key);
+
+  // The global ceiling exists to shed floods of unknown/malformed selectors.
+  // A selector that has previously authenticated is NOT charged against it, so
+  // a junk flood can no longer lock out established principals. Such callers
+  // remain bounded by their own per-selector bucket below.
+  if (!knownGood) {
+    globalAuthBucket.count += 1;
+    if (globalAuthBucket.count > AUTH_GLOBAL_MAX_ATTEMPTS) return true;
+  }
+
   const bucket = authBuckets.get(key);
   if (!bucket || bucket.resetAt <= now) {
-    if (!bucket && authBuckets.size >= AUTH_MAX_TRACKED_SELECTORS) return true;
+    if (!bucket && authBuckets.size >= AUTH_MAX_TRACKED_SELECTORS) {
+      // Evict the least-recently-inserted entry instead of denying. Map
+      // preserves insertion order, so the first key is the oldest. Denying
+      // here would fail CLOSED against a brand-new legitimate principal.
+      const oldest = authBuckets.keys().next();
+      if (!oldest.done) authBuckets.delete(oldest.value);
+    }
     authBuckets.set(key, { count: 1, resetAt: now + AUTH_WINDOW_MS });
     return false;
   }
@@ -112,6 +157,12 @@ export async function applicationPrincipalAuth(
   ) {
     return deny(c);
   }
+
+  // Only reached on a fully valid, non-revoked, non-expired credential. From
+  // here on this selector is exempt from the GLOBAL flood ceiling (it keeps its
+  // own per-selector bucket), so a junk flood cannot lock out a principal that
+  // has demonstrably authenticated.
+  markApplicationSelectorKnownGood(record.keyId);
 
   const principal: ApplicationPrincipalContext = {
     id: record.principalId,
