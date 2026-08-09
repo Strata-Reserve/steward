@@ -5,9 +5,9 @@ import type { EmailProvider } from "./email-provider";
 import { ConsoleProvider } from "./email-provider";
 import {
   renderTemplate as defaultTemplateRenderer,
-  renderOtpTemplate,
   type MagicLinkTemplateData,
   type RenderedMagicLinkTemplate,
+  renderOtpTemplate,
 } from "./email-templates";
 import { TokenStore } from "./token-store";
 

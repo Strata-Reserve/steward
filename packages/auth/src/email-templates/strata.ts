@@ -149,10 +149,7 @@ export function renderStrataMagicLinkTemplate({
       "",
       "— Strata Reserve",
     ].join("\n"),
-    html: shell(
-      `Sign in to Strata Reserve. Link expires in ${expiresInMinutes} minutes.`,
-      inner,
-    ),
+    html: shell(`Sign in to Strata Reserve. Link expires in ${expiresInMinutes} minutes.`, inner),
   };
 }
 
