@@ -3,8 +3,8 @@ import {
   __clearRotationGrace,
   __graceWindowMs,
   getGracedSuccessor,
-  rememberRotation,
   type RotationSuccessor,
+  rememberRotation,
 } from "../services/refresh-rotation-grace";
 
 const successor = (n: number): RotationSuccessor => ({
