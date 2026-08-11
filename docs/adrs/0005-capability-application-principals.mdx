@@ -1,0 +1,47 @@
+---
+title: "Capability-oriented application principals"
+status: "Accepted"
+date: "2026-08-09"
+---
+
+## Context
+
+A product backend must request custody operations without receiving tenant-administrator, agent-token, signing, broadcasting, approval, policy, or arbitrary-resource authority. Existing tenant keys and agent JWTs cannot safely represent this contract.
+
+## Decision
+
+Steward has a first-class, tenant-bound **application principal**. Its durable principal ID is its audit identity. A closed database-enforced capability enum, immutable assigned-resource rows, principal expiry, and independently rotatable/revocable credentials define authority. Credentials use a high-entropy public selector and a 256-bit random secret whose SHA-256 hash is stored; plaintext is returned once.
+
+Application credentials are accepted only under `/application/*`. A global header guard rejects them across every other mounted route before handler logic. Mixed tenant/application credentials fail closed. `authType: "application-principal"` never satisfies tenant-level or agent access helpers.
+
+The exact capability vocabulary is:
+
+- `wallet:ensure`
+- `wallet:address:read`
+- `transaction:prepare`
+- `transaction:propose`
+
+Application-resource relationships carry tenant and principal scope in composite database foreign keys. `Ensure Wallet` is a Vault-owned atomic command: the internal agent, both encrypted chain keys, both public addresses, application binding, and durable idempotency record commit together or not at all. Deterministic identities contain a domain-separated hash of tenant, principal, resource kind, and full resource ID; exact stored tuples are compared on replay and occupied identities fail closed.
+
+`Prepare Transaction` and `Propose Transaction` persist immutable records in application-only tables. Their module imports persistence only and has no Vault, RPC, approval, signing, broadcast, `transactions`, or `approval_queue` dependency. Proposal IDs therefore carry no executable authority.
+
+Every write requires a bounded `Idempotency-Key`. PostgreSQL uniqueness is scoped by `(tenant, principal, operation, key)` and stores the canonical request hash plus response identity. Concurrent identical requests serialize to one result; payload drift returns `409`.
+
+## Consequences
+
+- Compromise is bounded to four exact commands and explicit assigned resources.
+- Revocation is authoritative on the next request and does not affect unrelated principals.
+- Invalid selector, malformed secret, wrong secret, revoked key, and expired key use uniform authentication responses, an indexed selector lookup, and a dummy timing-safe comparison on misses.
+- Command audit rows derive actor and credential identities from authenticated server context; caller fields cannot override them.
+- The first release prepares EVM transactions only. Both EVM and Solana public addresses are provisioned atomically.
+- Any future proposal consumer is a new privileged command and requires separate architecture/security review.
+
+## Constitutional analysis
+
+No Position, ownership, settlement, issuance, or lifecycle state changes. An application proposal is a custody request, not a Strata Transaction Engine transaction. Vault remains the sole wallet/key writer, and the application proposal module is the sole intent/proposal writer. Commands are explicit; bindings, intents, proposals, and idempotency records are immutable; audit identity is server-derived. No frontend authority or new economic writer is introduced.
+
+## Related
+
+- [Application principal threat model](../security/application-principal-threat-model.mdx)
+- [Application principal API](../api-reference/application-principals.mdx)
+- [Operations runbook](../runbooks/application-principal-operations.md)

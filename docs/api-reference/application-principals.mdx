@@ -1,0 +1,129 @@
+---
+title: "Application principals"
+description: "Least-privilege proposal-only custody API for product backends."
+---
+
+# Application principals
+
+Application credentials use two headers and are valid only on the four exact `/application/*` commands:
+
+```http
+X-Steward-Application-Key-Id: apk_...
+X-Steward-Application-Secret: aps_...
+```
+
+Do not send tenant keys, bearer tokens, tenant headers, or internal agent IDs with application credentials. Credential mixing fails authentication.
+
+## Administrator lifecycle
+
+Tenant owner/admin or tenant API-key authentication is required.
+
+### Create
+
+`POST /application-principals`
+
+```json
+{
+  "name": "Strata API",
+  "capabilities": [
+    "wallet:ensure",
+    "wallet:address:read",
+    "transaction:prepare",
+    "transaction:propose"
+  ],
+  "resources": [
+    { "kind": "wallet_owner", "id": "investor:party_123" }
+  ],
+  "expiresAt": "2027-08-09T00:00:00.000Z",
+  "credentialExpiresAt": "2026-11-09T00:00:00.000Z"
+}
+```
+
+The capability and resource-kind vocabularies are closed database enums. The response contains `credential.secret` once. Store it in the deployment secret manager.
+
+### Rotate
+
+`POST /application-principals/:principalId/rotate`
+
+```json
+{ "credentialExpiresAt": "2026-12-09T00:00:00.000Z" }
+```
+
+Rotation atomically revokes all active old credentials and returns one new credential.
+
+### Revoke
+
+`POST /application-principals/:principalId/revoke`
+
+Revocation immediately invalidates the principal and every credential. Authentication reads authoritative database state on each request.
+
+## Application contract
+
+All write commands require a printable, non-empty `Idempotency-Key` header of at most 128 bytes. Idempotency is durable in PostgreSQL and scoped by tenant, principal, operation, and key.
+
+### Ensure Wallet
+
+`POST /application/wallets/ensure`
+
+```http
+Idempotency-Key: wallet:party_123:v1
+```
+
+```json
+{ "resourceId": "investor:party_123" }
+```
+
+Returns one stable application wallet binding with both EVM and Solana public addresses. The agent, encrypted keys, addresses, immutable resource binding, and idempotency record commit in one Vault-owned transaction. The resource must be assigned to the principal.
+
+### Read Wallet Address
+
+`GET /application/wallets/:walletId/address`
+
+Returns both public addresses only for a wallet owned by the authenticated tenant and principal. Foreign resources return `404`.
+
+### Prepare Transaction
+
+`POST /application/transactions/prepare`
+
+```http
+Idempotency-Key: close-intent:cii_123:v1
+```
+
+```json
+{
+  "walletId": "aw_...",
+  "network": { "type": "evm", "chainId": 8453 },
+  "transaction": {
+    "to": "0x1111111111111111111111111111111111111111",
+    "value": "0",
+    "data": "0x1234"
+  }
+}
+```
+
+The response is an immutable canonical unsigned intent with a SHA-256 `requestHash` and server-derived expiry. Decimal values and hex/address casing are canonicalized. Same key and request returns the original ID; payload drift returns `409` without mutation.
+
+### Propose Transaction
+
+`POST /application/transactions/propose`
+
+```http
+Idempotency-Key: close-proposal:cii_123:v1
+```
+
+```json
+{ "preparedTransactionId": "ati_..." }
+```
+
+Returns `202` with an immutable `status: "proposed"` record. Proposal IDs exist outside `transactions` and `approval_queue`; existing sign, approve, reject, RPC, and broadcast routes cannot consume them.
+
+All command schemas reject unknown fields, including `agentId`, `tenantId`, `principalId`, `actorId`, `broadcast`, `approve`, `signature`, `signedTx`, and `status`.
+
+## Errors
+
+- `400` invalid or unknown command fields, missing/invalid idempotency key
+- `401` malformed, unknown, expired, rotated, or revoked credential
+- `403` missing exact capability or unassigned resource
+- `404` resource not owned by this tenant and principal
+- `409` idempotency conflict, expired intent, or deterministic identity collision
+- `429` application-authentication rate limit

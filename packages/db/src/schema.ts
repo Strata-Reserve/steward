@@ -12,7 +12,9 @@ import {
   bigint,
   bigserial,
   boolean,
+  check,
   customType,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -69,6 +71,23 @@ export interface TenantEmailConfig {
 }
 
 export const chainFamilyEnum = pgEnum("chain_family", ["evm", "solana"]);
+
+export const applicationCapabilityEnum = pgEnum("application_capability", [
+  "wallet:ensure",
+  "wallet:address:read",
+  "transaction:prepare",
+  "transaction:propose",
+]);
+
+export const applicationResourceKindEnum = pgEnum("application_resource_kind", ["wallet_owner"]);
+
+export const applicationOperationEnum = pgEnum("application_operation", [
+  "wallet_ensure",
+  "transaction_prepare",
+  "transaction_propose",
+]);
+
+export const applicationProposalStatusEnum = pgEnum("application_proposal_status", ["proposed"]);
 
 export const policyTypeEnum = pgEnum("policy_type", [
   "spending-limit",
@@ -154,6 +173,256 @@ export const agents = pgTable(
   },
   (table) => ({
     tenantIdIdx: index("agents_tenant_id_idx").on(table.tenantId),
+    tenantIdUniqueIdx: uniqueIndex("agents_tenant_id_id_idx").on(table.tenantId, table.id),
+  }),
+);
+
+// ─── Capability-oriented application boundary ───────────────────────────────
+// Every relationship carries tenant + principal scope in its database keys.
+// The durable principal id is the application audit identity.
+export const applicationPrincipals = pgTable(
+  "application_principals",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 })
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 255 }).notNull(),
+    capabilities: applicationCapabilityEnum("capabilities").array().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    ...timestamps,
+  },
+  (table) => ({
+    tenantPrincipalUnique: uniqueIndex("application_principals_tenant_id_idx").on(
+      table.tenantId,
+      table.id,
+    ),
+    capabilitiesNonEmpty: check(
+      "application_principals_capabilities_nonempty_chk",
+      sql`cardinality(${table.capabilities}) BETWEEN 1 AND 4`,
+    ),
+    activeIdx: index("application_principals_active_idx")
+      .on(table.tenantId, table.expiresAt)
+      .where(sql`${table.revokedAt} IS NULL`),
+  }),
+);
+
+export const applicationPrincipalCredentials = pgTable(
+  "application_principal_credentials",
+  {
+    keyId: varchar("key_id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    secretHash: varchar("secret_hash", { length: 64 }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    tenantPrincipalKeyUnique: uniqueIndex("application_credentials_tenant_principal_key_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.keyId,
+    ),
+    tenantPrincipalFk: foreignKey({
+      columns: [table.tenantId, table.principalId],
+      foreignColumns: [applicationPrincipals.tenantId, applicationPrincipals.id],
+      name: "application_credentials_tenant_principal_fk",
+    }).onDelete("cascade"),
+    activeIdx: index("application_credentials_active_idx")
+      .on(table.tenantId, table.principalId, table.expiresAt)
+      .where(sql`${table.revokedAt} IS NULL`),
+  }),
+);
+
+export const applicationPrincipalResources = pgTable(
+  "application_principal_resources",
+  {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    resourceKind: applicationResourceKindEnum("resource_kind").notNull(),
+    resourceId: varchar("resource_id", { length: 255 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    resourceUnique: uniqueIndex("application_principal_resources_scope_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.resourceKind,
+      table.resourceId,
+    ),
+    tenantPrincipalFk: foreignKey({
+      columns: [table.tenantId, table.principalId],
+      foreignColumns: [applicationPrincipals.tenantId, applicationPrincipals.id],
+      name: "application_principal_resources_tenant_principal_fk",
+    }).onDelete("cascade"),
+  }),
+);
+
+export interface ApplicationWalletAddresses {
+  evm: string;
+  solana: string;
+}
+
+export const applicationWallets = pgTable(
+  "application_wallets",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    resourceKind: applicationResourceKindEnum("resource_kind").notNull(),
+    resourceId: varchar("resource_id", { length: 255 }).notNull(),
+    stewardAgentId: varchar("steward_agent_id", { length: 64 }).notNull(),
+    addresses: jsonb("addresses").$type<ApplicationWalletAddresses>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    scopeUnique: uniqueIndex("application_wallets_scope_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.resourceKind,
+      table.resourceId,
+    ),
+    tenantPrincipalWalletUnique: uniqueIndex("application_wallets_tenant_principal_id_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.id,
+    ),
+    agentUnique: uniqueIndex("application_wallets_agent_idx").on(table.stewardAgentId),
+    assignedResourceFk: foreignKey({
+      columns: [table.tenantId, table.principalId, table.resourceKind, table.resourceId],
+      foreignColumns: [
+        applicationPrincipalResources.tenantId,
+        applicationPrincipalResources.principalId,
+        applicationPrincipalResources.resourceKind,
+        applicationPrincipalResources.resourceId,
+      ],
+      name: "application_wallets_assigned_resource_fk",
+    }).onDelete("cascade"),
+    tenantAgentFk: foreignKey({
+      columns: [table.tenantId, table.stewardAgentId],
+      foreignColumns: [agents.tenantId, agents.id],
+      name: "application_wallets_tenant_agent_fk",
+    }).onDelete("cascade"),
+  }),
+);
+
+export const applicationIdempotencyRecords = pgTable(
+  "application_idempotency_records",
+  {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    operation: applicationOperationEnum("operation").notNull(),
+    idempotencyKey: varchar("idempotency_key", { length: 128 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    responseId: varchar("response_id", { length: 64 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    scopeUnique: uniqueIndex("application_idempotency_scope_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.operation,
+      table.idempotencyKey,
+    ),
+    tenantPrincipalFk: foreignKey({
+      columns: [table.tenantId, table.principalId],
+      foreignColumns: [applicationPrincipals.tenantId, applicationPrincipals.id],
+      name: "application_idempotency_tenant_principal_fk",
+    }).onDelete("cascade"),
+  }),
+);
+
+export const applicationTransactionIntents = pgTable(
+  "application_transaction_intents",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    credentialKeyId: varchar("credential_key_id", { length: 64 }).notNull(),
+    walletId: varchar("wallet_id", { length: 64 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    intent: jsonb("intent").$type<Record<string, unknown>>().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    tenantPrincipalIdUnique: uniqueIndex("application_intents_tenant_principal_id_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.id,
+    ),
+    walletFk: foreignKey({
+      columns: [table.tenantId, table.principalId, table.walletId],
+      foreignColumns: [
+        applicationWallets.tenantId,
+        applicationWallets.principalId,
+        applicationWallets.id,
+      ],
+      name: "application_intents_wallet_fk",
+    }).onDelete("cascade"),
+    credentialFk: foreignKey({
+      columns: [table.tenantId, table.principalId, table.credentialKeyId],
+      foreignColumns: [
+        applicationPrincipalCredentials.tenantId,
+        applicationPrincipalCredentials.principalId,
+        applicationPrincipalCredentials.keyId,
+      ],
+      name: "application_intents_credential_fk",
+    }).onDelete("cascade"),
+    tenantPrincipalIdx: index("application_intents_tenant_principal_idx").on(
+      table.tenantId,
+      table.principalId,
+    ),
+  }),
+);
+
+export const applicationTransactionProposals = pgTable(
+  "application_transaction_proposals",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    credentialKeyId: varchar("credential_key_id", { length: 64 }).notNull(),
+    intentId: varchar("intent_id", { length: 64 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    status: applicationProposalStatusEnum("status").notNull().default("proposed"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    tenantPrincipalIdUnique: uniqueIndex("application_proposals_tenant_principal_id_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.id,
+    ),
+    intentUnique: uniqueIndex("application_proposals_intent_unique_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.intentId,
+    ),
+    intentFk: foreignKey({
+      columns: [table.tenantId, table.principalId, table.intentId],
+      foreignColumns: [
+        applicationTransactionIntents.tenantId,
+        applicationTransactionIntents.principalId,
+        applicationTransactionIntents.id,
+      ],
+      name: "application_proposals_intent_fk",
+    }).onDelete("cascade"),
+    credentialFk: foreignKey({
+      columns: [table.tenantId, table.principalId, table.credentialKeyId],
+      foreignColumns: [
+        applicationPrincipalCredentials.tenantId,
+        applicationPrincipalCredentials.principalId,
+        applicationPrincipalCredentials.keyId,
+      ],
+      name: "application_proposals_credential_fk",
+    }).onDelete("cascade"),
+    tenantPrincipalIdx: index("application_proposals_tenant_principal_idx").on(
+      table.tenantId,
+      table.principalId,
+    ),
   }),
 );
 

@@ -35,6 +35,15 @@ function toU8(value: unknown): Uint8Array {
   throw new Error("toU8: unsupported value");
 }
 
+function rowsFromExecute<T>(result: unknown): T[] {
+  if (Array.isArray(result)) return result as T[];
+  if (result && typeof result === "object" && "rows" in result) {
+    const rows = (result as { rows?: unknown }).rows;
+    return Array.isArray(rows) ? (rows as T[]) : [];
+  }
+  return [];
+}
+
 function u8Equals(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
@@ -67,7 +76,7 @@ function getHmacKey(): Uint8Array {
   return cachedKey;
 }
 
-export type ActorType = "user" | "agent" | "platform" | "system";
+export type ActorType = "user" | "agent" | "application" | "platform" | "system";
 
 export interface AuditEventInput {
   tenantId: string;
@@ -116,9 +125,11 @@ export async function writeAuditEvent(ev: AuditEventInput): Promise<void> {
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`steward_audit_${ev.tenantId}`}, 0))`,
     );
 
-    const headRows = (await tx.execute(
-      sql`SELECT seq, hmac FROM audit_events WHERE tenant_id = ${ev.tenantId} ORDER BY seq DESC LIMIT 1`,
-    )) as Array<{ seq: number | string; hmac: unknown }>;
+    const headRows = rowsFromExecute<{ seq: number | string; hmac: unknown }>(
+      await tx.execute(
+        sql`SELECT seq, hmac FROM audit_events WHERE tenant_id = ${ev.tenantId} ORDER BY seq DESC LIMIT 1`,
+      ),
+    );
     const head = headRows[0];
     const seq = head ? Number(head.seq) + 1 : 1;
     const prevHash = head ? toU8(head.hmac) : ZERO_HASH;
@@ -189,17 +200,15 @@ export async function verifyAuditChain(
 
   let prevHash: Uint8Array = ZERO_HASH;
   if (fromSeq > 1) {
-    const prevRows = (await db.execute(
-      sql`SELECT hmac FROM audit_events WHERE tenant_id = ${tenantId} AND seq = ${fromSeq - 1}`,
-    )) as Array<{ hmac: unknown }>;
+    const prevRows = rowsFromExecute<{ hmac: unknown }>(
+      await db.execute(
+        sql`SELECT hmac FROM audit_events WHERE tenant_id = ${tenantId} AND seq = ${fromSeq - 1}`,
+      ),
+    );
     if (prevRows[0]) prevHash = toU8(prevRows[0].hmac);
   }
 
-  const rows = (await db.execute(
-    toSeq !== undefined
-      ? sql`SELECT * FROM audit_events WHERE tenant_id = ${tenantId} AND seq BETWEEN ${fromSeq} AND ${toSeq} ORDER BY seq ASC`
-      : sql`SELECT * FROM audit_events WHERE tenant_id = ${tenantId} AND seq >= ${fromSeq} ORDER BY seq ASC`,
-  )) as Array<{
+  const rows = rowsFromExecute<{
     tenant_id: string;
     seq: number | string;
     prev_hash: unknown;
@@ -214,7 +223,13 @@ export async function verifyAuditChain(
     user_agent: string | null;
     request_id: string | null;
     created_at: Date | string;
-  }>;
+  }>(
+    await db.execute(
+      toSeq !== undefined
+        ? sql`SELECT * FROM audit_events WHERE tenant_id = ${tenantId} AND seq BETWEEN ${fromSeq} AND ${toSeq} ORDER BY seq ASC`
+        : sql`SELECT * FROM audit_events WHERE tenant_id = ${tenantId} AND seq >= ${fromSeq} ORDER BY seq ASC`,
+    ),
+  );
 
   let count = 0;
   for (const row of rows) {
