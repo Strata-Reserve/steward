@@ -34,6 +34,22 @@ export interface LockGraph {
   packages: Map<string, Record<string, string>>;
   /** Every lock key, for resolution. */
   keys: Set<string>;
+  /**
+   * Workspace package NAME (`@stwd/react`) -> workspace PATH (`packages/react`).
+   *
+   * This map is the fix for a blind spot that made the walk unable to see the
+   * very path its docstring advertised. In `bun.lock`, a workspace package is
+   * stored as a ONE-ELEMENT array (`["@stwd/react@workspace:packages/react"]`)
+   * with no dependency metadata at index 2. So every workspace package looked
+   * like a leaf with zero outgoing edges, and the walk dead-ended at the first
+   * workspace hop: `@stwd/api -> @stwd/agent-trader -> @stwd/react` reached
+   * agent-trader and then stopped, never seeing react.
+   *
+   * Workspace-to-workspace edges must be resolved through the `workspaces`
+   * table instead. Without this, the `@stwd/web` negative control was vacuous —
+   * it could never have been reachable regardless of the truth.
+   */
+  workspaceNameToPath: Map<string, string>;
 }
 
 interface RawLock {
@@ -86,12 +102,16 @@ export function buildGraph(lockText: string): LockGraph {
   const lock = parseBunLock(lockText);
 
   const workspaces = new Map<string, Record<string, string>>();
+  const workspaceNameToPath = new Map<string, string>();
   for (const [path, meta] of Object.entries(lock.workspaces ?? {})) {
+    const record = meta as Record<string, unknown>;
     const deps: Record<string, string> = {};
     for (const field of DEP_FIELDS_WORKSPACE) {
-      Object.assign(deps, (meta as Record<string, unknown>)[field] ?? {});
+      Object.assign(deps, record[field] ?? {});
     }
     workspaces.set(path, deps);
+    const name = typeof record.name === "string" ? record.name : "";
+    if (name !== "") workspaceNameToPath.set(name, path);
   }
 
   const packages = new Map<string, Record<string, string>>();
@@ -107,7 +127,7 @@ export function buildGraph(lockText: string): LockGraph {
     packages.set(key, deps);
   }
 
-  return { workspaces, packages, keys: new Set(packages.keys()) };
+  return { workspaces, packages, keys: new Set(packages.keys()), workspaceNameToPath };
 }
 
 /**
@@ -120,6 +140,28 @@ function resolveKey(graph: LockGraph, name: string, parent: string): string | nu
     if (graph.keys.has(nested)) return nested;
   }
   return graph.keys.has(name) ? name : null;
+}
+
+/**
+ * Outgoing edges for a node, resolving WORKSPACE packages through the
+ * `workspaces` table rather than the (dependency-less) `packages` entry.
+ *
+ * Without this, every workspace package is a leaf and the walk cannot traverse
+ * `@stwd/api -> @stwd/agent-trader -> @stwd/react` — the exact path this module
+ * exists to catch.
+ */
+function outgoingEdges(graph: LockGraph, key: string): Record<string, string> {
+  const bare = key.split("/").pop() ?? key;
+  const scoped = key.match(/(@[^/]+\/[^/]+)$/)?.[1];
+  for (const candidate of [scoped, bare]) {
+    if (candidate === undefined) continue;
+    const wsPath = graph.workspaceNameToPath.get(candidate);
+    if (wsPath !== undefined) {
+      const deps = graph.workspaces.get(wsPath);
+      if (deps !== undefined) return deps;
+    }
+  }
+  return graph.packages.get(key) ?? {};
 }
 
 /**
@@ -152,7 +194,7 @@ export function reachableFrom(
 
   while (queue.length > 0) {
     const current = queue.pop()!;
-    for (const name of Object.keys(graph.packages.get(current) ?? {})) {
+    for (const name of Object.keys(outgoingEdges(graph, current))) {
       const key = resolveKey(graph, name, current);
       if (key !== null && !seen.has(key)) {
         seen.add(key);

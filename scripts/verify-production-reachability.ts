@@ -53,16 +53,31 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { AUDIT_EXCEPTIONS } from "./security/audit-exceptions.ts";
 import { loadGraph, reachableFrom } from "./security/runtime-import-closure.ts";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
- * CLASS A — accepted because the package is ABSENT from the production dependency
- * closure. The strongest form of the claim: the vulnerable code is not installed.
- * Keep in sync with docs/security/threat-model.mdx#known-accepted-cves.
+ * EXPECTATIONS ARE DERIVED FROM THE REGISTRY, NOT HARDCODED HERE.
+ *
+ * These lists used to be two literal arrays that happened to agree with
+ * scripts/security/audit-exceptions.ts. They were never compared, so the
+ * authorization (registry) and the evidence (this probe) could drift apart
+ * silently: flipping `image-size` to CLASS A/absent in the registry left this
+ * script still measuring — and passing — under the OLD disposition, while
+ * printing `image-size PRESENT` on the very same run.
+ *
+ * Deriving them makes the drift impossible: the registry states the claim, and
+ * this probe is obliged to test exactly the claim the registry makes.
+ *   CLASS A  =>  MUST be ABSENT from the production closure.
+ *   CLASS B  =>  MUST be PRESENT, and MUST be unreachable by runtime import.
+ * A CLASS B package that turns out to be ABSENT is an OVERSTATED-weakness bug
+ * and is reported, not silently tolerated.
  */
-const ACCEPTED_MUST_BE_ABSENT = ["vite", "next"] as const;
+const ACCEPTED_MUST_BE_ABSENT = AUDIT_EXCEPTIONS.filter((e) => e.reachabilityClass === "A").map(
+  (e) => e.package,
+);
 
 /**
  * CLASS B — accepted on the WEAKER ground that the package IS installed in the
@@ -71,16 +86,23 @@ const ACCEPTED_MUST_BE_ABSENT = ["vite", "next"] as const;
  * `image-size` is here because the first version of this check caught the author
  * asserting it was absent when it is not. The runtime stage stubs only `web`; it
  * copies the REAL `packages/react/package.json`, so react's transitive dependencies
- * (wagmi, the Solana wallet adapters) are installed into the image closure even
- * though react's build output is never copied. Absence was the wrong claim.
+ * are installed into the image closure even though react's build output is never
+ * copied. Absence was the wrong claim.
  *
- * This class is deliberately separate so nobody can read "accepted" and assume
- * "not installed". Both facts are asserted below: it IS present, and no
- * runtime-shipped workspace package depends on the workspace that pulls it in.
+ * The workspace that drags each CVE in is parsed out of the registry's declared
+ * `entryPath`, so that too stops being a second hardcoded copy of the truth.
  */
-const ACCEPTED_PRESENT_BUT_UNIMPORTED = [
-  { pkg: "image-size", viaWorkspace: "@stwd/react" },
-] as const;
+const ACCEPTED_PRESENT_BUT_UNIMPORTED = AUDIT_EXCEPTIONS.filter(
+  (e) => e.reachabilityClass === "B",
+).map((e) => {
+  const viaWorkspace = e.entryPath.match(/@[a-z0-9-]+\/[a-z0-9-]+/)?.[0];
+  if (viaWorkspace === undefined) {
+    fail(
+      `CLASS B exception \`${e.package}\` has an entryPath with no parseable workspace package: "${e.entryPath}". Refusing to verify a reachability claim whose entry point cannot be identified.`,
+    );
+  }
+  return { pkg: e.package, viaWorkspace };
+});
 
 /**
  * Positive control: a correct production closure certainly contains these. If any is
@@ -310,11 +332,18 @@ console.log(
 for (const { pkg, viaWorkspace } of ACCEPTED_PRESENT_BUT_UNIMPORTED) {
   const hit = isPresent(closure, pkg);
   if (hit === null) {
-    // Not a failure, but the documented basis is now stale and must be corrected:
-    // an absent package should be promoted to CLASS A rather than left overstated.
-    console.log(
-      `  ${pkg.padEnd(12)} ABSENT — basis is now STRONGER than documented; promote to CLASS A.`,
+    // A CLASS B premise has FLIPPED. The registry asserts this package IS present
+    // and is accepted only on non-reachability; the measured closure says it is
+    // absent. That may well be good news (the basis is stronger than documented),
+    // but the gate must never silently continue under a disposition whose stated
+    // premise no longer matches reality — it must demand re-review.
+    console.error(
+      `  ${pkg.padEnd(12)} ABSENT — but the registry declares it CLASS B (PRESENT, accepted on non-reachability).`,
     );
+    console.error(
+      `  ${"".padEnd(12)} The disposition's premise no longer holds. Re-review and promote to CLASS A deliberately.`,
+    );
+    broken++;
     continue;
   }
   console.log(
