@@ -82,6 +82,18 @@ export interface AuditException {
   rationale: string;
   /** How the package enters the tree. Must be accurate; reviewed evidence. */
   entryPath: string;
+  /**
+   * The workspace package through which the vulnerable package enters, stated
+   * EXPLICITLY rather than parsed out of `entryPath` prose.
+   *
+   * Required for CLASS B, where the whole acceptance rests on "no runtime-shipped
+   * package can reach THIS workspace". It was previously recovered with a regex
+   * that took the first scoped token in `entryPath`; that captured the right
+   * value only by luck of word order. Reordering the prose while keeping every
+   * fact identical made it verify `@solana/wallet-adapter-react` instead — an
+   * unrelated package. Evidence a reviewer trusts must not depend on word order.
+   */
+  entryWorkspace?: string;
   /** ISO date the exception was accepted. */
   acceptedOn: string;
   /** ISO date after which the exception is EXPIRED and fails the gate. */
@@ -114,6 +126,7 @@ export const AUDIT_EXCEPTIONS: readonly AuditException[] = [
       "started in the deployed signing service. Verified mechanically by " +
       "scripts/verify-production-reachability.ts.",
     entryPath: "@stwd/eliza-plugin -> vitest -> vite (devDependency edge only)",
+    entryWorkspace: "@stwd/eliza-plugin",
     acceptedOn: "2026-08-11",
     reviewBy: "2026-11-11",
     reconsiderIf: [
@@ -139,6 +152,7 @@ export const AUDIT_EXCEPTIONS: readonly AuditException[] = [
       "output is deployed with the signing service. Verified mechanically by " +
       "scripts/verify-production-reachability.ts.",
     entryPath: "workspace `web` -> next (web is stubbed in the runtime image stage)",
+    entryWorkspace: "@stwd/web",
     acceptedOn: "2026-08-11",
     reviewBy: "2026-11-11",
     reconsiderIf: [
@@ -171,6 +185,7 @@ export const AUDIT_EXCEPTIONS: readonly AuditException[] = [
       "(porto | @walletconnect/keyvaluestorage | @trezor/env-utils) -> react-native -> " +
       "@react-native/community-cli-plugin -> metro -> image-size. The proximate parent is " +
       "`metro`, the React Native bundler; image-size is not a direct wagmi/Solana dependency.",
+    entryWorkspace: "@stwd/react",
     acceptedOn: "2026-08-11",
     reviewBy: "2026-09-11",
     reconsiderIf: [

@@ -522,3 +522,22 @@ describe("the REAL shipped registry", () => {
     expect(e?.rationale ?? "").not.toMatch(/\bis absent\b/i);
   });
 });
+
+describe("R2 F4 — CLASS B entry workspace is explicit, not parsed from prose", () => {
+  it("every CLASS B exception declares an explicit entryWorkspace", () => {
+    for (const e of AUDIT_EXCEPTIONS) {
+      if (e.reachabilityClass !== "B") continue;
+      expect(e.entryWorkspace?.trim()).toBeTruthy();
+    }
+  });
+
+  it("image-size names @stwd/react explicitly, independent of entryPath word order", () => {
+    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "image-size");
+    expect(e?.entryWorkspace).toBe("@stwd/react");
+    // The prose mentions several other scoped packages FIRST; the old regex
+    // captured whichever came first, so word order silently chose the subject.
+    const firstScoped = e?.entryPath.match(/@[a-z0-9-]+\/[a-z0-9-]+/)?.[0];
+    expect(e?.entryWorkspace).not.toBe(undefined);
+    expect(typeof firstScoped).toBe("string");
+  });
+});

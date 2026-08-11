@@ -131,3 +131,69 @@ describe("the REAL lockfile", () => {
     expect(r.names.has("image-size")).toBe(false);
   });
 });
+
+/**
+ * Round-2 findings. Each of these was "correct by luck" before the fix, so each
+ * test is written to fail against the pre-fix behaviour, not merely to describe
+ * the current one.
+ */
+describe("R2 F1 — workspace optionalDependencies are traversed", () => {
+  const LOCK_OPT = JSON.stringify({
+    workspaces: {
+      "packages/api": { name: "@stwd/api", optionalDependencies: { "vuln-opt": "^1" } },
+    },
+    packages: {
+      "@stwd/api": ["@stwd/api@workspace:packages/api"],
+      "vuln-opt": ["vuln-opt@1.0.0", "", {}, "sha512-a"],
+    },
+  });
+
+  it("follows a workspace optionalDependencies edge (was silently dropped)", () => {
+    const r = reachableFrom(buildGraph(LOCK_OPT), ["packages/api"]);
+    expect(r.names.has("vuln-opt")).toBe(true);
+  });
+});
+
+describe("R2 F2 — runtime roots are inside their own closure", () => {
+  const LOCK_SELF = JSON.stringify({
+    workspaces: { "packages/api": { name: "@stwd/api", dependencies: { hono: "^4" } } },
+    packages: {
+      "@stwd/api": ["@stwd/api@workspace:packages/api"],
+      hono: ["hono@4.13.1", "", {}, "sha512-b"],
+    },
+  });
+
+  it("reports a shipped root as reachable from itself", () => {
+    // Previously false: a CLASS B exception whose entry workspace IS a shipped
+    // root would have been reported as having "no import path".
+    const r = reachableFrom(buildGraph(LOCK_SELF), ["packages/api"]);
+    expect(r.names.has("@stwd/api")).toBe(true);
+    expect(r.names.has("hono")).toBe(true);
+  });
+
+  it("holds on the real lockfile for every shipped root", async () => {
+    const lock = await Bun.file(new URL("../../bun.lock", import.meta.url)).text();
+    const roots = [
+      "api",
+      "auth",
+      "db",
+      "policy-engine",
+      "proxy",
+      "redis",
+      "sdk",
+      "shared",
+      "trade-sessions",
+      "vault",
+      "venue-hyperliquid",
+      "webhooks",
+    ];
+    const r = reachableFrom(
+      buildGraph(lock),
+      roots.map((p) => `packages/${p}`),
+    );
+    for (const p of roots) expect(r.names.has(`@stwd/${p}`)).toBe(true);
+    // and the CVE claims must survive the larger closure
+    expect(r.names.has("image-size")).toBe(false);
+    expect(r.names.has("@stwd/react")).toBe(false);
+  });
+});

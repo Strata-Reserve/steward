@@ -95,7 +95,18 @@ export function parseBunLock(text: string): RawLock {
   return JSON.parse(out) as RawLock;
 }
 
-const DEP_FIELDS_WORKSPACE = ["dependencies", "peerDependencies"] as const;
+/**
+ * Workspace-level dependency fields.
+ *
+ * `optionalDependencies` IS included, deliberately. It was previously omitted
+ * here while being present in `DEP_FIELDS_TRANSITIVE` — an unexplained asymmetry
+ * that made the walk silently under-report. A workspace `optionalDependencies`
+ * entry really is installed by `bun install --production`, so omitting it would
+ * hide a genuine import path the moment any workspace used one. No workspace in
+ * this repo uses `optionalDependencies` today; this closes the gap before the
+ * first one does, rather than after.
+ */
+const DEP_FIELDS_WORKSPACE = ["dependencies", "peerDependencies", "optionalDependencies"] as const;
 const DEP_FIELDS_TRANSITIVE = ["dependencies", "peerDependencies", "optionalDependencies"] as const;
 
 export function buildGraph(lockText: string): LockGraph {
@@ -182,6 +193,16 @@ export function reachableFrom(
       throw new Error(
         `workspace root \`${root}\` is not present in bun.lock. Refusing to compute reachability from a root that does not exist — that would silently under-report.`,
       );
+    }
+    // The root itself is part of its own closure. Seeding only its dependencies
+    // made shipped packages report `reachable=false` about themselves, so a
+    // CLASS B exception whose entry workspace IS a shipped root would have
+    // printed "no import path" while that root was in the image the whole time.
+    const rootName = [...graph.workspaceNameToPath.entries()].find(
+      ([, path]) => path === root,
+    )?.[0];
+    if (rootName !== undefined && !seen.has(rootName)) {
+      seen.add(rootName);
     }
     for (const name of Object.keys(deps)) {
       const key = resolveKey(graph, name, "");

@@ -89,16 +89,22 @@ const ACCEPTED_MUST_BE_ABSENT = AUDIT_EXCEPTIONS.filter((e) => e.reachabilityCla
  * are installed into the image closure even though react's build output is never
  * copied. Absence was the wrong claim.
  *
- * The workspace that drags each CVE in is parsed out of the registry's declared
- * `entryPath`, so that too stops being a second hardcoded copy of the truth.
+ * The entry workspace comes from the registry's EXPLICIT `entryWorkspace` field.
+ *
+ * It used to be regex-parsed out of the `entryPath` prose, which took the first
+ * scoped token and so was correct only by luck of word order: reordering the
+ * sentence while keeping every fact identical made it verify
+ * `@solana/wallet-adapter-react` instead of `@stwd/react` — an unrelated package,
+ * with the verifier still printing a clean pass. Evidence a reviewer trusts must
+ * not depend on the order of words in a comment.
  */
 const ACCEPTED_PRESENT_BUT_UNIMPORTED = AUDIT_EXCEPTIONS.filter(
   (e) => e.reachabilityClass === "B",
 ).map((e) => {
-  const viaWorkspace = e.entryPath.match(/@[a-z0-9-]+\/[a-z0-9-]+/)?.[0];
-  if (viaWorkspace === undefined) {
+  const viaWorkspace = e.entryWorkspace?.trim();
+  if (viaWorkspace === undefined || viaWorkspace === "") {
     fail(
-      `CLASS B exception \`${e.package}\` has an entryPath with no parseable workspace package: "${e.entryPath}". Refusing to verify a reachability claim whose entry point cannot be identified.`,
+      `CLASS B exception \`${e.package}\` has no explicit \`entryWorkspace\`. Refusing to verify a reachability claim whose entry point is not stated — it must not be inferred from prose.`,
     );
   }
   return { pkg: e.package, viaWorkspace };
@@ -314,6 +320,22 @@ console.log("import-graph liveness: OK\n");
 
 // ---- 4. The actual question -------------------------------------------------
 let broken = 0;
+
+// Floor: refuse to report a clean bill of health from a run that tested nothing.
+// An emptied registry previously made this script exit 0 with both class sections
+// blank — a vacuous pass. The gate would still have failed independently, but a
+// probe that can pass while checking zero claims is exactly the failure mode this
+// file exists to prevent.
+if (ACCEPTED_MUST_BE_ABSENT.length === 0 && ACCEPTED_PRESENT_BUT_UNIMPORTED.length === 0) {
+  fail(
+    "the exception registry declares ZERO reachability-based acceptances, so this check would verify nothing and pass vacuously. " +
+      "If every finding is genuinely remediated, delete this step deliberately rather than letting it self-certify an empty run.",
+  );
+}
+
+console.log(
+  `verifying ${ACCEPTED_MUST_BE_ABSENT.length} CLASS A + ${ACCEPTED_PRESENT_BUT_UNIMPORTED.length} CLASS B reachability claim(s) derived from the registry\n`,
+);
 
 console.log("CLASS A — must be ABSENT from the production closure:");
 for (const pkg of ACCEPTED_MUST_BE_ABSENT) {
