@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { spawnSync } from "node:child_process";
 /**
  * STRATA-926 — rerunnable production-image reachability check.
  *
@@ -39,11 +40,19 @@
  * This is deliberately NOT a general SBOM tool. It answers exactly one question:
  * "is the vulnerable package in the dependency closure the production image installs?"
  */
-import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -69,7 +78,7 @@ const ACCEPTED_MUST_BE_ABSENT = ["vite", "next"] as const;
  * runtime-shipped workspace package depends on the workspace that pulls it in.
  */
 const ACCEPTED_PRESENT_BUT_UNIMPORTED = [
-  { pkg: "image-size", viaWorkspace: "@stwd/react" }
+  { pkg: "image-size", viaWorkspace: "@stwd/react" },
 ] as const;
 
 /**
@@ -87,8 +96,18 @@ const MIN_EXPECTED_PACKAGES = 500;
  * If this set changes, the reachability basis for the accepted CVEs must be re-derived.
  */
 const EXPECTED_RUNTIME_PACKAGES = [
-  "api", "auth", "db", "policy-engine", "proxy", "redis",
-  "sdk", "shared", "trade-sessions", "vault", "venue-hyperliquid", "webhooks"
+  "api",
+  "auth",
+  "db",
+  "policy-engine",
+  "proxy",
+  "redis",
+  "sdk",
+  "shared",
+  "trade-sessions",
+  "vault",
+  "venue-hyperliquid",
+  "webhooks",
 ].sort();
 
 /** Workspace packages that introduce the accepted CVEs; must NOT reach the runtime image. */
@@ -104,7 +123,9 @@ function runtimePackagesFromDockerfile(): string[] {
   const dockerfile = readFileSync(join(repoRoot, "Dockerfile"), "utf8");
   const runtimeStart = dockerfile.indexOf("FROM oven/bun:1.3-alpine AS runtime");
   if (runtimeStart === -1) {
-    fail("Could not locate the `runtime` stage in the Dockerfile. Image composition changed — re-derive the exception basis before editing this check.");
+    fail(
+      "Could not locate the `runtime` stage in the Dockerfile. Image composition changed — re-derive the exception basis before editing this check.",
+    );
   }
   const runtimeStage = dockerfile.slice(runtimeStart);
   const names = new Set<string>();
@@ -112,7 +133,9 @@ function runtimePackagesFromDockerfile(): string[] {
     names.add(match[1]!);
   }
   if (names.size === 0) {
-    fail("Parsed ZERO `COPY --from=build /app/packages/*` lines from the runtime stage. Either the Dockerfile changed shape or this parser is broken — refusing to report a clean result from a parse that found nothing.");
+    fail(
+      "Parsed ZERO `COPY --from=build /app/packages/*` lines from the runtime stage. Either the Dockerfile changed shape or this parser is broken — refusing to report a clean result from a parse that found nothing.",
+    );
   }
   return [...names].sort();
 }
@@ -139,21 +162,28 @@ function productionClosure(): string[] {
     }
     // The runtime stage stubs `web` rather than shipping it.
     mkdirSync(join(scratch, "web"), { recursive: true });
-    writeFileSync(join(scratch, "web", "package.json"), JSON.stringify({ name: "web", version: "0.0.0", private: true }));
+    writeFileSync(
+      join(scratch, "web", "package.json"),
+      JSON.stringify({ name: "web", version: "0.0.0", private: true }),
+    );
 
     const install = spawnSync("bun", ["install", "--production", "--ignore-scripts"], {
       cwd: scratch,
       encoding: "utf8",
       env: { ...process.env, CI: "false" },
-      timeout: 600_000
+      timeout: 600_000,
     });
     if (install.status !== 0) {
-      fail(`production install failed (exit ${install.status}). A failed install yields an EMPTY tree, which would make every package look absent. Refusing to certify.\n${(install.stderr || "").slice(-800)}`);
+      fail(
+        `production install failed (exit ${install.status}). A failed install yields an EMPTY tree, which would make every package look absent. Refusing to certify.\n${(install.stderr || "").slice(-800)}`,
+      );
     }
 
     const store = join(scratch, "node_modules", ".bun");
     if (!existsSync(store)) {
-      fail("production install produced no `node_modules/.bun` store. Refusing to certify absence from a tree that does not exist.");
+      fail(
+        "production install produced no `node_modules/.bun` store. Refusing to certify absence from a tree that does not exist.",
+      );
     }
     return readdirSync(store);
   } finally {
@@ -179,13 +209,15 @@ const removed = EXPECTED_RUNTIME_PACKAGES.filter((p) => !runtimePackages.include
 if (added.length > 0 || removed.length > 0) {
   fail(
     `runtime image composition CHANGED (added: ${added.join(", ") || "none"}; removed: ${removed.join(", ") || "none"}).\n` +
-    "The accepted-CVE exceptions in docs/security/threat-model.mdx rest on this exact composition. " +
-    "Re-derive reachability and update the exceptions before changing this pin."
+      "The accepted-CVE exceptions in docs/security/threat-model.mdx rest on this exact composition. " +
+      "Re-derive reachability and update the exceptions before changing this pin.",
   );
 }
 for (const forbidden of MUST_NOT_BE_IN_RUNTIME) {
   if (runtimePackages.includes(forbidden)) {
-    fail(`workspace package \`${forbidden}\` is now copied into the runtime image. It introduces an accepted CVE; the exception no longer holds.`);
+    fail(
+      `workspace package \`${forbidden}\` is now copied into the runtime image. It introduces an accepted CVE; the exception no longer holds.`,
+    );
   }
 }
 console.log("composition pin: OK (unchanged, and no CVE-introducing workspace package ships)\n");
@@ -194,12 +226,16 @@ console.log("composition pin: OK (unchanged, and no CVE-introducing workspace pa
 const closure = productionClosure();
 console.log(`production dependency closure: ${closure.length} packages`);
 if (closure.length < MIN_EXPECTED_PACKAGES) {
-  fail(`closure has only ${closure.length} packages (expected >= ${MIN_EXPECTED_PACKAGES}). This is the empty/partial-install failure mode that previously produced false ABSENT results.`);
+  fail(
+    `closure has only ${closure.length} packages (expected >= ${MIN_EXPECTED_PACKAGES}). This is the empty/partial-install failure mode that previously produced false ABSENT results.`,
+  );
 }
 for (const pkg of MUST_BE_PRESENT) {
   const hit = isPresent(closure, pkg);
   if (hit === null) {
-    fail(`positive control \`${pkg}\` is MISSING from the production closure. The probe is inspecting the wrong tree; its ABSENT results cannot be trusted.`);
+    fail(
+      `positive control \`${pkg}\` is MISSING from the production closure. The probe is inspecting the wrong tree; its ABSENT results cannot be trusted.`,
+    );
   }
   console.log(`  positive control ${pkg}: PRESENT (${hit})`);
 }
@@ -219,16 +255,22 @@ for (const pkg of ACCEPTED_MUST_BE_ABSENT) {
   }
 }
 
-console.log("\nCLASS B — present in the closure, accepted only because nothing shipped imports them:");
+console.log(
+  "\nCLASS B — present in the closure, accepted only because nothing shipped imports them:",
+);
 for (const { pkg, viaWorkspace } of ACCEPTED_PRESENT_BUT_UNIMPORTED) {
   const hit = isPresent(closure, pkg);
   if (hit === null) {
     // Not a failure, but the documented basis is now stale and must be corrected:
     // an absent package should be promoted to CLASS A rather than left overstated.
-    console.log(`  ${pkg.padEnd(12)} ABSENT — basis is now STRONGER than documented; promote to CLASS A.`);
+    console.log(
+      `  ${pkg.padEnd(12)} ABSENT — basis is now STRONGER than documented; promote to CLASS A.`,
+    );
     continue;
   }
-  console.log(`  ${pkg.padEnd(12)} PRESENT (${hit}) via ${viaWorkspace} — verifying nothing shipped imports it`);
+  console.log(
+    `  ${pkg.padEnd(12)} PRESENT (${hit}) via ${viaWorkspace} — verifying nothing shipped imports it`,
+  );
 
   // The whole exception rests on this: no package whose build output ships in the
   // runtime image may depend on the workspace that drags the CVE in.
@@ -241,12 +283,18 @@ for (const { pkg, viaWorkspace } of ACCEPTED_PRESENT_BUT_UNIMPORTED) {
       devDependencies?: Record<string, string>;
       peerDependencies?: Record<string, string>;
     };
-    const all = { ...manifest.dependencies, ...manifest.devDependencies, ...manifest.peerDependencies };
+    const all = {
+      ...manifest.dependencies,
+      ...manifest.devDependencies,
+      ...manifest.peerDependencies,
+    };
     if (viaWorkspace in all) dependents.push(shipped);
   }
 
   if (dependents.length > 0) {
-    console.error(`  ${"".padEnd(12)} runtime-shipped package(s) depend on ${viaWorkspace}: ${dependents.join(", ")}`);
+    console.error(
+      `  ${"".padEnd(12)} runtime-shipped package(s) depend on ${viaWorkspace}: ${dependents.join(", ")}`,
+    );
     broken++;
   } else {
     console.log(`  ${"".padEnd(12)} OK — no runtime-shipped package depends on ${viaWorkspace}`);
@@ -254,9 +302,15 @@ for (const { pkg, viaWorkspace } of ACCEPTED_PRESENT_BUT_UNIMPORTED) {
 }
 
 if (broken > 0) {
-  fail(`${broken} accepted-CVE disposition(s) no longer hold. Remediate or re-disposition before shipping.`);
+  fail(
+    `${broken} accepted-CVE disposition(s) no longer hold. Remediate or re-disposition before shipping.`,
+  );
 }
 
-console.log("\n[OK] every accepted-CVE disposition still holds, and runtime composition is unchanged.");
+console.log(
+  "\n[OK] every accepted-CVE disposition still holds, and runtime composition is unchanged.",
+);
 console.log("NOTE: CLASS B is a weaker claim than CLASS A. `image-size` IS installed in the");
-console.log("      production image closure; it is accepted only because nothing shipped imports it.");
+console.log(
+  "      production image closure; it is accepted only because nothing shipped imports it.",
+);
