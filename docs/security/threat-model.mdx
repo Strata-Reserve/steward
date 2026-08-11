@@ -426,6 +426,101 @@ adversary defeats the entire architecture.
   credentials grants access to every tenant the user is a member
   of. A compromised user account is broader than one tenant.
 
+## Known accepted CVEs
+
+Dependency audit (`bun audit`) is a blocking PR gate at both CRITICAL and HIGH.
+Anything not fixed by upgrade must appear here with a disposition, an owner, and a
+dated review. A generic "known baseline" is not an acceptable disposition.
+
+Disposition vocabulary:
+
+- `remediated` — upgraded/overridden to a fixed version. **Not used below**; remediated
+  findings leave this table entirely.
+- `accepted_unreachable_dependency_risk` — the vulnerable code is not reachable in the
+  deployed Steward signing service.
+- `no_fix_available` — additional qualifier: no patched release exists at any version.
+
+**These are NOT remediated.** They are accepted, conditionally, with expiry.
+
+### Verification is rerunnable, not narrative
+
+Run `bun scripts/verify-production-reachability.ts` (exit 0 = all bases still hold).
+
+That script exists because the reachability claims below were originally produced by an
+ad hoc probe, and **three successive probes reported "ABSENT" while inspecting an
+installation that had actually failed or been mis-modelled**. The first version of the
+script immediately caught the author asserting `image-size` was absent when it is not.
+The script therefore refuses to fail open:
+
+- **install liveness** — the scratch `--production` install must yield ≥ 500 packages,
+  so an empty/failed tree cannot report everything as absent;
+- **positive controls** — `hono` and `drizzle-orm` must be PRESENT, or the probe is
+  inspecting the wrong tree and says so;
+- **composition pin** — the runtime image's package allowlist is parsed out of the
+  `Dockerfile` and compared against a pinned set, so the check goes red the moment
+  `web`, `react`, or `eliza-plugin` output enters the runtime image.
+
+### Two classes of claim, deliberately distinguished
+
+**CLASS A — absent from the production dependency closure.** The vulnerable code is not
+installed in the image at all.
+
+**CLASS B — present in the closure, but nothing shipped imports it.** A strictly weaker
+claim. Do not read "accepted" as "not installed".
+
+| Package | CVE / advisory | Disposition | Class | Owner | Accepted | Review by |
+|---|---|---|---|---|---|---|
+| `vite` (>=7.0.0 <=7.3.4) | GHSA-fx2h-pf6j-xcff — `server.fs.deny` bypass on Windows alternate paths | `accepted_unreachable_dependency_risk` | A | JJ Joseph | 2026-08-11 | 2026-11-11 |
+| `next` (>=14.1.1 <15.5.21) | GHSA-89xv-2m56-2m9x, GHSA-m99w-x7hq-7vfj, GHSA-p9j2-gv94-2wf4 — SSRF in Server Actions, DoS in App Router, SSRF in rewrites | `accepted_unreachable_dependency_risk` | A | JJ Joseph | 2026-08-11 | 2026-11-11 |
+| `image-size` (<=2.0.2) | GHSA-w3rx-r6r6-pgpr, GHSA-5p2g-fcmc-qvqq — DoS via infinite loops in ICNS and JXL/HEIF parsers | `accepted_unreachable_dependency_risk` + `no_fix_available` | **B** | JJ Joseph | 2026-08-11 | **2026-09-11** |
+
+#### `vite` — CLASS A
+
+- Enters through `@stwd/eliza-plugin → vitest`.
+- **Absent** from the deployed production dependency closure (verified by script).
+- `@stwd/eliza-plugin` build output is not copied into the runtime image.
+- Compensating controls: the production image ships an explicit bounded package/output
+  allowlist; the dependency audit remains an active blocking gate.
+- **Mandatory re-review if**: `@stwd/eliza-plugin`, Vitest/Vite tooling, or its output is
+  ever included in the production runtime; the runtime-image composition changes
+  materially; or the dependency path changes.
+
+#### `next` — CLASS A
+
+- Enters through `@stwd/web → next`.
+- **Absent** from the deployed production dependency closure (verified by script).
+- `@stwd/web` is stubbed in the runtime stage, not shipped.
+- Compensating controls: explicit runtime package/output allowlist; no web application
+  output ships with the signing service.
+- **Mandatory re-review if**: `@stwd/web`, Next.js, or web build output is added to the
+  production image; service packaging changes; or the dependency path changes.
+
+#### `image-size` — CLASS B, weaker basis, shorter expiry
+
+- **No patched release exists.** The advisory covers `<=2.0.2` and the latest published
+  version *is* `2.0.2`. There is nothing to upgrade to.
+- Enters through `@stwd/react` → `wagmi` / `@solana/wallet-adapter-*`.
+- **It IS present in the production dependency closure** (`image-size@1.2.1`). An earlier
+  draft of this document claimed it was absent. That was wrong: the runtime stage stubs
+  only `web`, and copies the **real** `packages/react/package.json`, so react's
+  transitive dependencies are installed into the image closure even though react's build
+  output is never copied.
+- The acceptance therefore rests on the narrower fact that **no runtime-shipped workspace
+  package depends on `@stwd/react`** — asserted mechanically by the verification script
+  across all twelve shipped packages, not by inspection.
+- Steward exposes no image-processing surface from this dependency chain; both CVEs are
+  parser DoS requiring attacker-controlled image input.
+- Compensating controls: deployed-image package allowlist excludes the affected workspace
+  package; no code path in the signing service decodes images.
+- **Mandatory re-review**: *immediately* when a fixed `image-size` release becomes
+  available; if `@stwd/react` or any dependent output is added to the runtime image; or if
+  runtime packaging changes such that the package becomes importable.
+- **Standing remediation option** (not taken in this PR, needs its own review): stub
+  `packages/react`, `packages/eliza-plugin`, `packages/agent-trader` and `packages/seed`
+  in the runtime stage the way `web` already is. Measured effect: production closure drops
+  from 1181 packages to 274 and `image-size` becomes genuinely absent, promoting this to
+  CLASS A. Deferred here because it changes image composition and deserves separate review.
+
 ## Changelog
 
 - 2026-04-24 — Initial version.
