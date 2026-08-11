@@ -31,15 +31,27 @@ jobs:
         run: bun run typecheck
 
       # Supply-chain audit (SOC2 CC7.1 / CC8.1).
-      # Backlog driven to zero — both CRITICAL and HIGH are now blocking.
-      # Any new CRITICAL/HIGH CVE must be fixed (upgrade / override) or
-      # explicitly accepted in docs/security/threat-model.mdx#known-accepted-cves
-      # before the PR can land.
-      - name: Audit dependencies (critical)
-        run: bun audit --audit-level=critical
-      - name: Audit dependencies (high)
+      #
+      # Every CRITICAL/HIGH finding must be either REMEDIATED (upgrade/override) or
+      # carry an explicit, complete, unexpired entry in the STRUCTURED registry at
+      # scripts/security/audit-exceptions.ts. The gate is fail-closed: an
+      # unallowlisted finding, an expired/ownerless/rationale-less exception, or a
+      # registry<->threat-model mismatch all block the PR.
+      #
+      # Editing docs/security/threat-model.mdx alone CANNOT authorize a vulnerability;
+      # the registry is the machine source of truth and the two are cross-checked in
+      # both directions.
+      #
+      # A generic HIGH exception never auto-covers a future CRITICAL in the same
+      # package — that requires its own explicitly approved critical disposition.
+      - name: Audit dependencies (exception gate)
+        run: bun scripts/security/check-audit-exceptions.ts
+
+      # Independent of the exception registry: proves the accepted-CVE reachability
+      # bases still hold against the real production closure and import graph.
+      - name: Verify production reachability (accepted-CVE bases)
         if: always()
-        run: bun audit --audit-level=high
+        run: bun scripts/verify-production-reachability.ts
 
       - name: Check public package version bumps
         env:

@@ -499,15 +499,34 @@ claim. Do not read "accepted" as "not installed".
 
 - **No patched release exists.** The advisory covers `<=2.0.2` and the latest published
   version *is* `2.0.2`. There is nothing to upgrade to.
-- Enters through `@stwd/react` → `wagmi` / `@solana/wallet-adapter-*`.
+- Enters through `@stwd/react` → `wagmi` / `@solana/wallet-adapter-*` /
+  `@rainbow-me/rainbowkit` → (`porto` | `@walletconnect/keyvaluestorage` |
+  `@trezor/env-utils`) → `react-native` → `@react-native/community-cli-plugin` →
+  **`metro`** → `image-size`. The proximate parent is `metro`, the React Native bundler —
+  `image-size` is *not* a direct dependency of wagmi or the Solana adapters, as an earlier
+  draft of this section implied.
 - **It IS present in the production dependency closure** (`image-size@1.2.1`). An earlier
   draft of this document claimed it was absent. That was wrong: the runtime stage stubs
   only `web`, and copies the **real** `packages/react/package.json`, so react's
   transitive dependencies are installed into the image closure even though react's build
   output is never copied.
 - The acceptance therefore rests on the narrower fact that **no runtime-shipped workspace
-  package depends on `@stwd/react`** — asserted mechanically by the verification script
-  across all twelve shipped packages, not by inspection.
+  package has any import path to `@stwd/react`** — asserted mechanically by
+  `scripts/security/runtime-import-closure.ts`, which walks the **full transitive**
+  declared-dependency graph from all twelve shipped workspace roots (148 packages
+  reachable) and confirms neither `@stwd/react` nor `image-size` is among them.
+  An earlier version of this check tested only a single hop — "does a shipped package
+  *directly* declare `@stwd/react`" — which a path such as
+  `@stwd/api → @stwd/agent-trader → @stwd/react` would have passed straight through.
+- **Scope of that mechanical claim, stated precisely.** What is *proven* is that no path
+  exists through **declared** dependency edges in `bun.lock` from the runtime-shipped
+  roots to `image-size`. What is **not** proven mechanically is the absence of an
+  undeclared or dynamic import (`require(variable)`, deep-path escape, or a phantom
+  dependency resolved from the hoisted tree). Under normal resolution a runtime package
+  cannot import what it does not declare, but phantom/hoisted resolution is a real
+  failure mode. That residual gap is carried as **independently reviewed evidence**, not
+  as a machine-proven fact — supported by the compensating control below that no code
+  path in the signing service decodes images.
 - Steward exposes no image-processing surface from this dependency chain; both CVEs are
   parser DoS requiring attacker-controlled image input.
 - Compensating controls: deployed-image package allowlist excludes the affected workspace

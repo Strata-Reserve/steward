@@ -53,6 +53,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadGraph, reachableFrom } from "./security/runtime-import-closure.ts";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -89,6 +90,20 @@ const MUST_BE_PRESENT = ["hono", "drizzle-orm"] as const;
 
 /** A real production closure is thousands of packages. Anything near zero is a failed install. */
 const MIN_EXPECTED_PACKAGES = 500;
+
+/**
+ * Positive controls for the IMPORT-GRAPH probe (distinct from the install probe
+ * above). These MUST be reachable from the runtime-shipped workspace roots. If they
+ * are not, the graph walk is inspecting the wrong roots or the lockfile parse broke,
+ * and every "not reachable" result it produces is worthless.
+ */
+const MUST_BE_IMPORT_REACHABLE = ["hono", "drizzle-orm"] as const;
+
+/**
+ * Floor on the import-reachable set. The real runtime closure is ~148 packages; a
+ * handful would mean the walk terminated early and is silently under-reporting.
+ */
+const MIN_IMPORT_REACHABLE = 50;
 
 /**
  * The runtime image copies build output for exactly these workspace packages.
@@ -241,7 +256,41 @@ for (const pkg of MUST_BE_PRESENT) {
 }
 console.log("install liveness: OK\n");
 
-// ---- 3. The actual question -------------------------------------------------
+// ---- 3. Import-graph liveness + positive control ----------------------------
+// Distinct probe, distinct failure modes, so it gets its OWN controls. The
+// install probe above proves the tree exists; this one proves the graph walk is
+// actually traversing the modelled runtime roots rather than terminating early.
+const importReachable = reachableFrom(
+  loadGraph(join(repoRoot, "bun.lock")),
+  EXPECTED_RUNTIME_PACKAGES.map((p) => `packages/${p}`),
+);
+console.log(
+  `import graph: ${importReachable.keys.size} package(s) transitively reachable from the ${EXPECTED_RUNTIME_PACKAGES.length} runtime-shipped roots`,
+);
+if (importReachable.keys.size < MIN_IMPORT_REACHABLE) {
+  fail(
+    `only ${importReachable.keys.size} packages are import-reachable (expected >= ${MIN_IMPORT_REACHABLE}). The graph walk terminated early or the lockfile parse is broken; its "not reachable" results cannot be trusted.`,
+  );
+}
+for (const pkg of MUST_BE_IMPORT_REACHABLE) {
+  if (!importReachable.names.has(pkg)) {
+    fail(
+      `import-graph positive control \`${pkg}\` is NOT reachable from the runtime-shipped roots. The walk is inspecting the wrong graph; every "not reachable" result is worthless.`,
+    );
+  }
+  console.log(`  positive control ${pkg}: import-REACHABLE`);
+}
+// Negative control: something that must NOT be reachable, proving the walk can
+// actually answer "no" and does not simply mark everything reachable.
+if (importReachable.names.has("@stwd/web")) {
+  fail(
+    "import-graph negative control failed: `@stwd/web` is reachable from the runtime roots, but the runtime stage stubs it. The walk is over-reporting.",
+  );
+}
+console.log("  negative control @stwd/web: correctly NOT reachable");
+console.log("import-graph liveness: OK\n");
+
+// ---- 4. The actual question -------------------------------------------------
 let broken = 0;
 
 console.log("CLASS A — must be ABSENT from the production closure:");
@@ -273,32 +322,31 @@ for (const { pkg, viaWorkspace } of ACCEPTED_PRESENT_BUT_UNIMPORTED) {
   );
 
   // The whole exception rests on this: no package whose build output ships in the
-  // runtime image may depend on the workspace that drags the CVE in.
-  const dependents: string[] = [];
-  for (const shipped of runtimePackages) {
-    const manifestPath = join(repoRoot, "packages", shipped, "package.json");
-    if (!existsSync(manifestPath)) continue;
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-      dependencies?: Record<string, string>;
-      devDependencies?: Record<string, string>;
-      peerDependencies?: Record<string, string>;
-    };
-    const all = {
-      ...manifest.dependencies,
-      ...manifest.devDependencies,
-      ...manifest.peerDependencies,
-    };
-    if (viaWorkspace in all) dependents.push(shipped);
+  // runtime image may reach the CVE-bearing package.
+  //
+  // This is a FULL TRANSITIVE walk, not a one-hop manifest check. The earlier
+  // version only asked "does a shipped package DIRECTLY declare @stwd/react",
+  // which a path like `api -> agent-trader -> react` would have walked straight
+  // through. Depth is exactly where this claim was weakest, so depth is what the
+  // check now covers.
+  if (!importReachable.names.has(viaWorkspace) && !importReachable.names.has(pkg)) {
+    console.log(
+      `  ${"".padEnd(12)} OK — no transitive import path from any runtime-shipped root to ${viaWorkspace} or ${pkg}`,
+    );
+    continue;
   }
 
-  if (dependents.length > 0) {
+  if (importReachable.names.has(pkg)) {
     console.error(
-      `  ${"".padEnd(12)} runtime-shipped package(s) depend on ${viaWorkspace}: ${dependents.join(", ")}`,
+      `  ${"".padEnd(12)} ${pkg} IS transitively reachable from the runtime-shipped roots — CLASS B basis BROKEN.`,
     );
-    broken++;
-  } else {
-    console.log(`  ${"".padEnd(12)} OK — no runtime-shipped package depends on ${viaWorkspace}`);
   }
+  if (importReachable.names.has(viaWorkspace)) {
+    console.error(
+      `  ${"".padEnd(12)} ${viaWorkspace} IS transitively reachable from the runtime-shipped roots — CLASS B basis BROKEN.`,
+    );
+  }
+  broken++;
 }
 
 if (broken > 0) {
