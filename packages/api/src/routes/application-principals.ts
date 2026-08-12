@@ -31,7 +31,7 @@ const resourceSchema = z
 const createSchema = z
   .object({
     name: z.string().trim().min(1).max(255),
-    capabilities: z.array(capabilitySchema).min(1).max(4),
+    capabilities: z.array(capabilitySchema).min(1).max(5),
     resources: z.array(resourceSchema).min(1).max(100),
     expiresAt: z.string(),
     credentialExpiresAt: z.string(),

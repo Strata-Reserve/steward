@@ -14,7 +14,7 @@ description: "Authority, abuse cases, and security invariants for the proposal-o
 | Agent, encrypted keys, public addresses, application binding | `Vault.ensureApplicationWallet` atomic command | application address command, operators |
 | Durable operation idempotency | owning application command transaction | owning command on replay |
 | Prepared transaction intent | proposal-only persistence module | proposal command, future separately authorized consumer |
-| Proposal | proposal-only persistence module | future separately authorized consumer |
+| Proposal | proposal-only persistence module | exact-scope `transaction:proposal:read`, future separately authorized consumer |
 | Signature/broadcast state | existing Vault/execution authorities; **not this boundary** | existing consumers |
 
 The durable authenticated principal ID is the immutable audit actor. Credential selector, capability, request ID, and resource IDs are derived from server context and command results, never caller identity fields.
@@ -29,7 +29,7 @@ Assume an attacker fully compromises the product backend and steals its applicat
 
 ## Invariants
 
-1. Application credentials authenticate only the four exact `/application/*` operations.
+1. Application credentials authenticate only the five exact capability-gated `/application/*` operations.
 2. `application-principal` never satisfies tenant-level or agent-access helpers.
 3. The global deny guard runs before every non-application handler and resource lookup.
 4. Capabilities and status are closed PostgreSQL enums and exact-match runtime values; no wildcard/prefix/case normalization exists.
@@ -40,9 +40,10 @@ Assume an attacker fully compromises the product backend and steals its applicat
 9. All writes require durable PostgreSQL idempotency scoped by tenant, principal, operation, and key.
 10. Proposal persistence has no signing/RPC/approval/broadcast import and writes neither `transactions` nor `approval_queue`.
 11. Exact proposal IDs cannot be consumed by any legacy sign/approve/reject route.
-12. Credential/principal revocation and expiry are read from authoritative storage on every request.
-13. Unknown/malformed/revoked/expired credentials share a generic response; every attempt performs one selector lookup and one timing-safe comparison, with a dummy hash on misses.
-14. Raw secrets are returned only once at create/rotate and never stored, logged, or audited.
+12. Proposal reads require an exact read capability and tenant/principal/resource scope; foreign and unknown IDs are enumeration-resistant. A persisted `proposed` row is non-terminal, and execution evidence remains explicitly `unknown` until a canonical linkage exists.
+13. Credential/principal revocation and expiry are read from authoritative storage on every request.
+14. Unknown/malformed/revoked/expired credentials share a generic response; every attempt performs one selector lookup and one timing-safe comparison, with a dummy hash on misses.
+15. Raw secrets are returned only once at create/rotate and never stored, logged, or audited.
 
 ## Abuse cases and controls
 
@@ -56,6 +57,8 @@ Assume an attacker fully compromises the product backend and steals its applicat
 | Replay changed transaction | canonical hash + scoped operation idempotency | replay, payload drift, cross-operation, and real PostgreSQL concurrency tests |
 | Enumerate keys | high-entropy selector, uniform lookup/compare/failure, auth rate limit | malformed/unknown/wrong/expired response assertions and static middleware review |
 | Forge audit identity | actor/credential identity from authenticated context | audit actor and metadata assertions; strict forged-field rejection |
+| Enumerate or over-read proposals | exact capability plus tenant/principal/resource-scoped join; uniform foreign/unknown 404 | cross-principal, cross-tenant, unknown, malformed, revoked, and expired matrix |
+| Mistake proposal for execution | non-terminal `proposed`; explicit unknown execution evidence; separate tables/module | read contract, replay, zero mutation, zero Vault calls, and zero transaction rows |
 | Turn proposal into execution | separate tables/module; proposal IDs absent from executable state | exact-ID sign/approve/reject matrix, zero Vault calls and zero transaction rows |
 | Break migration on live data | additive schema and no legacy-row rewrite | migration test over populated two-tenant agents/transactions |
 

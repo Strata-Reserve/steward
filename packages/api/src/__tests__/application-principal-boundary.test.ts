@@ -102,10 +102,16 @@ afterAll(async () => {
 });
 
 describe.serial("application principal custody boundary", () => {
-  it("executes only the deterministic four-command contract and never signs or broadcasts", async () => {
+  it("executes only the deterministic proposal command contract and never signs or broadcasts", async () => {
     const issued = await issuePrincipal(
       "Strata API",
-      ["wallet:ensure", "wallet:address:read", "transaction:prepare", "transaction:propose"],
+      [
+        "wallet:ensure",
+        "wallet:address:read",
+        "transaction:prepare",
+        "transaction:propose",
+        "transaction:proposal:read",
+      ],
       ["investor:001"],
     );
     proposalCredential = issued;
@@ -233,6 +239,192 @@ describe.serial("application principal custody boundary", () => {
     expect(appAudits.map((event) => event.action)).toContain("application.transaction.prepare");
     expect(appAudits.map((event) => event.action)).toContain("application.transaction.propose");
     expect(appAudits.every((event) => event.actorId === issued.principal.id)).toBe(true);
+  });
+
+  it("reads proposal acceptance without inventing execution evidence", async () => {
+    const [proposalBefore] = await getDb().select().from(applicationTransactionProposals);
+    expect(proposalBefore).toBeDefined();
+
+    const read = await app.request(`/application/transactions/proposals/${proposalBefore!.id}`, {
+      headers: applicationHeaders(proposalCredential),
+    });
+    expect(read.status).toBe(200);
+    expect(read.headers.get("Cache-Control")).toBe("no-store");
+    const body = (await read.json()) as {
+      data: {
+        proposal: {
+          id: string;
+          intentId: string;
+          status: string;
+          terminal: boolean;
+          resource: { kind: string; id: string; walletId: string };
+          executionEvidence: { status: string; evidence: unknown; reason: string };
+        };
+      };
+    };
+    expect(body.data.proposal).toMatchObject({
+      id: proposalBefore!.id,
+      intentId: proposalBefore!.intentId,
+      status: "proposed",
+      terminal: false,
+      executionEvidence: {
+        status: "unknown",
+        evidence: null,
+        reason: "no_canonical_execution_linkage",
+      },
+    });
+    expect(body.data.proposal.resource.kind).toBe("wallet_owner");
+    expect(body.data.proposal.resource.id).toBe("investor:001");
+
+    const replay = await app.request(`/application/transactions/proposals/${proposalBefore!.id}`, {
+      headers: applicationHeaders(proposalCredential),
+    });
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(body);
+    expect(await getDb().select().from(transactions)).toHaveLength(0);
+    const [proposalAfter] = await getDb()
+      .select()
+      .from(applicationTransactionProposals)
+      .where(eq(applicationTransactionProposals.id, proposalBefore!.id));
+    expect(proposalAfter).toEqual(proposalBefore);
+
+    const readAudits = await getDb()
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.action, "application.transaction_proposal.read"));
+    expect(readAudits).toHaveLength(2);
+    expect(readAudits.every((event) => event.actorId === proposalCredential.principal.id)).toBe(
+      true,
+    );
+    expect(
+      readAudits.every(
+        (event) =>
+          event.resourceId === proposalBefore!.id &&
+          event.metadata?.executionEvidenceStatus === "unknown",
+      ),
+    ).toBe(true);
+  });
+
+  it("fails closed for proposal read capability, identity, tenant, credential, and identifiers", async () => {
+    const [ownedProposal] = await getDb().select().from(applicationTransactionProposals);
+    expect(ownedProposal).toBeDefined();
+
+    const noRead = await issuePrincipal(
+      "No proposal read",
+      ["wallet:ensure", "transaction:propose"],
+      ["owner:no-read"],
+    );
+    const capabilityDenied = await app.request(
+      `/application/transactions/proposals/${ownedProposal!.id}`,
+      { headers: applicationHeaders(noRead) },
+    );
+    expect(capabilityDenied.status).toBe(403);
+
+    const otherPrincipal = await issuePrincipal(
+      "Other proposal reader",
+      ["transaction:proposal:read"],
+      ["owner:other-reader"],
+    );
+    const crossPrincipal = await app.request(
+      `/application/transactions/proposals/${ownedProposal!.id}`,
+      { headers: applicationHeaders(otherPrincipal) },
+    );
+    const unknown = await app.request(`/application/transactions/proposals/atp_${"f".repeat(40)}`, {
+      headers: applicationHeaders(otherPrincipal),
+    });
+    expect(crossPrincipal.status).toBe(404);
+    expect(unknown.status).toBe(404);
+    const enumerationResistantBody = await unknown.text();
+    expect(await crossPrincipal.text()).toBe(enumerationResistantBody);
+
+    const tenantBKey = generateApiKey();
+    const tenantB = `${TENANT_ID}-b`;
+    await getDb()
+      .insert(tenants)
+      .values({ id: tenantB, name: "Application Boundary B", apiKeyHash: tenantBKey.hash });
+    const tenantBResponse = await app.request("/application-principals", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Steward-Tenant": tenantB,
+        "X-Steward-Key": tenantBKey.key,
+      },
+      body: JSON.stringify({
+        name: "Cross tenant proposal reader",
+        capabilities: ["transaction:proposal:read"],
+        resources: [{ kind: "wallet_owner", id: "owner:tenant-b" }],
+        expiresAt: FAR_FUTURE,
+        credentialExpiresAt: CREDENTIAL_FUTURE,
+      }),
+    });
+    expect(tenantBResponse.status).toBe(201);
+    const tenantBPrincipal = ((await tenantBResponse.json()) as { data: IssuedPrincipal }).data;
+    const crossTenant = await app.request(
+      `/application/transactions/proposals/${ownedProposal!.id}`,
+      { headers: applicationHeaders(tenantBPrincipal) },
+    );
+    expect(crossTenant.status).toBe(404);
+    expect(await crossTenant.text()).toBe(enumerationResistantBody);
+
+    for (const malformed of [
+      "atp_",
+      `atp_${"g".repeat(40)}`,
+      `atp_${"a".repeat(39)}`,
+      `atp_${"a".repeat(41)}`,
+      "../atp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]) {
+      const response = await app.request(
+        `/application/transactions/proposals/${encodeURIComponent(malformed)}`,
+        { headers: applicationHeaders(proposalCredential) },
+      );
+      expect(response.status, malformed).toBe(400);
+    }
+
+    const wrongSecret = await app.request(
+      `/application/transactions/proposals/${ownedProposal!.id}`,
+      {
+        headers: {
+          ...applicationHeaders(proposalCredential),
+          "X-Steward-Application-Secret": `aps_${"f".repeat(64)}`,
+        },
+      },
+    );
+    expect(wrongSecret.status).toBe(401);
+
+    const lifecycle = await issuePrincipal(
+      "Credential lifecycle reader",
+      ["transaction:proposal:read"],
+      ["owner:lifecycle-reader"],
+    );
+    const rotate = await app.request(`/application-principals/${lifecycle.principal.id}/rotate`, {
+      method: "POST",
+      headers: tenantHeaders(),
+      body: JSON.stringify({
+        credentialExpiresAt: new Date(Date.now() + 250).toISOString(),
+      }),
+    });
+    expect(rotate.status).toBe(200);
+    const rotatedCredential = (await rotate.json()) as {
+      data: { keyId: string; secret: string };
+    };
+    const revoked = await app.request(`/application/transactions/proposals/${ownedProposal!.id}`, {
+      headers: applicationHeaders(lifecycle),
+    });
+    expect(revoked.status).toBe(401);
+    const rotated: IssuedPrincipal = {
+      principal: lifecycle.principal,
+      credential: rotatedCredential.data,
+    };
+    const activeButUnowned = await app.request(
+      `/application/transactions/proposals/${ownedProposal!.id}`,
+      { headers: applicationHeaders(rotated) },
+    );
+    expect(activeButUnowned.status).toBe(404);
+    await Bun.sleep(300);
+    const expired = await app.request(`/application/transactions/proposals/${ownedProposal!.id}`, {
+      headers: applicationHeaders(rotated),
+    });
+    expect(expired.status).toBe(401);
   });
 
   it("enforces capability and assigned-resource ownership on every command", async () => {

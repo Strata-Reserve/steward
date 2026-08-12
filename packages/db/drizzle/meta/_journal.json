@@ -183,6 +183,13 @@
       "when": 1786243089142,
       "tag": "0025_application_principals",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1786554000000,
+      "tag": "0026_application_proposal_read",
+      "breakpoints": true
     }
   ]
 }

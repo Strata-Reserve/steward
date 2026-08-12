@@ -77,6 +77,7 @@ export const applicationCapabilityEnum = pgEnum("application_capability", [
   "wallet:address:read",
   "transaction:prepare",
   "transaction:propose",
+  "transaction:proposal:read",
 ]);
 
 export const applicationResourceKindEnum = pgEnum("application_resource_kind", ["wallet_owner"]);
@@ -200,7 +201,7 @@ export const applicationPrincipals = pgTable(
     ),
     capabilitiesNonEmpty: check(
       "application_principals_capabilities_nonempty_chk",
-      sql`cardinality(${table.capabilities}) BETWEEN 1 AND 4`,
+      sql`cardinality(${table.capabilities}) BETWEEN 1 AND 5`,
     ),
     activeIdx: index("application_principals_active_idx")
       .on(table.tenantId, table.expiresAt)

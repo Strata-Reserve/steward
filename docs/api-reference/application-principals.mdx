@@ -5,7 +5,7 @@ description: "Least-privilege proposal-only custody API for product backends."
 
 # Application principals
 
-Application credentials use two headers and are valid only on the four exact `/application/*` commands:
+Application credentials use two headers and are valid only on exact capability-gated `/application/*` operations:
 
 ```http
 X-Steward-Application-Key-Id: apk_...
@@ -29,7 +29,8 @@ Tenant owner/admin or tenant API-key authentication is required.
     "wallet:ensure",
     "wallet:address:read",
     "transaction:prepare",
-    "transaction:propose"
+    "transaction:propose",
+    "transaction:proposal:read"
   ],
   "resources": [
     { "kind": "wallet_owner", "id": "investor:party_123" }
@@ -116,6 +117,35 @@ Idempotency-Key: close-proposal:cii_123:v1
 ```
 
 Returns `202` with an immutable `status: "proposed"` record. Proposal IDs exist outside `transactions` and `approval_queue`; existing sign, approve, reject, RPC, and broadcast routes cannot consume them.
+
+### Read Proposal Status
+
+`GET /application/transactions/proposals/:proposalId`
+
+Requires only `transaction:proposal:read`; it does not require prepare or propose authority. The authenticated principal can read only proposals in its exact tenant, principal, and assigned-wallet resource scope. Unknown and foreign proposal IDs return the same `404`; malformed IDs return `400`.
+
+The contract deliberately separates proposal acceptance from execution evidence:
+
+```json
+{
+  "id": "atp_...",
+  "intentId": "ati_...",
+  "status": "proposed",
+  "terminal": false,
+  "resource": {
+    "kind": "wallet_owner",
+    "id": "investor:party_123",
+    "walletId": "aw_..."
+  },
+  "executionEvidence": {
+    "status": "unknown",
+    "evidence": null,
+    "reason": "no_canonical_execution_linkage"
+  }
+}
+```
+
+`proposed` is not executed, signed, broadcast, confirmed, ownership-applied, or terminal. Steward has no canonical application-proposal-to-execution linkage in this schema, so this endpoint never fabricates execution success. Consumers must keep continuation work open until a separate canonical execution-evidence contract exists. Reads are idempotent and append an application-actor audit event without mutating the immutable proposal.
 
 All command schemas reject unknown fields, including `agentId`, `tenantId`, `principalId`, `actorId`, `broadcast`, `approve`, `signature`, `signedTx`, and `status`.
 

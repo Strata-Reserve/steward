@@ -20,6 +20,7 @@ The exact capability vocabulary is:
 - `wallet:address:read`
 - `transaction:prepare`
 - `transaction:propose`
+- `transaction:proposal:read`
 
 Application-resource relationships carry tenant and principal scope in composite database foreign keys. `Ensure Wallet` is a Vault-owned atomic command: the internal agent, both encrypted chain keys, both public addresses, application binding, and durable idempotency record commit together or not at all. Deterministic identities contain a domain-separated hash of tenant, principal, resource kind, and full resource ID; exact stored tuples are compared on replay and occupied identities fail closed.
 
@@ -29,12 +30,13 @@ Every write requires a bounded `Idempotency-Key`. PostgreSQL uniqueness is scope
 
 ## Consequences
 
-- Compromise is bounded to four exact commands and explicit assigned resources.
+- Compromise is bounded to five exact operations and explicit assigned resources.
 - Revocation is authoritative on the next request and does not affect unrelated principals.
 - Invalid selector, malformed secret, wrong secret, revoked key, and expired key use uniform authentication responses, an indexed selector lookup, and a dummy timing-safe comparison on misses.
 - Command audit rows derive actor and credential identities from authenticated server context; caller fields cannot override them.
 - The first release prepares EVM transactions only. Both EVM and Solana public addresses are provisioned atomically.
-- Any future proposal consumer is a new privileged command and requires separate architecture/security review.
+- `transaction:proposal:read` is read-only and tenant/principal/resource scoped. Its lifecycle contract reports immutable proposal acceptance as non-terminal and execution evidence as `unknown` because no canonical application-proposal-to-execution relation exists.
+- Any future execution-evidence writer or proposal consumer is a new privileged command and requires separate architecture/security review.
 
 ## Constitutional analysis
 
