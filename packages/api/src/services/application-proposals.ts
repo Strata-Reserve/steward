@@ -6,12 +6,14 @@
  */
 import {
   applicationIdempotencyRecords,
+  applicationPrincipalResources,
+  applicationProposalReadCompatibility,
   applicationTransactionIntents,
   applicationTransactionProposals,
   applicationWallets,
   getDb,
 } from "@stwd/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   ApplicationBoundaryError,
   type ApplicationPrincipalContext,
@@ -28,6 +30,124 @@ export type PrepareApplicationTransactionCommand = {
   value: string;
   data?: string;
 };
+
+export const APPLICATION_EXECUTION_EVIDENCE_UNAVAILABLE = "no_canonical_execution_linkage" as const;
+
+type ApplicationProposalReadRecord = {
+  id: string;
+  intentId: string;
+  status: "proposed";
+  createdAt: Date;
+  walletId: string;
+  resourceKind: "wallet_owner";
+  resourceId: string;
+};
+
+/**
+ * The proposal row proves proposal acceptance only. Steward currently has no
+ * canonical relation from an application proposal to signing, broadcast, or
+ * chain execution evidence, so the read model must preserve that uncertainty.
+ */
+export function toApplicationProposalReadModel(record: ApplicationProposalReadRecord) {
+  return {
+    id: record.id,
+    intentId: record.intentId,
+    status: record.status,
+    terminal: false as const,
+    recordedAt: record.createdAt.toISOString(),
+    resource: {
+      kind: record.resourceKind,
+      id: record.resourceId,
+      walletId: record.walletId,
+    },
+    executionEvidence: {
+      status: "unknown" as const,
+      evidence: null,
+      reason: APPLICATION_EXECUTION_EVIDENCE_UNAVAILABLE,
+    },
+  };
+}
+
+export async function readApplicationProposalStatus(
+  principal: ApplicationPrincipalContext,
+  proposalId: string,
+) {
+  const hasExplicitReadCapability = principal.capabilities.includes("transaction:proposal:read");
+
+  const [record] = await getDb()
+    .select({
+      id: applicationTransactionProposals.id,
+      intentId: applicationTransactionProposals.intentId,
+      status: applicationTransactionProposals.status,
+      createdAt: applicationTransactionProposals.createdAt,
+      walletId: applicationWallets.id,
+      resourceKind: applicationWallets.resourceKind,
+      resourceId: applicationWallets.resourceId,
+      compatibilityProposalId: applicationProposalReadCompatibility.proposalId,
+    })
+    .from(applicationTransactionProposals)
+    .innerJoin(
+      applicationTransactionIntents,
+      and(
+        eq(applicationTransactionIntents.tenantId, applicationTransactionProposals.tenantId),
+        eq(applicationTransactionIntents.principalId, applicationTransactionProposals.principalId),
+        eq(applicationTransactionIntents.id, applicationTransactionProposals.intentId),
+      ),
+    )
+    .innerJoin(
+      applicationWallets,
+      and(
+        eq(applicationWallets.tenantId, applicationTransactionIntents.tenantId),
+        eq(applicationWallets.principalId, applicationTransactionIntents.principalId),
+        eq(applicationWallets.id, applicationTransactionIntents.walletId),
+      ),
+    )
+    .innerJoin(
+      applicationPrincipalResources,
+      and(
+        eq(applicationPrincipalResources.tenantId, applicationWallets.tenantId),
+        eq(applicationPrincipalResources.principalId, applicationWallets.principalId),
+        eq(applicationPrincipalResources.resourceKind, applicationWallets.resourceKind),
+        eq(applicationPrincipalResources.resourceId, applicationWallets.resourceId),
+      ),
+    )
+    .leftJoin(
+      applicationProposalReadCompatibility,
+      and(
+        eq(applicationProposalReadCompatibility.tenantId, applicationTransactionProposals.tenantId),
+        eq(
+          applicationProposalReadCompatibility.principalId,
+          applicationTransactionProposals.principalId,
+        ),
+        eq(applicationProposalReadCompatibility.proposalId, applicationTransactionProposals.id),
+        eq(applicationProposalReadCompatibility.resourceKind, applicationWallets.resourceKind),
+        eq(applicationProposalReadCompatibility.resourceId, applicationWallets.resourceId),
+        eq(applicationProposalReadCompatibility.source, "pre_0026_transaction_proposal"),
+      ),
+    )
+    .where(
+      and(
+        eq(applicationTransactionProposals.tenantId, principal.tenantId),
+        eq(applicationTransactionProposals.principalId, principal.id),
+        eq(applicationTransactionProposals.id, proposalId),
+        hasExplicitReadCapability
+          ? undefined
+          : sql`${applicationProposalReadCompatibility.proposalId} IS NOT NULL`,
+      ),
+    );
+
+  // Wrong tenant, principal, resource assignment, compatibility binding, and
+  // unknown proposal are deliberately indistinguishable to the caller.
+  if (!record) {
+    throw new ApplicationBoundaryError(404, "proposal_not_found", "Proposal not found");
+  }
+  return {
+    proposal: toApplicationProposalReadModel(record),
+    authorizationBasis: hasExplicitReadCapability
+      ? ("explicit_capability" as const)
+      : ("pre_0026_proposal_compatibility" as const),
+  };
+}
 
 export async function prepareApplicationTransaction(
   principal: ApplicationPrincipalContext,

@@ -6,6 +6,7 @@ export const APPLICATION_CAPABILITIES = [
   "wallet:address:read",
   "transaction:prepare",
   "transaction:propose",
+  "transaction:proposal:read",
 ] as const;
 
 export type ApplicationCapability = (typeof APPLICATION_CAPABILITIES)[number];
@@ -83,6 +84,10 @@ export function isValidIdempotencyKey(value: unknown): value is string {
     value.length <= 128 &&
     /^[\x21-\x7e]+$/.test(value)
   );
+}
+
+export function isValidApplicationProposalId(value: unknown): value is string {
+  return typeof value === "string" && /^atp_[0-9a-f]{40}$/.test(value);
 }
 
 export function parseFutureExpiry(value: unknown, upperBound?: Date): Date | null {

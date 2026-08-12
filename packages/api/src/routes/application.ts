@@ -4,12 +4,14 @@ import { requireApplicationCapability } from "../middleware/application-principa
 import {
   ApplicationBoundaryError,
   type ApplicationCapability,
+  isValidApplicationProposalId,
   isValidApplicationReference,
   isValidIdempotencyKey,
 } from "../services/application-boundary";
 import {
   prepareApplicationTransaction,
   proposeApplicationTransaction,
+  readApplicationProposalStatus,
 } from "../services/application-proposals";
 import {
   ensureApplicationWallet,
@@ -264,6 +266,33 @@ applicationRoutes.post("/transactions/propose", async (c) => {
       { ok: true, data: { proposal: result.proposal, replay: !result.created } },
       result.created ? 202 : 200,
     );
+  } catch (error) {
+    return commandError(c, capability, error);
+  }
+});
+
+applicationRoutes.get("/transactions/proposals/:proposalId", async (c) => {
+  c.header("Cache-Control", "no-store");
+  const capability = "transaction:proposal:read" as const;
+  const proposalId = c.req.param("proposalId");
+  if (!isValidApplicationProposalId(proposalId)) return invalidRequest(c, capability);
+  try {
+    const result = await readApplicationProposalStatus(c.get("applicationPrincipal")!, proposalId);
+    const proposal = result.proposal;
+    await auditApplicationAction(
+      c,
+      "application.transaction_proposal.read",
+      capability,
+      "application_transaction_proposal",
+      proposal.id,
+      {
+        resourceKind: proposal.resource.kind,
+        resourceId: proposal.resource.id,
+        executionEvidenceStatus: proposal.executionEvidence.status,
+        authorizationBasis: result.authorizationBasis,
+      },
+    );
+    return c.json<ApiResponse>({ ok: true, data: { proposal } });
   } catch (error) {
     return commandError(c, capability, error);
   }

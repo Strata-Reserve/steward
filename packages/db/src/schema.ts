@@ -77,6 +77,7 @@ export const applicationCapabilityEnum = pgEnum("application_capability", [
   "wallet:address:read",
   "transaction:prepare",
   "transaction:propose",
+  "transaction:proposal:read",
 ]);
 
 export const applicationResourceKindEnum = pgEnum("application_resource_kind", ["wallet_owner"]);
@@ -200,7 +201,7 @@ export const applicationPrincipals = pgTable(
     ),
     capabilitiesNonEmpty: check(
       "application_principals_capabilities_nonempty_chk",
-      sql`cardinality(${table.capabilities}) BETWEEN 1 AND 4`,
+      sql`cardinality(${table.capabilities}) BETWEEN 1 AND 5`,
     ),
     activeIdx: index("application_principals_active_idx")
       .on(table.tenantId, table.expiresAt)
@@ -422,6 +423,37 @@ export const applicationTransactionProposals = pgTable(
     tenantPrincipalIdx: index("application_proposals_tenant_principal_idx").on(
       table.tenantId,
       table.principalId,
+    ),
+  }),
+);
+
+// Proposal-specific compatibility authority for proposals created before
+// transaction:proposal:read existed. Migration 0026 snapshots only existing
+// proposals whose proposer had transaction:propose and whose complete assigned
+// resource chain still exists. The table rejects every later mutation, so new
+// or sibling proposals cannot acquire compatibility authority after migration.
+export const applicationProposalReadCompatibility = pgTable(
+  "application_proposal_read_compatibility",
+  {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    proposalId: varchar("proposal_id", { length: 64 }).notNull(),
+    resourceKind: applicationResourceKindEnum("resource_kind").notNull(),
+    resourceId: varchar("resource_id", { length: 255 }).notNull(),
+    source: varchar("source", { length: 48 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    assignmentUnique: uniqueIndex("application_proposal_read_compatibility_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.proposalId,
+      table.resourceKind,
+      table.resourceId,
+    ),
+    sourceCheck: check(
+      "application_proposal_read_compatibility_source_chk",
+      sql`${table.source} = 'pre_0026_transaction_proposal'`,
     ),
   }),
 );
