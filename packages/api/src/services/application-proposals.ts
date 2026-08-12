@@ -7,12 +7,13 @@
 import {
   applicationIdempotencyRecords,
   applicationPrincipalResources,
+  applicationProposalReadCompatibility,
   applicationTransactionIntents,
   applicationTransactionProposals,
   applicationWallets,
   getDb,
 } from "@stwd/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   ApplicationBoundaryError,
   type ApplicationPrincipalContext,
@@ -71,6 +72,8 @@ export async function readApplicationProposalStatus(
   principal: ApplicationPrincipalContext,
   proposalId: string,
 ) {
+  const hasExplicitReadCapability = principal.capabilities.includes("transaction:proposal:read");
+
   const [record] = await getDb()
     .select({
       id: applicationTransactionProposals.id,
@@ -80,6 +83,7 @@ export async function readApplicationProposalStatus(
       walletId: applicationWallets.id,
       resourceKind: applicationWallets.resourceKind,
       resourceId: applicationWallets.resourceId,
+      compatibilityProposalId: applicationProposalReadCompatibility.proposalId,
     })
     .from(applicationTransactionProposals)
     .innerJoin(
@@ -107,20 +111,42 @@ export async function readApplicationProposalStatus(
         eq(applicationPrincipalResources.resourceId, applicationWallets.resourceId),
       ),
     )
+    .leftJoin(
+      applicationProposalReadCompatibility,
+      and(
+        eq(applicationProposalReadCompatibility.tenantId, applicationTransactionProposals.tenantId),
+        eq(
+          applicationProposalReadCompatibility.principalId,
+          applicationTransactionProposals.principalId,
+        ),
+        eq(applicationProposalReadCompatibility.proposalId, applicationTransactionProposals.id),
+        eq(applicationProposalReadCompatibility.resourceKind, applicationWallets.resourceKind),
+        eq(applicationProposalReadCompatibility.resourceId, applicationWallets.resourceId),
+        eq(applicationProposalReadCompatibility.source, "pre_0026_transaction_proposal"),
+      ),
+    )
     .where(
       and(
         eq(applicationTransactionProposals.tenantId, principal.tenantId),
         eq(applicationTransactionProposals.principalId, principal.id),
         eq(applicationTransactionProposals.id, proposalId),
+        hasExplicitReadCapability
+          ? undefined
+          : sql`${applicationProposalReadCompatibility.proposalId} IS NOT NULL`,
       ),
     );
 
-  // Wrong tenant, principal, resource assignment, and unknown proposal are
-  // deliberately indistinguishable to the caller.
+  // Wrong tenant, principal, resource assignment, compatibility binding, and
+  // unknown proposal are deliberately indistinguishable to the caller.
   if (!record) {
     throw new ApplicationBoundaryError(404, "proposal_not_found", "Proposal not found");
   }
-  return toApplicationProposalReadModel(record);
+  return {
+    proposal: toApplicationProposalReadModel(record),
+    authorizationBasis: hasExplicitReadCapability
+      ? ("explicit_capability" as const)
+      : ("pre_0026_proposal_compatibility" as const),
+  };
 }
 
 export async function prepareApplicationTransaction(

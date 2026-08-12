@@ -14,7 +14,7 @@ description: "Authority, abuse cases, and security invariants for the proposal-o
 | Agent, encrypted keys, public addresses, application binding | `Vault.ensureApplicationWallet` atomic command | application address command, operators |
 | Durable operation idempotency | owning application command transaction | owning command on replay |
 | Prepared transaction intent | proposal-only persistence module | proposal command, future separately authorized consumer |
-| Proposal | proposal-only persistence module | exact-scope `transaction:proposal:read`, future separately authorized consumer |
+| Proposal | proposal-only persistence module | exact-scope `transaction:proposal:read`, or immutable exact pre-0026 proposal/resource compatibility tuple; future separately authorized consumer |
 | Signature/broadcast state | existing Vault/execution authorities; **not this boundary** | existing consumers |
 
 The durable authenticated principal ID is the immutable audit actor. Credential selector, capability, request ID, and resource IDs are derived from server context and command results, never caller identity fields.

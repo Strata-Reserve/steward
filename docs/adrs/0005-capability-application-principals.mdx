@@ -35,7 +35,7 @@ Every write requires a bounded `Idempotency-Key`. PostgreSQL uniqueness is scope
 - Invalid selector, malformed secret, wrong secret, revoked key, and expired key use uniform authentication responses, an indexed selector lookup, and a dummy timing-safe comparison on misses.
 - Command audit rows derive actor and credential identities from authenticated server context; caller fields cannot override them.
 - The first release prepares EVM transactions only. Both EVM and Solana public addresses are provisioned atomically.
-- `transaction:proposal:read` is read-only and tenant/principal/resource scoped. Its lifecycle contract reports immutable proposal acceptance as non-terminal and execution evidence as `unknown` because no canonical application-proposal-to-execution relation exists.
+- `transaction:proposal:read` is read-only and tenant/principal/resource scoped. Migration 0026 also snapshots exact pre-existing proposal/resource tuples for legacy proposers, so historical proposals remain readable without a principal-wide grant; the immutable compatibility rows never cover sibling, post-migration, or replacement-principal proposals. Its lifecycle contract reports immutable proposal acceptance as non-terminal and execution evidence as `unknown` because no canonical application-proposal-to-execution relation exists.
 - Any future execution-evidence writer or proposal consumer is a new privileged command and requires separate architecture/security review.
 
 ## Constitutional analysis

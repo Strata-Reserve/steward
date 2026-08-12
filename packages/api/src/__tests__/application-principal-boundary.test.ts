@@ -318,7 +318,7 @@ describe.serial("application principal custody boundary", () => {
       `/application/transactions/proposals/${ownedProposal!.id}`,
       { headers: applicationHeaders(noRead) },
     );
-    expect(capabilityDenied.status).toBe(403);
+    expect(capabilityDenied.status).toBe(404);
 
     const otherPrincipal = await issuePrincipal(
       "Other proposal reader",

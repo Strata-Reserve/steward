@@ -427,6 +427,37 @@ export const applicationTransactionProposals = pgTable(
   }),
 );
 
+// Proposal-specific compatibility authority for proposals created before
+// transaction:proposal:read existed. Migration 0026 snapshots only existing
+// proposals whose proposer had transaction:propose and whose complete assigned
+// resource chain still exists. The table rejects every later mutation, so new
+// or sibling proposals cannot acquire compatibility authority after migration.
+export const applicationProposalReadCompatibility = pgTable(
+  "application_proposal_read_compatibility",
+  {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    proposalId: varchar("proposal_id", { length: 64 }).notNull(),
+    resourceKind: applicationResourceKindEnum("resource_kind").notNull(),
+    resourceId: varchar("resource_id", { length: 255 }).notNull(),
+    source: varchar("source", { length: 48 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    assignmentUnique: uniqueIndex("application_proposal_read_compatibility_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.proposalId,
+      table.resourceKind,
+      table.resourceId,
+    ),
+    sourceCheck: check(
+      "application_proposal_read_compatibility_source_chk",
+      sql`${table.source} = 'pre_0026_transaction_proposal'`,
+    ),
+  }),
+);
+
 export const encryptedKeys = pgTable(
   "encrypted_keys",
   {

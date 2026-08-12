@@ -122,7 +122,7 @@ Returns `202` with an immutable `status: "proposed"` record. Proposal IDs exist 
 
 `GET /application/transactions/proposals/:proposalId`
 
-Requires only `transaction:proposal:read`; it does not require prepare or propose authority. The authenticated principal can read only proposals in its exact tenant, principal, and assigned-wallet resource scope. Unknown and foreign proposal IDs return the same `404`; malformed IDs return `400`.
+Normally requires `transaction:proposal:read`; it does not require prepare or propose authority. Migration 0026 creates one immutable compatibility row for each exact pre-0026 proposal whose same proposer had `transaction:propose` and whose complete assigned-wallet resource chain still existed. That bounded row authorizes only the recorded tenant + principal + proposal + resource tuple: it does not authorize sibling or post-migration proposals, and replacement principals receive no compatibility authority. The authenticated principal can otherwise read only proposals in its exact tenant, principal, and assigned-wallet resource scope. Unknown, unauthorized, and foreign proposal IDs return the same `404`; malformed IDs return `400`.
 
 The contract deliberately separates proposal acceptance from execution evidence:
 

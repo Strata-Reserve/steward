@@ -274,14 +274,11 @@ applicationRoutes.post("/transactions/propose", async (c) => {
 applicationRoutes.get("/transactions/proposals/:proposalId", async (c) => {
   c.header("Cache-Control", "no-store");
   const capability = "transaction:proposal:read" as const;
-  if (!requireApplicationCapability(c, capability)) return forbidden(c, capability);
   const proposalId = c.req.param("proposalId");
   if (!isValidApplicationProposalId(proposalId)) return invalidRequest(c, capability);
   try {
-    const proposal = await readApplicationProposalStatus(
-      c.get("applicationPrincipal")!,
-      proposalId,
-    );
+    const result = await readApplicationProposalStatus(c.get("applicationPrincipal")!, proposalId);
+    const proposal = result.proposal;
     await auditApplicationAction(
       c,
       "application.transaction_proposal.read",
@@ -292,6 +289,7 @@ applicationRoutes.get("/transactions/proposals/:proposalId", async (c) => {
         resourceKind: proposal.resource.kind,
         resourceId: proposal.resource.id,
         executionEvidenceStatus: proposal.executionEvidence.status,
+        authorizationBasis: result.authorizationBasis,
       },
     );
     return c.json<ApiResponse>({ ok: true, data: { proposal } });

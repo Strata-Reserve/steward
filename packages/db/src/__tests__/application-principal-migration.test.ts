@@ -146,6 +146,27 @@ describe("application-principal migrations", () => {
         "SELECT * FROM application_transaction_proposals WHERE id = 'atp_existing'",
       );
       expect(proposalAfter.rows).toEqual(proposalBefore.rows);
+      const compatibility = await client.query<{
+        tenant_id: string;
+        principal_id: string;
+        proposal_id: string;
+        resource_kind: string;
+        resource_id: string;
+        source: string;
+      }>(
+        `SELECT tenant_id, principal_id, proposal_id, resource_kind, resource_id, source
+         FROM application_proposal_read_compatibility`,
+      );
+      expect(compatibility.rows).toEqual([
+        {
+          tenant_id: "migration-read",
+          principal_id: "app_existing",
+          proposal_id: "atp_existing",
+          resource_kind: "wallet_owner",
+          resource_id: "party_existing",
+          source: "pre_0026_transaction_proposal",
+        },
+      ]);
     } finally {
       await client.close();
     }
