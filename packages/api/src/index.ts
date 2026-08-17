@@ -13,12 +13,12 @@
  */
 
 import { validateJwtSecretEnv } from "@stwd/auth";
-import { closeDb, getDb, runMigrations } from "@stwd/db";
+import { closeDb, getDb, getMigrationExpectation, runMigrations } from "@stwd/db";
 import { shouldUsePGLite } from "@stwd/db/pglite";
 import { sql } from "drizzle-orm";
-import { app } from "./app";
-import { initRedis, shutdownRedis } from "./middleware/redis";
-import { initAuthStores } from "./routes/auth";
+import { composeApp } from "./compose";
+import { getRedisClient, initRedis, isRedisConfigured, shutdownRedis } from "./middleware/redis";
+import { assertAuthStoresAreSafe, getAuthStoreSources, initAuthStores } from "./routes/auth";
 import {
   API_VERSION,
   type ApiResponse,
@@ -26,6 +26,17 @@ import {
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_MS,
 } from "./services/context";
+import { startProviderReservationReconciliationScheduler } from "./services/provider-reservation-reconciliation-scheduler";
+import { startRetentionScheduler } from "./services/retention";
+import {
+  InMemoryRateLimiter,
+  parseNonNegativeInt,
+  parsePositiveInt,
+  resolveClientIp,
+} from "./services/runtime-gate";
+import { startTransactionReceiptPollingScheduler } from "./services/transaction-receipt-poller";
+import { configuredVaultStartupLogLine, getConfiguredVault } from "./services/vault-factory";
+import { startWebhookRetryScheduler } from "./services/webhook-retry-scheduler";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -38,46 +49,57 @@ if (!Number.isInteger(PORT) || PORT <= 0) {
 }
 validateJwtSecretEnv();
 
+// Compose the deployable app: lean core + this repo's opt-in plugins (trading).
+// composeApp() is async because plugin registration may be async + the trading
+// plugin is dynamically imported so the lean core graph never statically pulls
+// in the trading stack. top-level await is supported by the Bun entry.
+const app = await composeApp();
+
 // ─── In-memory rate-limit log + shutdown guard ───────────────────────────────
 //
 // NOT used by the Workers entry — Workers should rely on the Redis-backed
 // sliding-window rate limiter (or a Workers-native KV-backed alternative).
+//
+// SEC-014: the limiter keys on the socket peer unless the operator declares
+// STEWARD_TRUSTED_PROXY_HOPS > 0, in which case the client IP is derived from
+// the rightmost trusted XFF entries (client-supplied XFF prefixes are never
+// trusted). The key space is capped and fails closed when full.
 
-const requestLog = new Map<string, { count: number; resetAt: number }>();
+const trustedProxyHops = parseNonNegativeInt(process.env.STEWARD_TRUSTED_PROXY_HOPS, 0);
+const rateLimiter = new InMemoryRateLimiter(
+  RATE_LIMIT_MAX_REQUESTS,
+  RATE_LIMIT_WINDOW_MS,
+  parsePositiveInt(process.env.STEWARD_RATE_LIMIT_MAX_KEYS, 10_000),
+);
 let isShuttingDown = false;
+let cancelRetention: (() => void) | undefined;
+let cancelProviderReservationReconciliation: (() => void) | undefined;
+let cancelTransactionReceiptPolling: (() => void) | undefined;
+let cancelWebhookRetryScheduler: (() => void) | undefined;
 
-app.use("*", async (c, next) => {
-  if (c.req.path === "/health" || c.req.path === "/ready") return next();
+function runtimeGate(request: Request, peerAddress: string | null): Response | null {
+  const url = new URL(request.url);
+  if (url.pathname === "/health" || url.pathname === "/ready") return null;
 
   if (isShuttingDown) {
-    return c.json<ApiResponse>({ ok: false, error: "Server is shutting down" }, 503);
+    return Response.json({ ok: false, error: "Server is shutting down" } satisfies ApiResponse, {
+      status: 503,
+    });
   }
 
-  const forwardedFor = c.req.header("x-forwarded-for");
-  const ip = forwardedFor?.split(",")[0]?.trim() || c.req.header("x-real-ip") || "unknown";
-  const now = Date.now();
-  const current = requestLog.get(ip);
-
-  if (!current || current.resetAt <= now) {
-    requestLog.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
-    return next();
+  const ip = resolveClientIp(request.headers, peerAddress, trustedProxyHops);
+  const verdict = rateLimiter.check(ip);
+  if (verdict.limited) {
+    return Response.json({ ok: false, error: "Rate limit exceeded" } satisfies ApiResponse, {
+      status: 429,
+      headers: { "Retry-After": verdict.retryAfterSeconds.toString() },
+    });
   }
-
-  if (current.count >= RATE_LIMIT_MAX_REQUESTS) {
-    c.header("Retry-After", Math.ceil((current.resetAt - now) / 1000).toString());
-    return c.json<ApiResponse>({ ok: false, error: "Rate limit exceeded" }, 429);
-  }
-
-  current.count += 1;
-  requestLog.set(ip, current);
-  return next();
-});
+  return null;
+}
 
 const requestLogCleanupTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [ip, entry] of requestLog.entries()) {
-    if (entry.resetAt <= now) requestLog.delete(ip);
-  }
+  rateLimiter.sweep();
 }, RATE_LIMIT_WINDOW_MS);
 
 // ─── /ready — deep readiness probe ───────────────────────────────────────────
@@ -86,16 +108,96 @@ const requestLogCleanupTimer = setInterval(() => {
 // on the Cloudflare control plane for instance health.
 
 app.get("/ready", async (c) => {
-  const checks: Record<string, { ok: boolean; error?: string }> = {};
+  const checks: Record<
+    string,
+    { ok: boolean; required?: boolean; error?: string; source?: string; detail?: unknown }
+  > = {};
 
-  checks.migrations = { ok: migrationsRan };
+  const expectedMigration = getMigrationExpectation();
+  checks.migrations = { ok: false, detail: { expected: expectedMigration.tag } };
 
   try {
     const db = getDb();
-    await db.execute(sql`SELECT 1`);
-    checks.database = { ok: true };
+    const pglite = shouldUsePGLite();
+    const result = pglite
+      ? await db.execute(sql`
+          SELECT
+            EXTRACT(EPOCH FROM CURRENT_TIMESTAMP) * 1000 AS database_time_ms,
+            EXISTS(
+              SELECT 1 FROM __steward_migrations WHERE tag = ${expectedMigration.tag}
+            ) AS expected_migration_applied
+        `)
+      : await db.execute(sql`
+          SELECT
+            EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS database_time_ms,
+            (SELECT MAX(created_at) FROM drizzle.__drizzle_migrations) AS migration_created_at
+        `);
+    const rows = Array.isArray(result)
+      ? result
+      : ((result as unknown as { rows?: unknown[] }).rows ?? []);
+    const row = rows[0] as
+      | { database_time_ms?: string | number; migration_created_at?: string | number | null }
+      | undefined;
+    const databaseTimeMs = Number(row?.database_time_ms);
+    const migrationCreatedAt = Number(row?.migration_created_at);
+    const expectedMigrationApplied =
+      (row as { expected_migration_applied?: unknown } | undefined)?.expected_migration_applied ===
+      true;
+    const databaseSkewMs = Math.abs(Date.now() - databaseTimeMs);
+    checks.database = {
+      ok: Number.isFinite(databaseTimeMs) && databaseSkewMs <= 30_000,
+      detail: { clockSkewMs: Math.round(databaseSkewMs), serverTime: new Date().toISOString() },
+    };
+    checks.migrations = {
+      ok:
+        migrationsRan &&
+        (pglite ? expectedMigrationApplied : migrationCreatedAt === expectedMigration.createdAt),
+      detail: {
+        expected: expectedMigration.tag,
+        expectedCreatedAt: expectedMigration.createdAt,
+        ...(pglite
+          ? { expectedMigrationApplied }
+          : { actualCreatedAt: Number.isFinite(migrationCreatedAt) ? migrationCreatedAt : null }),
+      },
+    };
   } catch (err: unknown) {
     checks.database = { ok: false, error: err instanceof Error ? err.message : "unknown" };
+  }
+
+  try {
+    const redis = getRedisClient();
+    checks.redis = redis
+      ? { ok: (await redis.ping()).toUpperCase() === "PONG" }
+      : isRedisConfigured()
+        ? { ok: false, error: "Redis is configured but not connected" }
+        : { ok: false, required: false, error: "Redis is not configured (optional mode)" };
+  } catch (err: unknown) {
+    checks.redis = { ok: false, error: err instanceof Error ? err.message : "unknown" };
+  }
+
+  const proxyUrl = process.env.STEWARD_PROXY_URL?.replace(/\/+$/, "");
+  if (!proxyUrl) {
+    checks.proxyClock = {
+      ok: false,
+      required: false,
+      error: "STEWARD_PROXY_URL not configured",
+    };
+  } else {
+    try {
+      const startedAt = Date.now();
+      const response = await fetch(`${proxyUrl}/health`, { signal: AbortSignal.timeout(3_000) });
+      const body = (await response.json()) as { serverTime?: unknown };
+      const endedAt = Date.now();
+      const proxyTime = Date.parse(String(body.serverTime ?? ""));
+      const midpoint = startedAt + (endedAt - startedAt) / 2;
+      const skewMs = Math.abs(proxyTime - midpoint);
+      checks.proxyClock = {
+        ok: response.ok && Number.isFinite(proxyTime) && skewMs <= 30_000,
+        detail: { clockSkewMs: Math.round(skewMs) },
+      };
+    } catch (err: unknown) {
+      checks.proxyClock = { ok: false, error: err instanceof Error ? err.message : "unknown" };
+    }
   }
 
   if (!process.env.STEWARD_MASTER_PASSWORD) {
@@ -104,7 +206,24 @@ app.get("/ready", async (c) => {
     checks.vault = { ok: true };
   }
 
-  const allOk = Object.values(checks).every((c) => c.ok);
+  const storeSources = getAuthStoreSources();
+  const memoryAuthStores = Object.entries(storeSources)
+    .filter(([, source]) => source === "memory")
+    .map(([name]) => name);
+  const memoryAuthStoresAllowed =
+    process.env.STEWARD_ALLOW_MEMORY_AUTH_STORES === "true" ||
+    process.env.NODE_ENV !== "production";
+  checks.authStores = {
+    ok: memoryAuthStores.length === 0 || memoryAuthStoresAllowed,
+    source: Object.entries(storeSources)
+      .map(([name, source]) => `${name}:${source}`)
+      .join(","),
+    ...(memoryAuthStores.length > 0 && !memoryAuthStoresAllowed
+      ? { error: `Production auth stores using memory: ${memoryAuthStores.join(", ")}` }
+      : {}),
+  };
+
+  const allOk = Object.values(checks).every((check) => check.ok || check.required === false);
   return c.json(
     {
       status: allOk ? "ready" : "not_ready",
@@ -127,27 +246,76 @@ if (shouldUsePGLite()) {
 } else {
   try {
     console.log("[steward] Running database migrations...");
-    await runMigrations();
+    const { applied } = await runMigrations();
     migrationsRan = true;
-    console.log("[steward] Migrations complete.");
+    if (applied.length > 0) {
+      console.log(`[steward] Applied ${applied.length} migration(s): ${applied.join(", ")}`);
+      const { writeAuditEvent } = await import("./services/audit");
+      try {
+        await writeAuditEvent({
+          tenantId: "system",
+          actorType: "system",
+          action: "system.migration.applied",
+          metadata: { count: applied.length, names: applied },
+        });
+      } catch (auditErr) {
+        console.error("[steward] Failed to record migration audit event:", auditErr);
+      }
+    } else {
+      console.log("[steward] Migrations already up to date.");
+    }
+
+    // Plugin-owned migrations (Phase 2c): applied AFTER the core migrator so a
+    // plugin migration may reference core tables via FK. Each plugin's migrations
+    // land in its OWN namespaced bookkeeping table
+    // (drizzle.__drizzle_migrations_plugin_<id>), totally isolated from the core's
+    // drizzle.__drizzle_migrations journal. Fail-closed: a plugin migration error
+    // aborts boot (we never half-boot with a partially-migrated plugin schema).
+    const { runComposedPluginMigrations } = await import("./compose");
+    const pluginResults = await runComposedPluginMigrations();
+    if (pluginResults.length > 0) {
+      console.log(
+        `[steward] Applied plugin migrations: ${pluginResults
+          .map((r) => `${r.pluginName}\u2192${r.migrationsTable}`)
+          .join(", ")}`,
+      );
+    }
   } catch (err) {
     console.error("[steward] Migration failed — cannot start:", err);
     process.exit(1);
   }
 }
 
-// ─── Redis + auth store initialization (non-blocking) ───────────────────────
+// ─── Redis + auth stores (blocking — must complete before serving traffic) ──
 
-initRedis()
-  .then((redisOk) => {
-    // usePostgres=true when migrations have run, so auth_kv_store table exists.
-    const usePostgres = migrationsRan && !redisOk;
-    return initAuthStores(usePostgres);
-  })
-  .catch((err) => {
-    console.warn("[steward] Redis/auth store initialization failed, using in-memory stores:", err);
-    initAuthStores(false).catch(() => {});
-  });
+let redisOk = false;
+try {
+  redisOk = await initRedis();
+} catch (err) {
+  console.warn("[steward] Redis initialization failed; trying Postgres auth storage:", err);
+}
+
+// Postgres is the durable fallback for the long-lived server when Redis is not
+// available. buildBackend probes every namespace; the assertion below turns
+// any production fallback to process-local memory into a startup failure.
+await initAuthStores(migrationsRan && !redisOk);
+assertAuthStoresAreSafe();
+
+// ─── Data retention scheduler (SOC2 CC2) ────────────────────────────────────
+
+if (migrationsRan) {
+  cancelRetention = startRetentionScheduler();
+  if (redisOk) {
+    cancelProviderReservationReconciliation = startProviderReservationReconciliationScheduler();
+  }
+  cancelTransactionReceiptPolling = startTransactionReceiptPollingScheduler();
+  cancelWebhookRetryScheduler = startWebhookRetryScheduler();
+}
+
+// Resolve custody before accepting traffic. A configured backend that cannot
+// initialize throws here, so production never falls back to local AES.
+getConfiguredVault();
+console.log(configuredVaultStartupLogLine());
 
 // ─── Server ───────────────────────────────────────────────────────────────────
 
@@ -156,7 +324,8 @@ const BIND_HOST = process.env.STEWARD_BIND_HOST || "127.0.0.1";
 const serverOptions = {
   hostname: BIND_HOST,
   port: PORT,
-  fetch: (request: Request) => app.fetch(request),
+  fetch: (request: Request, server: { requestIP(req: Request): { address: string } | null }) =>
+    runtimeGate(request, server.requestIP(request)?.address ?? null) ?? app.fetch(request),
   idleTimeout: 30,
 } as Parameters<typeof Bun.serve>[0] & { hostname?: string };
 
@@ -170,7 +339,11 @@ const shutdown = async (signal: string) => {
   server.stop(true);
   clearInterval(requestLogCleanupTimer);
   if (nonceCleanupTimer) clearInterval(nonceCleanupTimer);
-  requestLog.clear();
+  if (cancelRetention) cancelRetention();
+  if (cancelProviderReservationReconciliation) cancelProviderReservationReconciliation();
+  if (cancelTransactionReceiptPolling) cancelTransactionReceiptPolling();
+  if (cancelWebhookRetryScheduler) cancelWebhookRetryScheduler();
+  rateLimiter.clear();
 
   try {
     await Promise.all([closeDb(), shutdownRedis()]);

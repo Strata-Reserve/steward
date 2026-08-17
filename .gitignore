@@ -16,6 +16,8 @@ out/
 .env.local
 .env.*.local
 !.env.example
+# Operator-local fleet inventory (SEC-130 — node IPs are never committed)
+scripts/deploy-nodes.local.conf
 
 # ─── Logs ──────────────────────────────────────────────────────────────────────
 *.log
@@ -48,3 +50,6 @@ docker-compose.override.yml
 # ─── Misc ──────────────────────────────────────────────────────────────────────
 *.tgz
 *.tar.gz
+web/test-results/
+.claude/
+artifacts/

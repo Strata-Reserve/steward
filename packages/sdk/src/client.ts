@@ -1,17 +1,78 @@
+import { assertSecureBaseUrl } from "./base-url.ts";
 import type {
+  AgentAccountSummary,
   AgentBalance,
   AgentDashboardResponse,
   AgentIdentity,
+  AgentKeyQuorum,
+  AgentKeyQuorumCreate,
+  AgentKeyQuorumStatus,
+  AgentKeyQuorumUpdate,
+  AgentSigner,
+  AgentSignerCreate,
+  AgentSignerCreateResult,
+  AgentSignerStatus,
+  AgentSignerUpdate,
+  AgentSpendSummary,
   ApiResponse,
   ApprovalQueueEntry,
   ApprovalStats,
+  AuditEventsResponse,
   AuditLogResponse,
   AuditSummaryResponse,
+  AuthorizationKey,
+  AuthorizationKeyCreate,
+  AuthorizationKeyCreateResult,
+  AuthorizationKeyUpdate,
   AutoApprovalRule,
   ChainFamily,
+  ConditionSet,
+  ConditionSetCreate,
+  ConditionSetItem,
+  ConditionSetItemInput,
+  ConditionSetItemListResult,
+  ConditionSetItemUpdate,
+  ConditionSetUpdate,
   CreateRoutePayload,
   CreateSecretPayload,
+  DigitalAssetAccount,
+  DigitalAssetAccountAggregation,
+  DigitalAssetAccountAggregationDeleteResult,
+  DigitalAssetAccountAggregationListResult,
+  DigitalAssetAccountAggregationMutationInput,
+  DigitalAssetAccountBalance,
+  DigitalAssetAccountDeleteResult,
+  DigitalAssetAccountListResult,
+  DigitalAssetAccountMutationInput,
+  EncryptedAgentKeyImportInitResult,
+  EncryptedAgentKeyImportResult,
+  EncryptedAgentKeyImportSubmitInput,
+  EncryptedUserWalletKeyImportInitResult,
+  EncryptedUserWalletKeyImportResult,
+  EncryptedUserWalletKeyImportSubmitInput,
   ExportKeyResult,
+  Intent,
+  IntentCreate,
+  IntentListOptions,
+  PendingProxyRequest,
+  PendingProxyRequestStatus,
+  PlatformLinkAccountResult,
+  PlatformTenantInvitation,
+  PlatformTenantInvitationCreateResult,
+  PlatformTenantInvitationListResult,
+  PlatformTenantUser,
+  PlatformTransferAccountResult,
+  PlatformUserCreateInput,
+  PlatformUserCreateResult,
+  PlatformUserDeactivateResult,
+  PlatformUserDeleteResult,
+  PlatformUserIdentity,
+  PlatformUserLookupResult,
+  PlatformUserSearchResult,
+  PlatformWalletExternalIdAssignInput,
+  PlatformWalletExternalIdAssignResult,
+  PlatformWalletExternalIdConnectOrCreateInput,
+  PlatformWalletExternalIdConnectOrCreateResult,
   PolicyResult,
   PolicyRule,
   PolicySimulateInput,
@@ -19,15 +80,64 @@ import type {
   PolicyTemplate,
   PolicyTemplateCreate,
   PolicyTemplateUpdate,
+  PregeneratedUserWalletClaimResult,
+  PregeneratedUserWalletCreateResult,
+  ProviderActionApprovalDecisionInput,
+  ProviderActionApprovalDetail,
+  ProviderActionInvokeInput,
+  ProviderActionInvokeResult,
+  ProviderActionStatus,
+  ProviderActionTransitionResult,
+  ProviderCaseEvidence,
+  ProviderCaseManifest,
   RouteRecord,
   RpcResponse,
   SecretRecord,
+  SponsoredGasSpendSummary,
+  SsoDiscoveryResult,
+  TenantAccessAllowlistEntry,
+  TenantAccessAllowlistEntryInput,
+  TenantAdminUser,
+  TenantAdminUserEventsResult,
+  TenantAdminUserSearchResult,
+  TenantAppClient,
+  TenantAppClientSecret,
+  TenantAppClientSecretCreateResult,
+  TenantAuthAbuseConfig,
   TenantControlPlaneConfig,
+  TenantGasSponsorshipConfig,
+  TenantIdempotencyMetrics,
   TenantMembership,
+  TenantOidcProviderConfig,
+  TenantRequestSigningKey,
+  TenantRequestSigningKeyCreateResult,
+  TenantSamlSsoConfig,
+  TenantSamlSsoUpdate,
+  TenantSecurityChecklist,
+  TenantSsoDomain,
+  TenantTeamRole,
+  TenantTestAccountConfig,
+  TenantWalletPolicyBulkRemediationItem,
+  TenantWalletPolicyBulkRemediationResponse,
+  TenantWalletPolicyRemediationResult,
+  TenantWalletPolicyViolationReport,
   TxRecord,
   TypedDataDomain,
   TypedDataField,
   UpdateRoutePayload,
+  UserAccountSummary,
+  UserPushSubscriptionInput,
+  UserPushSubscriptionListResult,
+  UserPushSubscriptionResult,
+  UserWalletCreateResult,
+  UserWalletHistoryResult,
+  UserWalletRecoveryRestoreResult,
+  UserWalletRecoverySetupResult,
+  UserWalletSigner,
+  UserWalletSignerCreate,
+  UserWalletSignerCreateResult,
+  UserWalletSignMessageResult,
+  UserWalletSignResult,
   WebhookConfig,
   WebhookDelivery,
 } from "./types.ts";
@@ -35,7 +145,10 @@ import type {
 export interface BatchAgentSpec {
   id: string;
   name: string;
+  /** Steward-native immutable per-tenant wallet external identifier. */
   platformId?: string;
+  /** Privy-style alias for platformId. Ignored when platformId is supplied. */
+  externalId?: string;
 }
 
 export interface BatchCreateResult {
@@ -43,14 +156,66 @@ export interface BatchCreateResult {
   errors: Array<{ id: string; error: string }>;
 }
 
+export interface WalletBatchSpec {
+  /** Client-side reference id used only for partial-failure reporting. */
+  id: string;
+  name: string;
+  /** Immutable per-tenant wallet external id. */
+  externalId?: string;
+}
+
+export type WalletBatchCreateResult = BatchCreateResult;
+
 export type GetBalanceResult = AgentBalance;
+export interface UserWalletSelector {
+  walletIndex?: number;
+}
+export interface UserWalletBalanceInput extends UserWalletSelector {
+  chainId?: number;
+}
 
 export interface StewardClientConfig {
   baseUrl: string;
   apiKey?: string;
-  /** Agent-scoped JWT — sent as `Authorization: Bearer <token>`. Preferred over apiKey when both are set. */
+  /** Privy-style app id for server auth, sent as Basic auth username and X-Steward-App-Id. */
+  appId?: string;
+  /** Privy-style app secret for server auth, sent only through Basic auth. */
+  appSecret?: string;
+  /** Platform management key - sent as `X-Steward-Platform-Key`. */
+  platformKey?: string;
+  /** Agent-scoped JWT - sent as `Authorization: Bearer <token>`. Preferred over apiKey when both are set. */
   bearerToken?: string;
   tenantId?: string;
+  /** Optional HMAC secret used to sign sensitive mutating requests. */
+  requestSigningSecret?: string;
+  /** Optional tenant request-signing key id, sent as `X-Steward-Signing-Key-Id`. */
+  requestSigningKeyId?: string;
+  /**
+   * Server-grade credentials are blocked in browser runtimes by default because
+   * injected scripts can read request headers. Prefer bearerToken in browsers.
+   */
+  allowUnsafeBrowserSecrets?: boolean;
+  /**
+   * Permit a plaintext non-loopback baseUrl (warns at construction). HTTPS is
+   * required by default so credentials never travel cleartext off-loopback.
+   */
+  allowInsecureBaseUrl?: boolean;
+}
+
+export interface QuorumSignerCredential {
+  signerId: string;
+  signerSecret: string;
+}
+
+export interface StewardSignerAuthOptions {
+  /** Delegated signer id for non-admin flows. */
+  signerId?: string;
+  /** One-time-issued signer credential secret for delegated flows. */
+  signerSecret?: string;
+  /** Key quorum id for multi-signer non-admin flows. */
+  keyQuorumId?: string;
+  /** Signer-bound credentials that satisfy the key quorum threshold. */
+  keyQuorumCredentials?: QuorumSignerCredential[];
 }
 
 export interface SignTransactionInput {
@@ -61,12 +226,52 @@ export interface SignTransactionInput {
   broadcast?: boolean; // default true; set false to get signed tx without broadcasting
 }
 
+export type SignTransactionOptions = StewardSignerAuthOptions;
+
 export interface SignTypedDataInput {
   domain: TypedDataDomain;
   types: Record<string, TypedDataField[]>;
   primaryType: string;
   value: Record<string, unknown>;
 }
+
+export type SignTypedDataOptions = StewardSignerAuthOptions;
+
+export interface SignUserOperationInput {
+  userOperation: {
+    sender: string;
+    nonce: string;
+    initCode?: string;
+    callData: string;
+    verificationGasLimit: string;
+    callGasLimit: string;
+    preVerificationGas: string;
+    maxPriorityFeePerGas: string;
+    maxFeePerGas: string;
+    paymasterAndData?: string;
+  };
+  entryPoint?: string;
+  chainId: number;
+  /** Explicit policy recipient until calldata-level extraction is configured. */
+  to: string;
+  /** Explicit policy value in wei until calldata-level extraction is configured. */
+  value: string;
+  /** Optional caller-supplied ID mirrored in action payloads and lifecycle webhooks. */
+  referenceId?: string;
+}
+
+export type SignUserOperationOptions = StewardSignerAuthOptions;
+
+export interface SignAuthorizationInput {
+  contractAddress: string;
+  /** EIP-7702 allows 0 to designate any chain. */
+  chainId: number;
+  nonce: number;
+  /** Optional caller-supplied ID mirrored in action payloads and lifecycle webhooks. */
+  referenceId?: string;
+}
+
+export type SignAuthorizationOptions = StewardSignerAuthOptions;
 
 export interface SignSolanaTransactionInput {
   transaction: string; // base64-encoded serialized Solana transaction
@@ -94,6 +299,258 @@ export interface SignMessageResult {
   signature: string;
 }
 
+export type SignMessageOptions = StewardSignerAuthOptions;
+
+export interface SignRawHashInput {
+  hash: `0x${string}`;
+  /** Optional caller-supplied ID mirrored in audit metadata. */
+  referenceId?: string;
+  /** Delegated signer or key quorum authentication for non-admin unsafe signing flows. */
+  signerId?: StewardSignerAuthOptions["signerId"];
+  signerSecret?: StewardSignerAuthOptions["signerSecret"];
+  keyQuorumId?: StewardSignerAuthOptions["keyQuorumId"];
+  keyQuorumCredentials?: StewardSignerAuthOptions["keyQuorumCredentials"];
+}
+
+export interface SignRawHashResult {
+  signature: string;
+  hash: `0x${string}`;
+  walletAddress: string;
+}
+
+export interface SignBitcoinPsbtInput {
+  /** Scoped Bitcoin wallet id returned by create/list wallet APIs, e.g. bitcoin:testnet:p2wpkh:0:0:0. */
+  walletScope: string;
+  /** Base64-encoded PSBT. */
+  psbtBase64: string;
+  /**
+   * When true, return a finalized raw transaction hex plus txid/fee metadata when all inputs can be finalized.
+   * Steward still does not broadcast the transaction.
+   */
+  finalize?: boolean;
+  /**
+   * Optional caller-supplied ID mirrored in audit/history metadata.
+   * Reuse this value with a stable idempotency key when safely retrying PSBT signing.
+   */
+  referenceId?: string;
+  /** Delegated signer or key quorum authentication for non-admin signing flows. */
+  signerId?: StewardSignerAuthOptions["signerId"];
+  signerSecret?: StewardSignerAuthOptions["signerSecret"];
+  keyQuorumId?: StewardSignerAuthOptions["keyQuorumId"];
+  keyQuorumCredentials?: StewardSignerAuthOptions["keyQuorumCredentials"];
+}
+
+export interface SignBitcoinPsbtResult {
+  /** Signed PSBT; this route does not broadcast. */
+  signedPsbtBase64: string;
+  signedInputs: number;
+  addressType: "p2wpkh" | "p2tr";
+  network: "mainnet" | "testnet";
+  walletScope: string;
+  walletAddress: string;
+  /** Steward transaction record ID for audit/history lookup. */
+  transactionId: string;
+  /** Present only when finalize=true and the PSBT can be finalized without broadcasting. */
+  finalizedTxHex?: string;
+  /** Bitcoin transaction id for finalizedTxHex; check this before retrying downstream broadcast. */
+  txId?: string;
+  vsize?: number;
+  /** Finalized transaction fee in sats after Steward fee-cap and spend-policy checks. */
+  feeSats?: string;
+}
+
+export interface MoneroTransferDestinationInput {
+  /** Standard, subaddress, or integrated Monero address (case-significant base58). */
+  address: string;
+  /** Positive decimal amount in piconero (1 XMR = 10^12 piconero). */
+  amountPiconero: string;
+}
+
+export interface TransferMoneroInput {
+  /** Scoped Monero wallet id returned by create/list wallet APIs, e.g. monero:mainnet:0. */
+  walletScope: string;
+  destinations: MoneroTransferDestinationInput[];
+  /** wallet2 fee priority: 0 default … 3 elevated. */
+  priority?: 0 | 1 | 2 | 3;
+  /**
+   * Optional caller-supplied ID mirrored in audit/history metadata and used for
+   * server-side dedupe: retries with the same referenceId return the original
+   * transaction instead of relaying twice.
+   */
+  referenceId?: string;
+  /**
+   * Broadcast idempotency key (required by the API). Auto-generated when
+   * omitted; pass a stable value together with referenceId when retrying.
+   */
+  idempotencyKey?: string;
+  /** Delegated signer or key quorum authentication for non-admin signing flows. */
+  signerId?: StewardSignerAuthOptions["signerId"];
+  signerSecret?: StewardSignerAuthOptions["signerSecret"];
+  keyQuorumId?: StewardSignerAuthOptions["keyQuorumId"];
+  keyQuorumCredentials?: StewardSignerAuthOptions["keyQuorumCredentials"];
+}
+
+export interface TransferMoneroResult {
+  /** Steward transaction record ID for audit/history lookup. */
+  transactionId: string;
+  /** Monero transaction hash (64 hex chars, no 0x prefix). Already relayed. */
+  txHash: string;
+  /** Network fee paid, in piconero. */
+  feePiconero: string;
+  /** Sum of destination amounts, in piconero. */
+  amountPiconero: string;
+  /** amount + fee, in piconero (the value policy counters record). */
+  totalPiconero: string;
+  walletScope: string;
+  walletAddress: string;
+  network: "mainnet" | "stagenet";
+}
+
+export interface MoneroBalanceResult {
+  /** Total balance in piconero. */
+  balancePiconero: string;
+  /** Spendable (unlocked) balance in piconero. */
+  unlockedPiconero: string;
+  blocksToUnlock: number;
+  syncedHeight: number;
+  walletScope: string;
+  walletAddress: string;
+  network: "mainnet" | "stagenet";
+}
+
+export type HyperliquidAsset =
+  | "BTC"
+  | "ETH"
+  | "BNB"
+  | "SOL"
+  | "AVAX"
+  | "ARB"
+  | "OP"
+  | "NEAR"
+  | "HYPE"
+  | "ZEC"
+  | "XMR";
+
+export interface CreateTradeSessionInput {
+  agentId?: string;
+  venue: "hyperliquid";
+  walletAddress?: string;
+  dailyCap?: number;
+  perOrderCap?: number;
+  leverageCap?: number;
+  allowedAssets?: HyperliquidAsset[];
+  ttlSeconds?: number;
+}
+
+export interface CreateTradeSessionResult {
+  sessionId: string;
+  expiresAt: string;
+}
+
+export interface RevokeTradeSessionResult {
+  sessionId: string;
+  revokedAt: string;
+}
+
+export interface TradeSessionState {
+  id: string;
+  agentId: string;
+  tenantId: string;
+  venue: "hyperliquid" | string;
+  walletId: string;
+  status: "active" | "revoked" | "expired";
+  dailySpendUsd: number;
+  dailyCapUsd: number;
+  remainingCapUsd: number;
+  perOrderCapUsd: number;
+  leverageCap: number;
+  allowedAssets: HyperliquidAsset[];
+  createdAt: string;
+  expiresAt: string;
+  revokedAt?: string | null;
+  revokedBy?: string | null;
+}
+
+// Keep in lockstep with the equivalent list in EVERY other SDK (go, java,
+// python, ruby, rust, swift, csharp, flutter): mutations under these prefixes
+// are HMAC-signed, and divergence silently downgrades integrity (SEC-049).
+const SENSITIVE_SIGNED_PATHS = [
+  "/vault",
+  "/agents",
+  "/policies",
+  "/secrets",
+  "/trade",
+  "/v1/trade",
+  "/approvals",
+  "/intents",
+  "/user",
+  "/webhooks",
+  "/tenants",
+  "/platform",
+  "/condition-sets",
+  "/condition_sets",
+  "/v1/condition_sets",
+  "/global-wallet",
+  "/accounts",
+];
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+type IdempotencyOptions = {
+  idempotencyKey?: string;
+};
+
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function hmacSha256Hex(secret: string, canonical: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(canonical));
+  return [...new Uint8Array(signature)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function randomIdempotencyKey(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function isSensitiveMutatingRequest(path: string, method: string): boolean {
+  return (
+    MUTATING_METHODS.has(method.toUpperCase()) &&
+    SENSITIVE_SIGNED_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))
+  );
+}
+
+export interface HyperliquidSubmitOrderInput {
+  sessionId: string;
+  asset: HyperliquidAsset;
+  side: "buy" | "sell";
+  size: number;
+  leverage: number;
+  reduceOnly?: boolean;
+  idempotencyKey?: string;
+}
+
+export interface HyperliquidOrderResult {
+  orderId: string;
+  status: string;
+  filledQty: number;
+  avgPrice: number;
+  txHash: string | null;
+}
+
 /**
  * Result of creating a wallet. For new agents, includes `walletAddresses`
  * with both EVM and Solana addresses.
@@ -104,12 +561,585 @@ export interface GetAddressesResult {
   agentId: string;
   addresses: Array<{ chainFamily: ChainFamily; address: string }>;
 }
+
+export interface AdapterTokenRef {
+  address: string;
+  symbol?: string;
+  decimals?: number;
+}
+
+export interface AdapterUnsignedIntent {
+  signed: false;
+  kind: "evm-tx" | "evm-typed-data" | "abstract-intent";
+  chainId: number;
+  to: string;
+  value: string;
+  data?: string;
+  owner: string;
+  category: string;
+  provider: string;
+  metadata?: Record<string, unknown>;
+}
+
+export type AdapterRegistryDescription = Record<string, unknown>;
+
+export interface SwapQuoteInput {
+  agentId?: string;
+  fromToken: AdapterTokenRef;
+  toToken: AdapterTokenRef;
+  amount: string;
+  chainId: number;
+  slippageBps?: number;
+  estimatedUsd?: number;
+}
+
+export interface SwapQuote {
+  provider: string;
+  quoteId: string;
+  fromToken: AdapterTokenRef;
+  toToken: AdapterTokenRef;
+  amountIn: string;
+  amountOut: string;
+  minAmountOut: string;
+  feeAmount?: string;
+  chainId: number;
+  slippageBps?: number;
+  expiresAt?: number;
+  route?: unknown[];
+}
+
+export interface SwapBuildInput {
+  agentId?: string;
+  quote: SwapQuote | Record<string, unknown>;
+  estimatedUsd?: number;
+}
+
+export interface EarnVault {
+  id: string;
+  provider?: string;
+  chainId?: number;
+  asset?: AdapterTokenRef;
+  shareToken?: AdapterTokenRef;
+  apy?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface EarnPosition {
+  vault: string;
+  owner: string;
+  assets: string;
+  shares: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface EarnDepositInput {
+  agentId?: string;
+  vault: string;
+  assets: string;
+  estimatedUsd?: number;
+}
+
+export interface EarnWithdrawInput {
+  agentId?: string;
+  vault: string;
+  shares: string;
+  estimatedUsd?: number;
+}
+
+export interface BridgeQuoteInput {
+  agentId?: string;
+  fromChainId: number;
+  toChainId: number;
+  fromToken: AdapterTokenRef;
+  toToken: AdapterTokenRef;
+  amount: string;
+  recipient: string;
+  slippageBps?: number;
+  estimatedUsd?: number;
+}
+
+export interface BridgeQuote {
+  provider: string;
+  quoteId: string;
+  fromChainId: number;
+  toChainId: number;
+  fromToken: AdapterTokenRef;
+  toToken: AdapterTokenRef;
+  amountIn: string;
+  amountOut: string;
+  minAmountOut: string;
+  feeAmount: string;
+  recipient: string;
+  route: Array<{ bridge: string; fromChainId: number; toChainId: number }>;
+  slippageBps: number;
+  expiresAt: number;
+  direction?: string;
+  executionMode?: "unsigned-transaction" | "external-handoff";
+  handoffUrl?: string;
+  feeBps?: number;
+  feeScope?: "final" | "global-estimate" | "not-applicable";
+  feeObservedSlot?: number;
+  feeObservedAt?: number;
+  notices?: string[];
+}
+
+export interface BridgeBuildInput {
+  agentId?: string;
+  quote: BridgeQuote;
+  owner: string;
+  estimatedUsd?: number;
+}
+
+export interface BridgeSession {
+  id: string;
+  provider: string;
+  quoteId: string;
+  status: "created" | "pending" | "completed" | "failed";
+  fromChainId: number;
+  toChainId: number;
+  recipient: string;
+  createdAt: number;
+  direction?: string;
+  executionMode?: "unsigned-transaction" | "external-handoff";
+  handoffUrl?: string;
+  recipientSensitive?: boolean;
+  notices?: string[];
+  expiresAt?: number;
+}
+
+export interface BridgeHandoff {
+  kind: "external-handoff";
+  category: "bridge";
+  provider: string;
+  quoteId: string;
+  direction: string;
+  url: string;
+  fromChainId: number;
+  toChainId: number;
+  amountIn: string;
+  estimatedUsd: number;
+  recipient: string;
+  recipientSensitive?: boolean;
+  expiresAt: number;
+  feeBps: number;
+  feeScope: "global-estimate" | "owner-observed" | "not-applicable";
+  feeObservedSlot?: number;
+  feeObservedAt: number;
+  notices: string[];
+}
+
+export type BridgeBuildResult = AdapterUnsignedIntent | BridgeHandoff;
+
+export type SparkNetwork = "mainnet" | "testnet" | "signet";
+
+export interface SparkWalletCreateInput {
+  userId?: string;
+  network?: SparkNetwork;
+  label?: string;
+}
+
+export interface SparkWallet {
+  id: string;
+  provider: string;
+  userId: string;
+  network: SparkNetwork;
+  status: "created" | "active" | "disabled";
+  sparkAddress: string;
+  identityPublicKey: string;
+  createdAt: number;
+}
+
+export interface SparkBalance {
+  walletId: string;
+  provider: string;
+  network: SparkNetwork;
+  btcSats: string;
+  lightningSats: string;
+  sparkTokenBalances: Array<{ tokenId: string; amount: string }>;
+  updatedAt: number;
+}
+
+export interface SparkStaticBtcDepositQuoteInput {
+  walletId: string;
+  amountSats?: string;
+}
+
+export interface SparkStaticBtcDepositQuote {
+  id: string;
+  provider: string;
+  walletId: string;
+  network: SparkNetwork;
+  depositAddress: string;
+  amountSats?: string;
+  status: "created" | "funded" | "claimed" | "expired";
+  expiresAt: number;
+  createdAt: number;
+}
+
+export interface SparkStaticBtcDepositClaimInput {
+  agentId?: string;
+  walletId: string;
+  quoteId: string;
+  estimatedUsd?: number;
+}
+
+export interface SparkLightningInvoiceInput {
+  walletId: string;
+  amountSats: string;
+  memo?: string;
+  expiresInSeconds?: number;
+}
+
+export interface SparkLightningInvoice {
+  id: string;
+  provider: string;
+  walletId: string;
+  amountSats: string;
+  memo?: string;
+  paymentRequest: string;
+  status: "created" | "paid" | "expired" | "canceled";
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface SparkLightningPaymentInput {
+  agentId?: string;
+  walletId: string;
+  paymentRequest: string;
+  maxFeeSats?: string;
+  estimatedUsd?: number;
+}
+
+export interface SparkTransferInput {
+  agentId?: string;
+  walletId: string;
+  recipient: string;
+  amountSats: string;
+  memo?: string;
+  estimatedUsd?: number;
+}
+
+export interface SparkTokenTransferInput {
+  agentId?: string;
+  walletId: string;
+  recipient: string;
+  tokenId: string;
+  amount: string;
+  memo?: string;
+  estimatedUsd?: number;
+}
+
+export interface SparkIdentitySignInput {
+  walletId: string;
+  payload: string;
+}
+
+export interface ExchangeEmbedSessionInput {
+  userId?: string;
+  provider: "kraken" | "coinbase" | "binance" | "mock";
+  returnUrl: string;
+  scopes?: string[];
+  locale?: string;
+}
+
+export interface ExchangeEmbedSession {
+  id: string;
+  provider: string;
+  userId: string;
+  tenantId: string;
+  status: "created" | "active" | "expired" | "failed";
+  url: string;
+  scopes: string[];
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface ExchangeAccountLink {
+  id: string;
+  provider: string;
+  userId: string;
+  externalAccountId: string;
+  status: "linked" | "revoked";
+  createdAt: number;
+}
 export type GetHistoryResult = StewardHistoryEntry[];
 export type SignTransactionResult =
   | { txHash: string; caip2?: string }
   | { signedTx: string; caip2?: string }
   | StewardPendingApproval;
+export interface TransferActionQuoteInput {
+  to: string;
+  /** ERC20 token contract address. Defaults to native chain asset. */
+  token?: "native" | string;
+  value?: string;
+  amountWei?: string;
+  chainId?: number;
+  broadcast?: boolean;
+  /** Optional caller-supplied ID mirrored in action payloads and lifecycle webhooks. */
+  referenceId?: string;
+  /** Request tenant-configured gas sponsorship for supported execution paths. */
+  sponsor?: boolean;
+}
+
+export type WalletActionOptions = StewardSignerAuthOptions;
+
+export interface UserLinkedAccount {
+  id: string;
+  provider: string;
+  providerAccountId: string;
+  expiresAt: number | null;
+  type?: string;
+  embeddedWallets?: Array<{ address: string }>;
+  smartWallets?: Array<{ address: string }>;
+  providerApp?: {
+    id: string;
+    name: string | null;
+    logoUrl: string | null;
+  };
+  firstVerifiedAt?: string | Date;
+  latestVerifiedAt?: string | Date;
+}
+
+export interface UserAccountsResult {
+  accounts: UserLinkedAccount[];
+  primaryLoginMethods: Array<{ provider: "email" | "wallet"; providerAccountId: string }>;
+}
+
+export interface GlobalWalletAppSummary {
+  id: string;
+  appId: string;
+  tenantId: string;
+  name: string;
+  environment: string;
+  origin: string;
+  redirectUri: string | null;
+}
+
+export interface GlobalWalletConsent {
+  id: string;
+  tenantId: string;
+  clientId: string;
+  appId: string;
+  origin: string;
+  redirectUri: string | null;
+  walletAgentId: string | null;
+  walletAddress: string | null;
+  walletIndex: number | null;
+  scopes: string[];
+  status: string;
+  grantedAt: string | Date;
+  lastUsedAt: string | Date | null;
+  expiresAt: string | Date | null;
+  revokedAt: string | Date | null;
+  createdAt: string | Date;
+  updatedAt: string | Date;
+}
+
+export interface GlobalWalletConsentRequest {
+  app: GlobalWalletAppSummary;
+  requestedScopes: string[];
+  wallet: { agentId: string; address: string; walletIndex: number };
+  consent: GlobalWalletConsent | null;
+}
+
+export interface GlobalWalletApproveResult {
+  consent: GlobalWalletConsent;
+  wallet: { agentId: string; address: string; walletIndex: number };
+}
+
+export interface GlobalWalletRpcResult<T = unknown> {
+  jsonrpc: string;
+  id: unknown;
+  result: T;
+}
+
+export interface GlobalWalletActionConfirmation {
+  confirmationId: string;
+  method: "personal_sign" | "eth_signTypedData_v4" | "eth_sendTransaction" | string;
+  wallet?: { agentId: string; address: string; walletIndex: number };
+  expiresAt: string;
+}
+
+export interface GlobalWalletTransactionScan {
+  method: "eth_sendTransaction";
+  wallet: { address: string; agentId: string; walletIndex: number };
+  transaction: {
+    from?: string;
+    to: string;
+    valueWei: string;
+    data?: string;
+    chainId: number;
+  };
+  blocked: boolean;
+  riskLevel: "low" | "medium" | "high" | "blocked";
+  warnings: Array<{ code: string; severity: "info" | "warning" | "error"; message: string }>;
+  confirmationRequired: boolean;
+  executionSupported: boolean;
+  unsupportedReason?: string | null;
+}
+
+export interface UserAccountUnlinkResult {
+  deleted: boolean;
+  issuedBefore: number;
+}
+
+export interface UserEthereumWalletLinkNonce {
+  nonce: string;
+  message: string;
+  expiresIn: number;
+  address?: string;
+}
+
+export interface UserEthereumWalletLinkResult {
+  account: UserLinkedAccount;
+  isNew: boolean;
+}
+
+export interface UserSolanaWalletLinkNonce {
+  nonce: string;
+  message: string;
+  expiresIn: number;
+  publicKey?: string;
+}
+
+export interface UserSolanaWalletLinkResult {
+  account: UserLinkedAccount;
+  isNew: boolean;
+}
+
+export interface UserOAuthAccountLinkResult {
+  account: UserLinkedAccount;
+  isNew: boolean;
+}
+
+export interface UserOAuthAccountLinkChallenge {
+  state: string;
+  redirectUri: string;
+  expiresIn: number;
+}
+
+export interface UserPhoneAccountLinkSendResult {
+  phone: string;
+  expiresAt: string;
+}
+
+export interface UserPhoneAccountLinkResult {
+  account: UserLinkedAccount;
+  isNew: boolean;
+}
+
+export interface UserSocialAccountLinkResult {
+  account: UserLinkedAccount;
+  isNew: boolean;
+}
+
+export interface UserSocialAccountLinkChallenge {
+  challengeId?: string;
+  nonce?: string;
+  expiresIn: number;
+}
+
+export type AgentPolicyRuleCreate = Omit<PolicyRule, "id" | "enabled"> & {
+  id?: string;
+  enabled?: boolean;
+};
+
+export type AgentPolicyRuleUpdate = Partial<Omit<PolicyRule, "id">> & {
+  id?: never;
+};
+
+export interface TransferActionQuote {
+  quoteId: string;
+  type: "transfer";
+  chainId: number;
+  from: string;
+  to: string;
+  value: string;
+  token: "native" | string;
+  expiresAt: string;
+  request: {
+    to: string;
+    token: "native" | string;
+    value: string;
+    chainId: number;
+    broadcast: boolean;
+    referenceId?: string;
+    sponsor?: boolean;
+  };
+}
+export interface SendCallsActionInput {
+  calls: Array<{ to: string; value?: string; data?: string }>;
+  chainId?: number;
+  broadcast?: boolean;
+  /** Optional caller-supplied ID mirrored in action payloads and lifecycle webhooks. */
+  referenceId?: string;
+  /** Request tenant-configured gas sponsorship for supported execution paths. */
+  sponsor?: boolean;
+}
+export type TransferActionStatus =
+  | "pending_approval"
+  | "rejected"
+  | "signed"
+  | "broadcast"
+  | "confirmed"
+  | "failed";
+export interface TransferAction {
+  id: string;
+  type: "transfer";
+  status: TransferActionStatus;
+  chainId: number;
+  to: string;
+  value: string;
+  token: "native" | string;
+  txHash?: string;
+  signedTx?: string;
+  sponsorship?: {
+    requested: boolean;
+    sponsored: boolean;
+    provider?: string;
+    mode?: string;
+    estimatedUsd?: number | null;
+  };
+  policyResults?: PolicyResult[];
+  createdAt?: string;
+  signedAt?: string;
+  confirmedAt?: string;
+}
+export interface SendCallsAction {
+  id: string;
+  type: "send_calls";
+  status: "pending_approval" | "rejected";
+  chainId: number;
+  calls: Array<{ to: string; value: string; data?: string }>;
+  totalValue: string;
+  sponsorship?: {
+    requested: boolean;
+    sponsored: boolean;
+    provider?: string;
+    mode?: string;
+    estimatedUsd?: number | null;
+  };
+  policyResults?: Array<PolicyResult & { callIndex?: number }>;
+}
 export type SignTypedDataResult = { signature: string };
+export type SignUserOperationResult = {
+  signature: string;
+  userOperationHash: string;
+  entryPoint: string;
+  chainId: number;
+  txId: string;
+};
+export type SignAuthorizationResult = {
+  authorization: {
+    contractAddress: string;
+    chainId: number;
+    nonce: number;
+    r: string;
+    s: string;
+    yParity: 0 | 1;
+  };
+  txId: string;
+};
 export type SignSolanaTransactionResult = {
   signature: string;
   broadcast: boolean;
@@ -117,7 +1147,54 @@ export type SignSolanaTransactionResult = {
   caip2?: string;
 };
 export type RpcPassthroughResult = RpcResponse;
-export type StewardErrorResponse = { results?: PolicyResult[] };
+export type TransactionListResult = {
+  transactions: TxRecord[];
+  limit: number;
+  offset: number;
+};
+export type TransactionLifecycleEventType =
+  | "transaction.broadcasted"
+  | "transaction.confirmed"
+  | "transaction.execution_reverted"
+  | "transaction.replaced"
+  | "transaction.failed"
+  | "transaction.provider_error"
+  | "transaction.still_pending";
+export interface TransactionLifecycleUpdateInput {
+  type: TransactionLifecycleEventType;
+  txHash?: string;
+  replacementTxHash?: string;
+  reason?: string;
+  error?: string;
+  provider?: string;
+  blockNumber?: string | number;
+  confirmations?: number;
+}
+export interface TransactionReplaceInput {
+  replacementTxHash: string;
+  reason?: string;
+  provider?: string;
+  blockNumber?: string | number;
+  confirmations?: number;
+}
+export interface StewardMfaRequiredErrorData {
+  mfaRequired?: true;
+  reason?: string;
+  maxAgeSeconds?: number;
+  mfaVerifiedAt?: number | null;
+}
+
+export type StewardErrorResponse = { results?: PolicyResult[] } & StewardMfaRequiredErrorData;
+
+function errorMessageRequiresMfa(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("recent mfa") ||
+    normalized.includes("mfa step-up") ||
+    normalized.includes("multi-factor") ||
+    normalized.includes("mfa verification")
+  );
+}
 
 type ApiRequestResult<TSuccess, TFailure> =
   | { ok: true; status: number; data: TSuccess }
@@ -130,34 +1207,887 @@ function parseAgentIdentity(agent: AgentIdentity): AgentIdentity {
   };
 }
 
+function parsePlatformTenantUser(user: PlatformTenantUser): PlatformTenantUser {
+  return {
+    ...user,
+    joinedAt: new Date(user.joinedAt),
+    createdAt: new Date(user.createdAt),
+    updatedAt: new Date(user.updatedAt),
+  };
+}
+
+function parsePlatformTenantInvitation(
+  invitation: PlatformTenantInvitation,
+): PlatformTenantInvitation {
+  return {
+    ...invitation,
+    acceptedAt: invitation.acceptedAt ? new Date(invitation.acceptedAt) : null,
+    revokedAt: invitation.revokedAt ? new Date(invitation.revokedAt) : null,
+    expiresAt: new Date(invitation.expiresAt),
+    createdAt: new Date(invitation.createdAt),
+    updatedAt: invitation.updatedAt ? new Date(invitation.updatedAt) : undefined,
+  };
+}
+
+function parseTenantAdminUser(user: TenantAdminUser): TenantAdminUser {
+  return {
+    ...user,
+    joinedAt: new Date(user.joinedAt),
+    deactivatedAt: user.deactivatedAt ? new Date(user.deactivatedAt) : null,
+    createdAt: new Date(user.createdAt),
+    updatedAt: new Date(user.updatedAt),
+  };
+}
+
+function parseTenantAdminUserEvents(
+  result: TenantAdminUserEventsResult,
+): TenantAdminUserEventsResult {
+  return {
+    ...result,
+    events: result.events.map((event) => ({
+      ...event,
+      createdAt: new Date(event.createdAt),
+    })),
+  };
+}
+
+function parsePlatformUserIdentity(user: PlatformUserIdentity): PlatformUserIdentity {
+  return {
+    ...user,
+    deactivatedAt: user.deactivatedAt ? new Date(user.deactivatedAt) : null,
+    createdAt: new Date(user.createdAt),
+    updatedAt: new Date(user.updatedAt),
+  };
+}
+
+function parseDigitalAssetAccount(account: DigitalAssetAccount): DigitalAssetAccount {
+  return {
+    ...account,
+    createdAt: new Date(account.createdAt),
+    created_at: account.created_at ? new Date(account.created_at) : undefined,
+    updatedAt: new Date(account.updatedAt),
+    updated_at: account.updated_at ? new Date(account.updated_at) : undefined,
+    wallets: account.wallets.map((wallet) => ({
+      ...wallet,
+      createdAt: wallet.createdAt ? new Date(wallet.createdAt) : wallet.createdAt,
+    })),
+  };
+}
+
+function parseDigitalAssetAccountBalance(
+  balance: DigitalAssetAccountBalance,
+): DigitalAssetAccountBalance {
+  return {
+    ...balance,
+    wallets: balance.wallets.map((wallet) => ({
+      ...wallet,
+      createdAt: wallet.createdAt ? new Date(wallet.createdAt) : wallet.createdAt,
+    })),
+  };
+}
+
+function parseDigitalAssetAccountAggregation(
+  aggregation: DigitalAssetAccountAggregation,
+): DigitalAssetAccountAggregation {
+  return {
+    ...aggregation,
+    createdAt: new Date(aggregation.createdAt),
+    created_at: aggregation.created_at ? new Date(aggregation.created_at) : undefined,
+    updatedAt: new Date(aggregation.updatedAt),
+    updated_at: aggregation.updated_at ? new Date(aggregation.updated_at) : undefined,
+  };
+}
+
+function parseTxRecord(tx: TxRecord): TxRecord {
+  return {
+    ...tx,
+    createdAt: tx.createdAt instanceof Date ? tx.createdAt : new Date(tx.createdAt),
+    signedAt: tx.signedAt
+      ? tx.signedAt instanceof Date
+        ? tx.signedAt
+        : new Date(tx.signedAt)
+      : undefined,
+    confirmedAt: tx.confirmedAt
+      ? tx.confirmedAt instanceof Date
+        ? tx.confirmedAt
+        : new Date(tx.confirmedAt)
+      : undefined,
+  };
+}
+
+function signerHeaders(options?: StewardSignerAuthOptions): HeadersInit | undefined {
+  if (
+    !options?.signerId &&
+    !options?.signerSecret &&
+    !options?.keyQuorumId &&
+    !options?.keyQuorumCredentials?.length
+  ) {
+    return undefined;
+  }
+  const headers: Record<string, string> = {};
+  if (options.signerId) headers["X-Steward-Signer-Id"] = options.signerId;
+  if (options.signerSecret) headers["X-Steward-Signer-Secret"] = options.signerSecret;
+  if (options.keyQuorumId) headers["X-Steward-Key-Quorum-Id"] = options.keyQuorumId;
+  if (options.keyQuorumCredentials?.length) {
+    headers["X-Steward-Key-Quorum-Credentials"] = JSON.stringify(options.keyQuorumCredentials);
+  }
+  return headers;
+}
+
 export class StewardApiError<TData = unknown> extends Error {
   readonly status: number;
   readonly data?: TData;
+  readonly mfaRequired: boolean;
 
   constructor(message: string, status: number, data?: TData) {
     super(message);
     this.name = "StewardApiError";
     this.status = status;
     this.data = data;
+    this.mfaRequired =
+      (typeof data === "object" &&
+        data !== null &&
+        "mfaRequired" in data &&
+        (data as { mfaRequired?: unknown }).mfaRequired === true) ||
+      errorMessageRequiresMfa(message);
   }
+}
+
+export function isStewardMfaRequiredError(
+  error: unknown,
+): error is StewardApiError<StewardMfaRequiredErrorData> {
+  return error instanceof StewardApiError && error.mfaRequired;
+}
+
+function isBrowserRuntime(): boolean {
+  return typeof globalThis.window !== "undefined" && typeof globalThis.document !== "undefined";
 }
 
 export class StewardClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
+  private readonly appId?: string;
+  private readonly appSecret?: string;
+  private readonly platformKey?: string;
   private readonly bearerToken?: string;
   private readonly tenantId?: string;
+  private readonly requestSigningSecret?: string;
+  private readonly requestSigningKeyId?: string;
 
-  constructor({ baseUrl, apiKey, bearerToken, tenantId }: StewardClientConfig) {
+  constructor({
+    baseUrl,
+    apiKey,
+    appId,
+    appSecret,
+    platformKey,
+    bearerToken,
+    tenantId,
+    requestSigningSecret,
+    requestSigningKeyId,
+    allowUnsafeBrowserSecrets,
+    allowInsecureBaseUrl,
+  }: StewardClientConfig) {
+    if (
+      isBrowserRuntime() &&
+      !allowUnsafeBrowserSecrets &&
+      (apiKey || appSecret || platformKey || requestSigningSecret)
+    ) {
+      throw new StewardApiError(
+        "apiKey, appSecret, platformKey, and requestSigningSecret must not be used in browser runtimes; use bearerToken or set allowUnsafeBrowserSecrets only for audited local tools.",
+        0,
+      );
+    }
+    assertSecureBaseUrl(baseUrl, allowInsecureBaseUrl);
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.apiKey = apiKey;
+    this.appId = appId;
+    this.appSecret = appSecret;
+    this.platformKey = platformKey;
     this.bearerToken = bearerToken;
     this.tenantId = tenantId;
+    this.requestSigningSecret = requestSigningSecret;
+    this.requestSigningKeyId = requestSigningKeyId;
   }
+
+  readonly tradeSessions = {
+    create: async (input: CreateTradeSessionInput): Promise<CreateTradeSessionResult> => {
+      const response = await this.request<CreateTradeSessionResult, StewardErrorResponse>(
+        "/v1/trade/sessions",
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+    revoke: async (sessionId: string): Promise<RevokeTradeSessionResult> => {
+      const response = await this.request<RevokeTradeSessionResult, StewardErrorResponse>(
+        `/v1/trade/sessions/${encodeURIComponent(sessionId)}/revoke`,
+        {
+          method: "POST",
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+    get: async (sessionId: string): Promise<TradeSessionState> => {
+      const response = await this.request<TradeSessionState, StewardErrorResponse>(
+        `/v1/trade/sessions/${encodeURIComponent(sessionId)}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+  };
+
+  readonly trade = {
+    hyperliquid: {
+      submitOrder: async (
+        input: HyperliquidSubmitOrderInput,
+        options?: { idempotencyKey?: string },
+      ): Promise<HyperliquidOrderResult> => {
+        const idempotencyKey = options?.idempotencyKey ?? input.idempotencyKey;
+        const response = await this.request<HyperliquidOrderResult, StewardErrorResponse>(
+          "/v1/trade/hyperliquid/order",
+          {
+            method: "POST",
+            headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
+            body: JSON.stringify(input),
+          },
+        );
+        if (!response.ok) {
+          throw new StewardApiError(response.error, response.status, response.data);
+        }
+        return response.data;
+      },
+    },
+  };
+
+  /**
+   * Governed workspace-provider action lifecycle.
+   *
+   * Invoke and get are agent-JWT surfaces. Approval reads/decisions and case
+   * evidence retain the API human-session + MFA gates; the SDK only types those
+   * routes and never substitutes credentials or actors. Execute is authorized
+   * by the API against the persisted action owner/approval state.
+   */
+  readonly providerActions = {
+    invoke: async (input: ProviderActionInvokeInput): Promise<ProviderActionInvokeResult> => {
+      try {
+        return await this.requestRawJson<ProviderActionInvokeResult>("/v2/provider-actions", {
+          method: "POST",
+          body: JSON.stringify(input),
+        });
+      } catch (error) {
+        if (error instanceof StewardApiError && error.status === 403) {
+          const envelope = error.data as {
+            error?: string;
+            data?: { id?: string; status?: string; requestHash?: string; actionDigest?: string };
+          };
+          const denial = envelope?.data;
+          if (
+            denial?.id &&
+            (denial.status === "denied_access" || denial.status === "denied_policy") &&
+            denial.requestHash &&
+            denial.actionDigest
+          ) {
+            return {
+              id: denial.id,
+              status: denial.status,
+              reasonCode: envelope.error ?? error.message,
+              requestHash: denial.requestHash,
+              actionDigest: denial.actionDigest,
+              persisted: true,
+            };
+          }
+        }
+        throw error;
+      }
+    },
+
+    get: async (actionId: string): Promise<ProviderActionStatus> => {
+      const response = await this.request<ProviderActionStatus, StewardErrorResponse>(
+        `/v2/provider-actions/${encodeURIComponent(actionId)}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+
+    getApproval: async (actionId: string): Promise<ProviderActionApprovalDetail> => {
+      const response = await this.requestRawJson<{
+        ok: true;
+        data: ProviderActionApprovalDetail;
+      }>(`/v2/provider-actions/${encodeURIComponent(actionId)}/approval`);
+      return response.data;
+    },
+
+    decideApproval: async (
+      actionId: string,
+      input: ProviderActionApprovalDecisionInput,
+    ): Promise<ProviderActionTransitionResult> =>
+      this.requestRawJson<ProviderActionTransitionResult>(
+        `/v2/provider-actions/${encodeURIComponent(actionId)}/approval`,
+        { method: "POST", body: JSON.stringify(input) },
+      ),
+
+    execute: async (actionId: string): Promise<ProviderActionTransitionResult> =>
+      this.requestRawJson<ProviderActionTransitionResult>(
+        `/v2/provider-actions/${encodeURIComponent(actionId)}/execute`,
+        { method: "POST" },
+      ),
+
+    getCase: async (actionId: string): Promise<ProviderCaseManifest> =>
+      this.requestRawJson<ProviderCaseManifest>(
+        `/v2/provider-actions/${encodeURIComponent(actionId)}/case`,
+      ),
+
+    getEvidence: async (actionId: string): Promise<ProviderCaseEvidence> =>
+      this.requestRawJson<ProviderCaseEvidence>(
+        `/v2/provider-actions/${encodeURIComponent(actionId)}/evidence`,
+      ),
+  };
 
   getBaseUrl(): string {
     return this.baseUrl;
   }
+
+  readonly platformUsers = {
+    create: async (input: PlatformUserCreateInput): Promise<PlatformUserCreateResult> => {
+      const response = await this.request<PlatformUserCreateResult, StewardErrorResponse>(
+        "/platform/users",
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+
+    getIdentity: async (userId: string): Promise<PlatformUserIdentity> => {
+      const response = await this.request<PlatformUserIdentity, StewardErrorResponse>(
+        `/platform/users/${encodeURIComponent(userId)}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parsePlatformUserIdentity(response.data);
+    },
+
+    updateCustomMetadata: async (
+      userId: string,
+      customMetadata: Record<string, unknown>,
+    ): Promise<PlatformUserIdentity> => {
+      const response = await this.request<PlatformUserIdentity, StewardErrorResponse>(
+        `/platform/users/${encodeURIComponent(userId)}/metadata`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ customMetadata }),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parsePlatformUserIdentity(response.data);
+    },
+
+    deactivate: async (
+      userId: string,
+      deactivated = true,
+    ): Promise<PlatformUserDeactivateResult> => {
+      const response = await this.request<PlatformUserDeactivateResult, StewardErrorResponse>(
+        `/platform/users/${encodeURIComponent(userId)}/deactivate`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ deactivated }),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        ...response.data,
+        deactivatedAt: response.data.deactivatedAt ? new Date(response.data.deactivatedAt) : null,
+      };
+    },
+
+    delete: async (userId: string): Promise<PlatformUserDeleteResult> => {
+      const response = await this.request<PlatformUserDeleteResult, StewardErrorResponse>(
+        `/platform/users/${encodeURIComponent(userId)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+
+    lookup: async (opts: {
+      email?: string;
+      phone?: string;
+      walletAddress?: string;
+      walletExternalId?: string;
+      smartWalletId?: string;
+      customAuthId?: string;
+      provider?: string;
+      providerAccountId?: string;
+      tenantId?: string;
+    }): Promise<PlatformUserLookupResult> => {
+      const params = new URLSearchParams();
+      if (opts.email) params.set("email", opts.email);
+      if (opts.phone) params.set("phone", opts.phone);
+      if (opts.walletAddress) params.set("walletAddress", opts.walletAddress);
+      if (opts.walletExternalId) params.set("walletExternalId", opts.walletExternalId);
+      if (opts.smartWalletId) params.set("smartWalletId", opts.smartWalletId);
+      if (opts.customAuthId) params.set("customAuthId", opts.customAuthId);
+      if (opts.provider) params.set("provider", opts.provider);
+      if (opts.providerAccountId) params.set("providerAccountId", opts.providerAccountId);
+      if (opts.tenantId) params.set("tenantId", opts.tenantId);
+      const response = await this.request<PlatformUserLookupResult, StewardErrorResponse>(
+        `/platform/users/lookup?${params.toString()}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        user: response.data.user ? parsePlatformUserIdentity(response.data.user) : null,
+      };
+    },
+
+    getUserByEmailAddress: async (
+      email: string,
+      opts?: { tenantId?: string },
+    ): Promise<PlatformUserLookupResult> =>
+      this.platformUsers.lookup({ email, tenantId: opts?.tenantId }),
+
+    getUserByPhoneNumber: async (
+      phone: string,
+      opts?: { tenantId?: string },
+    ): Promise<PlatformUserLookupResult> =>
+      this.platformUsers.lookup({ phone, tenantId: opts?.tenantId }),
+
+    getUserByWalletAddress: async (
+      walletAddress: string,
+      opts?: { tenantId?: string },
+    ): Promise<PlatformUserLookupResult> =>
+      this.platformUsers.lookup({ walletAddress, tenantId: opts?.tenantId }),
+
+    getUserByWalletExternalId: async (
+      walletExternalId: string,
+      opts: { tenantId: string },
+    ): Promise<PlatformUserLookupResult> =>
+      this.platformUsers.lookup({ walletExternalId, tenantId: opts.tenantId }),
+
+    getUserBySmartWalletAddress: async (
+      smartWalletId: string,
+      opts?: { tenantId?: string },
+    ): Promise<PlatformUserLookupResult> =>
+      this.platformUsers.lookup({ smartWalletId, tenantId: opts?.tenantId }),
+
+    getUserByCustomAuthId: async (
+      customAuthId: string,
+      opts?: { tenantId?: string },
+    ): Promise<PlatformUserLookupResult> =>
+      this.platformUsers.lookup({ customAuthId, tenantId: opts?.tenantId }),
+
+    getUserByProviderAccount: async (
+      provider: string,
+      providerAccountId: string,
+      opts?: { tenantId?: string },
+    ): Promise<PlatformUserLookupResult> =>
+      this.platformUsers.lookup({ provider, providerAccountId, tenantId: opts?.tenantId }),
+
+    getUserByDiscordUsername: async (username: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("discord", username, opts),
+    getUserByGithubUsername: async (username: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("github", username, opts),
+    getUserByFarcasterId: async (fid: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("farcaster", fid, opts),
+    getUserByInstagramUsername: async (username: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("instagram", username, opts),
+    getUserBySpotifySubject: async (subject: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("spotify", subject, opts),
+    getUserByTelegramUserId: async (id: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("telegram", id, opts),
+    getUserByTelegramUsername: async (username: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("telegram", username, opts),
+    getUserByTwitchUsername: async (username: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("twitch", username, opts),
+    getUserByTwitterSubject: async (subject: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("twitter", subject, opts),
+    getUserByTwitterUsername: async (username: string, opts?: { tenantId?: string }) =>
+      this.platformUsers.getUserByProviderAccount("twitter", username, opts),
+
+    search: async (
+      tenantId: string,
+      opts?: {
+        q?: string;
+        email?: string;
+        walletExternalId?: string;
+        limit?: number;
+        offset?: number;
+      },
+    ): Promise<PlatformUserSearchResult> => {
+      const params = new URLSearchParams();
+      if (opts?.q) params.set("q", opts.q);
+      if (opts?.email) params.set("email", opts.email);
+      if (opts?.walletExternalId) params.set("walletExternalId", opts.walletExternalId);
+      if (opts?.limit) params.set("limit", String(opts.limit));
+      if (opts?.offset) params.set("offset", String(opts.offset));
+      const qs = params.toString();
+      const response = await this.request<PlatformUserSearchResult, StewardErrorResponse>(
+        `/platform/tenants/${encodeURIComponent(tenantId)}/users${qs ? `?${qs}` : ""}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        ...response.data,
+        users: response.data.users.map(parsePlatformTenantUser),
+      };
+    },
+
+    get: async (tenantId: string, userId: string): Promise<PlatformTenantUser> => {
+      const response = await this.request<PlatformTenantUser, StewardErrorResponse>(
+        `/platform/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parsePlatformTenantUser(response.data);
+    },
+
+    updateMetadata: async (
+      tenantId: string,
+      userId: string,
+      metadata: {
+        customMetadata?: Record<string, unknown>;
+        tenantCustomMetadata?: Record<string, unknown>;
+      },
+    ): Promise<PlatformTenantUser> => {
+      const response = await this.request<PlatformTenantUser, StewardErrorResponse>(
+        `/platform/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}/metadata`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(metadata),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parsePlatformTenantUser(response.data);
+    },
+
+    listInvitations: async (
+      tenantId: string,
+      opts?: {
+        status?: "pending" | "accepted" | "revoked" | "expired" | "all";
+        limit?: number;
+        offset?: number;
+      },
+    ): Promise<PlatformTenantInvitationListResult> => {
+      const params = new URLSearchParams();
+      if (opts?.status) params.set("status", opts.status);
+      if (opts?.limit) params.set("limit", String(opts.limit));
+      if (opts?.offset) params.set("offset", String(opts.offset));
+      const qs = params.toString();
+      const response = await this.request<PlatformTenantInvitationListResult, StewardErrorResponse>(
+        `/platform/tenants/${encodeURIComponent(tenantId)}/invitations${qs ? `?${qs}` : ""}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        invitations: response.data.invitations.map(parsePlatformTenantInvitation),
+      };
+    },
+
+    createInvitation: async (
+      tenantId: string,
+      input: {
+        email: string;
+        role?: Exclude<TenantTeamRole, "owner"> | string;
+        expiresInSeconds?: number;
+        invitedByUserId?: string;
+        sendEmail?: boolean;
+      },
+    ): Promise<PlatformTenantInvitationCreateResult> => {
+      const response = await this.request<
+        PlatformTenantInvitationCreateResult,
+        StewardErrorResponse
+      >(`/platform/tenants/${encodeURIComponent(tenantId)}/invitations`, {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        token: response.data.token,
+        emailSent: response.data.emailSent,
+        invitation: parsePlatformTenantInvitation(response.data.invitation),
+      };
+    },
+
+    revokeInvitation: async (tenantId: string, invitationId: string): Promise<void> => {
+      const response = await this.request<Record<string, never>, StewardErrorResponse>(
+        `/platform/tenants/${encodeURIComponent(tenantId)}/invitations/${encodeURIComponent(invitationId)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    },
+
+    linkAccount: async (
+      userId: string,
+      input: { provider: string; providerAccountId: string; tenantId?: string },
+    ): Promise<PlatformLinkAccountResult> => {
+      const response = await this.request<PlatformLinkAccountResult, StewardErrorResponse>(
+        `/platform/users/${encodeURIComponent(userId)}/accounts`,
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+
+    unlinkAccount: async (
+      userId: string,
+      provider: string,
+      providerAccountId: string,
+      opts?: { force?: boolean },
+    ): Promise<void> => {
+      const params = new URLSearchParams();
+      if (opts?.force) params.set("force", "true");
+      const qs = params.toString();
+      const response = await this.request<Record<string, never>, StewardErrorResponse>(
+        `/platform/users/${encodeURIComponent(userId)}/accounts/${encodeURIComponent(provider)}/${encodeURIComponent(providerAccountId)}${qs ? `?${qs}` : ""}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    },
+
+    transferAccount: async (
+      fromUserId: string,
+      provider: string,
+      providerAccountId: string,
+      input: { toUserId: string; force?: boolean },
+    ): Promise<PlatformTransferAccountResult> => {
+      const response = await this.request<PlatformTransferAccountResult, StewardErrorResponse>(
+        `/platform/users/${encodeURIComponent(fromUserId)}/accounts/${encodeURIComponent(provider)}/${encodeURIComponent(providerAccountId)}/transfer`,
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+
+    assignWalletExternalId: async (
+      userId: string,
+      input: PlatformWalletExternalIdAssignInput,
+    ): Promise<PlatformWalletExternalIdAssignResult> => {
+      const response = await this.request<
+        PlatformWalletExternalIdAssignResult,
+        StewardErrorResponse
+      >(`/platform/users/${encodeURIComponent(userId)}/wallet/external-id`, {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+
+    resolveWalletExternalId: async (
+      input: PlatformWalletExternalIdAssignInput,
+    ): Promise<PlatformUserLookupResult> => {
+      const response = await this.request<PlatformUserLookupResult, StewardErrorResponse>(
+        "/platform/users/wallet/external-id",
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        user: response.data.user ? parsePlatformUserIdentity(response.data.user) : null,
+      };
+    },
+
+    connectOrCreateByWalletExternalId: async (
+      input: PlatformWalletExternalIdConnectOrCreateInput,
+    ): Promise<PlatformWalletExternalIdConnectOrCreateResult> => {
+      const response = await this.request<
+        PlatformWalletExternalIdConnectOrCreateResult,
+        StewardErrorResponse
+      >("/platform/users/wallet/external-id/connect-or-create", {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+  };
+
+  readonly accounts = {
+    list: async (): Promise<DigitalAssetAccountListResult> => {
+      const response = await this.request<DigitalAssetAccountListResult, StewardErrorResponse>(
+        "/accounts",
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        accounts: response.data.accounts.map(parseDigitalAssetAccount),
+      };
+    },
+
+    create: async (input: DigitalAssetAccountMutationInput): Promise<DigitalAssetAccount> => {
+      const response = await this.request<DigitalAssetAccount, StewardErrorResponse>("/accounts", {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parseDigitalAssetAccount(response.data);
+    },
+
+    get: async (accountId: string): Promise<DigitalAssetAccount> => {
+      const response = await this.request<DigitalAssetAccount, StewardErrorResponse>(
+        `/accounts/${encodeURIComponent(accountId)}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parseDigitalAssetAccount(response.data);
+    },
+
+    getBalance: async (accountId: string): Promise<DigitalAssetAccountBalance> => {
+      const response = await this.request<DigitalAssetAccountBalance, StewardErrorResponse>(
+        `/accounts/${encodeURIComponent(accountId)}/balance`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parseDigitalAssetAccountBalance(response.data);
+    },
+
+    update: async (
+      accountId: string,
+      input: DigitalAssetAccountMutationInput,
+    ): Promise<DigitalAssetAccount> => {
+      const response = await this.request<DigitalAssetAccount, StewardErrorResponse>(
+        `/accounts/${encodeURIComponent(accountId)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parseDigitalAssetAccount(response.data);
+    },
+
+    delete: async (accountId: string): Promise<DigitalAssetAccountDeleteResult> => {
+      const response = await this.request<DigitalAssetAccountDeleteResult, StewardErrorResponse>(
+        `/accounts/${encodeURIComponent(accountId)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+
+    listAggregations: async (
+      accountId: string,
+    ): Promise<DigitalAssetAccountAggregationListResult> => {
+      const response = await this.request<
+        DigitalAssetAccountAggregationListResult,
+        StewardErrorResponse
+      >(`/accounts/${encodeURIComponent(accountId)}/aggregations`);
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return {
+        aggregations: response.data.aggregations.map(parseDigitalAssetAccountAggregation),
+      };
+    },
+
+    createAggregation: async (
+      accountId: string,
+      input: DigitalAssetAccountAggregationMutationInput = {},
+    ): Promise<DigitalAssetAccountAggregation> => {
+      const response = await this.request<DigitalAssetAccountAggregation, StewardErrorResponse>(
+        `/accounts/${encodeURIComponent(accountId)}/aggregations`,
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parseDigitalAssetAccountAggregation(response.data);
+    },
+
+    getAggregation: async (
+      accountId: string,
+      aggregationId: string,
+    ): Promise<DigitalAssetAccountAggregation> => {
+      const response = await this.request<DigitalAssetAccountAggregation, StewardErrorResponse>(
+        `/accounts/${encodeURIComponent(accountId)}/aggregations/${encodeURIComponent(aggregationId)}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return parseDigitalAssetAccountAggregation(response.data);
+    },
+
+    deleteAggregation: async (
+      accountId: string,
+      aggregationId: string,
+    ): Promise<DigitalAssetAccountAggregationDeleteResult> => {
+      const response = await this.request<
+        DigitalAssetAccountAggregationDeleteResult,
+        StewardErrorResponse
+      >(
+        `/accounts/${encodeURIComponent(accountId)}/aggregations/${encodeURIComponent(aggregationId)}`,
+        { method: "DELETE" },
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+  };
+
+  readonly platformApps = {
+    getGasSpend: async (input: {
+      tenantId: string;
+      walletIds?: string[];
+      walletExternalIds?: string[];
+      startTimestamp?: number;
+      endTimestamp?: number;
+    }): Promise<SponsoredGasSpendSummary> => {
+      const params = new URLSearchParams();
+      params.set("tenant_id", input.tenantId);
+      if (input.walletIds?.length) {
+        params.set("wallet_ids", input.walletIds.join(","));
+      }
+      if (input.walletExternalIds?.length) {
+        params.set("wallet_external_ids", input.walletExternalIds.join(","));
+      }
+      if (input.startTimestamp !== undefined) {
+        params.set("start_timestamp", String(input.startTimestamp));
+      }
+      if (input.endTimestamp !== undefined) {
+        params.set("end_timestamp", String(input.endTimestamp));
+      }
+      const response = await this.request<SponsoredGasSpendSummary, StewardErrorResponse>(
+        `/platform/apps/gas_spend?${params.toString()}`,
+      );
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data;
+    },
+  };
+
+  readonly platformTestAccounts = {
+    get: async (tenantId: string): Promise<TenantTestAccountConfig> => {
+      const response = await this.request<
+        { testAccount: TenantTestAccountConfig },
+        StewardErrorResponse
+      >(`/platform/tenants/${encodeURIComponent(tenantId)}/test-account`);
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data.testAccount;
+    },
+
+    enable: async (tenantId: string): Promise<TenantTestAccountConfig> => {
+      const response = await this.request<
+        { testAccount: TenantTestAccountConfig },
+        StewardErrorResponse
+      >(`/platform/tenants/${encodeURIComponent(tenantId)}/test-account`, {
+        method: "POST",
+      });
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data.testAccount;
+    },
+
+    disable: async (tenantId: string): Promise<TenantTestAccountConfig> => {
+      const response = await this.request<
+        { testAccount: TenantTestAccountConfig },
+        StewardErrorResponse
+      >(`/platform/tenants/${encodeURIComponent(tenantId)}/test-account`, {
+        method: "DELETE",
+      });
+      if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+      return response.data.testAccount;
+    },
+  };
 
   async createWallet(
     agentId: string,
@@ -176,12 +2106,17 @@ export class StewardClient {
     return parseAgentIdentity(response.data);
   }
 
-  async signTransaction(agentId: string, tx: SignTransactionInput): Promise<SignTransactionResult> {
+  async signTransaction(
+    agentId: string,
+    tx: SignTransactionInput,
+    options?: SignTransactionOptions,
+  ): Promise<SignTransactionResult> {
     const response = await this.request<
       { txHash: string },
       StewardPendingApproval | StewardErrorResponse
     >(`/vault/${encodeURIComponent(agentId)}/sign`, {
       method: "POST",
+      headers: signerHeaders(options),
       body: JSON.stringify(tx),
     });
 
@@ -194,6 +2129,67 @@ export class StewardClient {
     }
 
     throw new StewardApiError(response.error, response.status, response.data);
+  }
+
+  async quoteTransfer(
+    agentId: string,
+    input: TransferActionQuoteInput,
+  ): Promise<TransferActionQuote> {
+    const response = await this.request<TransferActionQuote, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/actions/transfer/quote`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async createTransferAction(
+    agentId: string,
+    input: TransferActionQuoteInput,
+    options?: WalletActionOptions,
+  ): Promise<TransferAction> {
+    const response = await this.request<TransferAction, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/actions/transfer`,
+      {
+        method: "POST",
+        headers: signerHeaders(options),
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async createSendCallsAction(
+    agentId: string,
+    input: SendCallsActionInput,
+    options?: WalletActionOptions,
+  ): Promise<SendCallsAction> {
+    const response = await this.request<SendCallsAction, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/actions/send-calls`,
+      {
+        method: "POST",
+        headers: signerHeaders(options),
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async getTransferAction(agentId: string, actionId: string): Promise<TransferAction> {
+    const response = await this.request<TransferAction, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/actions/${encodeURIComponent(actionId)}`,
+    );
+
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
   }
 
   async getPolicies(agentId: string): Promise<PolicyRule[]> {
@@ -229,6 +2225,79 @@ export class StewardClient {
     return response.data ?? policies;
   }
 
+  async listPolicyRules(agentId: string): Promise<PolicyRule[]> {
+    const response = await this.request<{ rules: PolicyRule[] }, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/policies/rules`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data.rules;
+  }
+
+  async createPolicyRule(agentId: string, rule: AgentPolicyRuleCreate): Promise<PolicyRule> {
+    const response = await this.request<PolicyRule, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/policies/rules`,
+      {
+        method: "POST",
+        body: JSON.stringify(rule),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  async getPolicyRule(agentId: string, ruleId: string): Promise<PolicyRule> {
+    const response = await this.request<PolicyRule, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/policies/rules/${encodeURIComponent(ruleId)}`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  async updatePolicyRule(
+    agentId: string,
+    ruleId: string,
+    update: AgentPolicyRuleUpdate,
+  ): Promise<PolicyRule> {
+    const response = await this.request<PolicyRule, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/policies/rules/${encodeURIComponent(ruleId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(update),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  async deletePolicyRule(agentId: string, ruleId: string): Promise<PolicyRule> {
+    const response = await this.request<PolicyRule, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/policies/rules/${encodeURIComponent(ruleId)}`,
+      { method: "DELETE" },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
   async getAgent(agentId: string): Promise<AgentIdentity> {
     const response = await this.request<AgentIdentity, StewardErrorResponse>(
       `/agents/${encodeURIComponent(agentId)}`,
@@ -253,7 +2322,7 @@ export class StewardClient {
 
   /**
    * Return a compact history feed for an agent. Each entry is a
-   * `{ timestamp, value }` pair — suitable for trend charts and volume
+   * `{ timestamp, value }` pair - suitable for trend charts and volume
    * windows. For the full signed-transaction objects, prefer
    * {@link getTransactionHistory}.
    */
@@ -274,7 +2343,7 @@ export class StewardClient {
    * original sign request.
    */
   async getTransactionHistory(agentId: string): Promise<TxRecord[]> {
-    const response = await this.request<TxRecord[], StewardErrorResponse>(
+    const response = await this.request<TxRecord[] | TransactionListResult, StewardErrorResponse>(
       `/vault/${encodeURIComponent(agentId)}/history`,
     );
 
@@ -282,29 +2351,211 @@ export class StewardClient {
       throw new StewardApiError(response.error, response.status, response.data);
     }
 
-    return response.data.map((tx) => ({
-      ...tx,
-      createdAt: tx.createdAt instanceof Date ? tx.createdAt : new Date(tx.createdAt),
-      signedAt: tx.signedAt
-        ? tx.signedAt instanceof Date
-          ? tx.signedAt
-          : new Date(tx.signedAt)
-        : undefined,
-      confirmedAt: tx.confirmedAt
-        ? tx.confirmedAt instanceof Date
-          ? tx.confirmedAt
-          : new Date(tx.confirmedAt)
-        : undefined,
-    }));
+    const records = Array.isArray(response.data) ? response.data : response.data.transactions;
+    return records.map(parseTxRecord);
   }
 
-  async signMessage(agentId: string, message: string): Promise<SignMessageResult> {
+  async listTransactions(
+    agentId: string,
+    opts?: {
+      status?: string;
+      actionType?: string;
+      txHash?: string;
+      referenceId?: string;
+      limit?: number;
+      offset?: number;
+    },
+  ): Promise<TransactionListResult> {
+    const params = new URLSearchParams();
+    if (opts?.status) params.set("status", opts.status);
+    if (opts?.actionType) params.set("actionType", opts.actionType);
+    if (opts?.txHash) params.set("txHash", opts.txHash);
+    if (opts?.referenceId) params.set("referenceId", opts.referenceId);
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    if (opts?.offset) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const response = await this.request<TransactionListResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/transactions${qs ? `?${qs}` : ""}`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return {
+      ...response.data,
+      transactions: response.data.transactions.map(parseTxRecord),
+    };
+  }
+
+  async getTransaction(agentId: string, txId: string): Promise<TxRecord> {
+    const response = await this.request<TxRecord, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/transactions/${encodeURIComponent(txId)}`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return parseTxRecord(response.data);
+  }
+
+  async updateTransactionLifecycle(
+    agentId: string,
+    txId: string,
+    input: TransactionLifecycleUpdateInput,
+  ): Promise<TxRecord> {
+    const response = await this.request<TxRecord, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/transactions/${encodeURIComponent(txId)}/lifecycle`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return parseTxRecord(response.data);
+  }
+
+  async replaceTransaction(
+    agentId: string,
+    txId: string,
+    input: TransactionReplaceInput,
+  ): Promise<TxRecord> {
+    const response = await this.request<TxRecord, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/transactions/${encodeURIComponent(txId)}/replace`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return parseTxRecord(response.data);
+  }
+
+  async signMessage(
+    agentId: string,
+    message: string,
+    options?: SignMessageOptions,
+  ): Promise<SignMessageResult> {
     const response = await this.request<SignMessageResult, StewardErrorResponse>(
       `/vault/${encodeURIComponent(agentId)}/sign-message`,
       {
         method: "POST",
+        headers: signerHeaders(options),
         body: JSON.stringify({ message }),
       },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  async signRawHash(agentId: string, input: SignRawHashInput): Promise<SignRawHashResult> {
+    const {
+      signerId: _signerId,
+      signerSecret: _signerSecret,
+      keyQuorumId: _keyQuorumId,
+      keyQuorumCredentials: _keyQuorumCredentials,
+      ...body
+    } = input;
+    const response = await this.request<SignRawHashResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/sign-raw-hash`,
+      {
+        method: "POST",
+        headers: signerHeaders(input),
+        body: JSON.stringify(body),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  async signBitcoinPsbt(
+    agentId: string,
+    input: SignBitcoinPsbtInput,
+  ): Promise<SignBitcoinPsbtResult> {
+    const {
+      signerId: _signerId,
+      signerSecret: _signerSecret,
+      keyQuorumId: _keyQuorumId,
+      keyQuorumCredentials: _keyQuorumCredentials,
+      ...body
+    } = input;
+    const response = await this.request<SignBitcoinPsbtResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/sign-bitcoin-psbt`,
+      {
+        method: "POST",
+        headers: signerHeaders(input),
+        body: JSON.stringify(body),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Build, sign, and relay a native Monero transfer through the vault.
+   * Requires an enabled `raw-signing-chain` policy allowing monero/ed25519 and
+   * a self-hosted deployment with the monero-wallet-rpc sidecar configured
+   * (503 otherwise). Amounts are piconero decimal strings (1 XMR = 10^12);
+   * USD-denominated policy rules fail closed for Monero — use
+   * piconero-denominated limits.
+   */
+  async transferMonero(agentId: string, input: TransferMoneroInput): Promise<TransferMoneroResult> {
+    const {
+      signerId: _signerId,
+      signerSecret: _signerSecret,
+      keyQuorumId: _keyQuorumId,
+      keyQuorumCredentials: _keyQuorumCredentials,
+      idempotencyKey,
+      ...body
+    } = input;
+    const headers: Record<string, string> = {
+      ...((signerHeaders(input) as Record<string, string> | undefined) ?? {}),
+      "Idempotency-Key": idempotencyKey ?? crypto.randomUUID(),
+    };
+    const response = await this.request<TransferMoneroResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/monero/transfer`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Read a scoped Monero wallet balance (piconero string amounts). The first
+   * call after idle time refreshes the wallet scan and may take a few seconds.
+   */
+  async getMoneroBalance(agentId: string, walletScope: string): Promise<MoneroBalanceResult> {
+    const response = await this.request<MoneroBalanceResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/monero/balance?walletScope=${encodeURIComponent(walletScope)}`,
     );
 
     if (!response.ok) {
@@ -318,11 +2569,65 @@ export class StewardClient {
    * Sign EIP-712 typed data (`eth_signTypedData_v4`).
    * Used for DEX approvals, ERC-20 permits, and structured data signatures.
    */
-  async signTypedData(agentId: string, input: SignTypedDataInput): Promise<SignTypedDataResult> {
+  async signTypedData(
+    agentId: string,
+    input: SignTypedDataInput,
+    options?: SignTypedDataOptions,
+  ): Promise<SignTypedDataResult> {
     const response = await this.request<SignTypedDataResult, StewardErrorResponse>(
       `/vault/${encodeURIComponent(agentId)}/sign-typed-data`,
       {
         method: "POST",
+        headers: signerHeaders(options),
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Sign an ERC-4337 EntryPoint v0.7 user operation (`eth_signUserOperation`).
+   * `to` and `value` are required for policy evaluation until calldata extraction is configured.
+   */
+  async signUserOperation(
+    agentId: string,
+    input: SignUserOperationInput,
+    options?: SignUserOperationOptions,
+  ): Promise<SignUserOperationResult> {
+    const response = await this.request<SignUserOperationResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/sign-user-operation`,
+      {
+        method: "POST",
+        headers: signerHeaders(options),
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Sign an EIP-7702 set-code authorization for inclusion in an authorizationList.
+   */
+  async signAuthorization(
+    agentId: string,
+    input: SignAuthorizationInput,
+    options?: SignAuthorizationOptions,
+  ): Promise<SignAuthorizationResult> {
+    const response = await this.request<SignAuthorizationResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/sign-authorization`,
+      {
+        method: "POST",
+        headers: signerHeaders(options),
         body: JSON.stringify(input),
       },
     );
@@ -414,16 +2719,1062 @@ export class StewardClient {
    * Export the private keys for the authenticated user's personal wallet.
    * Requires a user session token (Bearer JWT).
    */
-  async exportUserWalletKey(): Promise<ExportKeyResult> {
+  async exportUserWalletKey(input: UserWalletSelector = {}): Promise<ExportKeyResult> {
     const response = await this.request<ExportKeyResult, StewardErrorResponse>(
       "/user/me/wallet/export",
-      { method: "POST" },
+      {
+        method: "POST",
+        body:
+          input.walletIndex === undefined
+            ? undefined
+            : JSON.stringify({ walletIndex: input.walletIndex }),
+      },
     );
 
     if (!response.ok) {
       throw new StewardApiError(response.error, response.status, response.data);
     }
 
+    return response.data;
+  }
+
+  /**
+   * Initialize a one-time encrypted private-key import session for the
+   * authenticated user's embedded wallet. Requires a personal user session with
+   * recent MFA and the audited import feature flags.
+   */
+  async initializeEncryptedUserWalletKeyImport(
+    chain: "evm" | "solana",
+    input: UserWalletSelector = {},
+  ): Promise<EncryptedUserWalletKeyImportInitResult> {
+    const response = await this.request<
+      EncryptedUserWalletKeyImportInitResult,
+      StewardErrorResponse
+    >("/user/me/wallet/import/init", {
+      method: "POST",
+      body: JSON.stringify({
+        chain,
+        ...(input.walletIndex === undefined ? {} : { walletIndex: input.walletIndex }),
+      }),
+    });
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Submit an encrypted private-key import envelope for the authenticated user's
+   * embedded wallet. Plaintext privateKey fields are rejected by the API.
+   */
+  async submitEncryptedUserWalletKeyImport(
+    input: EncryptedUserWalletKeyImportSubmitInput,
+  ): Promise<EncryptedUserWalletKeyImportResult> {
+    const response = await this.request<EncryptedUserWalletKeyImportResult, StewardErrorResponse>(
+      "/user/me/wallet/import/submit",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Get the authenticated user's embedded wallet native balance.
+   * Requires a personal user session token (Bearer JWT).
+   */
+  async getUserWallet(input?: number | UserWalletBalanceInput): Promise<GetBalanceResult> {
+    const params = new URLSearchParams();
+    if (typeof input === "number") {
+      params.set("chainId", String(input));
+    } else if (input) {
+      if (input.chainId !== undefined) params.set("chainId", String(input.chainId));
+      if (input.walletIndex !== undefined) params.set("walletIndex", String(input.walletIndex));
+    }
+    const qs = params.toString();
+    const response = await this.request<AgentBalance, StewardErrorResponse>(
+      `/user/me/wallet${qs ? `?${qs}` : ""}`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** Privy-style alias for the authenticated user's embedded wallet balance. */
+  async getUserWalletBalance(input?: number | UserWalletBalanceInput): Promise<GetBalanceResult> {
+    return this.getUserWallet(input);
+  }
+
+  /**
+   * Provision the authenticated user's embedded wallet if needed.
+   * Requires a personal user session token (Bearer JWT).
+   */
+  async createUserWallet(input: UserWalletSelector = {}): Promise<UserWalletCreateResult> {
+    const response = await this.request<UserWalletCreateResult, StewardErrorResponse>(
+      "/user/me/wallet",
+      {
+        method: "POST",
+        body:
+          input.walletIndex === undefined
+            ? undefined
+            : JSON.stringify({ walletIndex: input.walletIndex }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** Privy-style alias for authenticated user-wallet provisioning. */
+  async provisionUserWallet(input: UserWalletSelector = {}): Promise<UserWalletCreateResult> {
+    return this.createUserWallet(input);
+  }
+
+  /**
+   * Provision the authenticated user's wallet from a one-time BIP-39 recovery
+   * phrase. Requires a user session token with recent MFA and only works before
+   * a user wallet already exists.
+   */
+  async setupUserWalletRecovery(
+    input: UserWalletSelector = {},
+  ): Promise<UserWalletRecoverySetupResult> {
+    const response = await this.request<UserWalletRecoverySetupResult, StewardErrorResponse>(
+      "/user/me/wallet/recovery/setup",
+      {
+        method: "POST",
+        body:
+          input.walletIndex === undefined
+            ? undefined
+            : JSON.stringify({ walletIndex: input.walletIndex }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Restore/import the authenticated user's mnemonic-backed wallet. Requires a
+   * user session with recent MFA. The mnemonic is sent once and is never returned.
+   */
+  async restoreUserWalletRecovery(input: {
+    mnemonic: string;
+    walletIndex?: number;
+  }): Promise<UserWalletRecoveryRestoreResult> {
+    const response = await this.request<UserWalletRecoveryRestoreResult, StewardErrorResponse>(
+      "/user/me/wallet/recovery/restore",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          mnemonic: input.mnemonic,
+          ...(input.walletIndex === undefined ? {} : { walletIndex: input.walletIndex }),
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Claim a tenant-admin pregenerated wallet for the authenticated user.
+   * Requires a personal user session with recent MFA and no existing user wallet.
+   */
+  async claimPregeneratedUserWallet(input: {
+    tenantId: string;
+    claimToken: string;
+    walletIndex?: number;
+  }): Promise<PregeneratedUserWalletClaimResult> {
+    const response = await this.request<PregeneratedUserWalletClaimResult, StewardErrorResponse>(
+      "/user/me/wallet/claim-pregenerated",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /**
+   * Sign a native transfer with the authenticated user's embedded wallet.
+   * Broadcast requests require an idempotency key server-side.
+   */
+  async signUserWalletTransaction(
+    input: SignTransactionInput & UserWalletSelector,
+    options?: { idempotencyKey?: string },
+  ): Promise<UserWalletSignResult> {
+    const response = await this.request<UserWalletSignResult, StewardErrorResponse>(
+      "/user/me/wallet/sign",
+      {
+        method: "POST",
+        headers: options?.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : undefined,
+        body: JSON.stringify(input),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** Sign a message with the authenticated user's embedded wallet when server-side unsafe signing is enabled. */
+  async signUserWalletMessage(
+    message: string,
+    input: UserWalletSelector = {},
+  ): Promise<UserWalletSignMessageResult> {
+    const response = await this.request<UserWalletSignMessageResult, StewardErrorResponse>(
+      "/user/me/wallet/sign-message",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          message,
+          ...(input.walletIndex === undefined ? {} : { walletIndex: input.walletIndex }),
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** List the authenticated user's embedded-wallet transaction history. */
+  async getUserWalletHistory(opts?: {
+    limit?: number;
+    offset?: number;
+    walletIndex?: number;
+  }): Promise<UserWalletHistoryResult> {
+    const params = new URLSearchParams();
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    if (opts?.offset) params.set("offset", String(opts.offset));
+    if (opts?.walletIndex !== undefined) params.set("walletIndex", String(opts.walletIndex));
+    const qs = params.toString();
+    const response = await this.request<UserWalletHistoryResult, StewardErrorResponse>(
+      `/user/me/wallet/history${qs ? `?${qs}` : ""}`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return {
+      ...response.data,
+      transactions: response.data.transactions.map(parseTxRecord),
+    };
+  }
+
+  /** Get active/default policy rules for the authenticated user's embedded wallet. */
+  async getUserWalletPolicies(input: UserWalletSelector = {}): Promise<PolicyRule[]> {
+    const params = new URLSearchParams();
+    if (input.walletIndex !== undefined) params.set("walletIndex", String(input.walletIndex));
+    const qs = params.toString();
+    const response = await this.request<PolicyRule[], StewardErrorResponse>(
+      `/user/me/wallet/policies${qs ? `?${qs}` : ""}`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** List additional signer credentials for the authenticated user's embedded wallet. */
+  async listUserWalletSigners(
+    input: UserWalletSelector & { status?: AgentSignerStatus } = {},
+  ): Promise<UserWalletSigner[]> {
+    const params = new URLSearchParams();
+    if (input.walletIndex !== undefined) params.set("walletIndex", String(input.walletIndex));
+    if (input.status) params.set("status", input.status);
+    const qs = params.toString();
+    const response = await this.request<{ signers: UserWalletSigner[] }, StewardErrorResponse>(
+      `/user/me/wallet/signers${qs ? `?${qs}` : ""}`,
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data.signers;
+  }
+
+  /**
+   * Create a server-issued signer credential for the authenticated user's embedded wallet.
+   * The returned credentialSecret is shown once.
+   */
+  async createUserWalletSigner(
+    input: UserWalletSignerCreate = {},
+  ): Promise<UserWalletSignerCreateResult> {
+    const { walletIndex, ...body } = input;
+    const response = await this.request<UserWalletSignerCreateResult, StewardErrorResponse>(
+      "/user/me/wallet/signers",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...body,
+          ...(walletIndex === undefined ? {} : { walletIndex }),
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** Revoke an additional signer credential on the authenticated user's embedded wallet. */
+  async revokeUserWalletSigner(
+    signerId: string,
+    input: UserWalletSelector = {},
+  ): Promise<UserWalletSigner> {
+    const params = new URLSearchParams();
+    if (input.walletIndex !== undefined) params.set("walletIndex", String(input.walletIndex));
+    const qs = params.toString();
+    const response = await this.request<UserWalletSigner, StewardErrorResponse>(
+      `/user/me/wallet/signers/${encodeURIComponent(signerId)}${qs ? `?${qs}` : ""}`,
+      { method: "DELETE" },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** List linked accounts for the authenticated user. Requires user JWT. */
+  async listUserAccounts(): Promise<UserAccountsResult> {
+    const response = await this.request<UserAccountsResult, StewardErrorResponse>(
+      "/user/me/accounts",
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Get the authenticated user's aggregated account, wallets, portfolio, and spend. */
+  async getUserAccount(
+    opts: { chainId?: number; tokens?: string[] } = {},
+  ): Promise<UserAccountSummary> {
+    const params = new URLSearchParams();
+    if (opts.chainId) params.set("chainId", String(opts.chainId));
+    if (opts.tokens?.length) params.set("tokens", opts.tokens.join(","));
+    const qs = params.toString();
+    const response = await this.request<UserAccountSummary, StewardErrorResponse>(
+      `/user/me/account${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Privy-style alias for the authenticated user's aggregated account summary. */
+  async getUserAccountAggregation(
+    opts: { chainId?: number; tokens?: string[] } = {},
+  ): Promise<UserAccountSummary> {
+    const params = new URLSearchParams();
+    if (opts.chainId) params.set("chainId", String(opts.chainId));
+    if (opts.tokens?.length) params.set("tokens", opts.tokens.join(","));
+    const qs = params.toString();
+    const response = await this.request<UserAccountSummary, StewardErrorResponse>(
+      `/user/me/aggregation${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** List active push subscriptions for the authenticated user. Requires user JWT. */
+  async listUserPushSubscriptions(): Promise<UserPushSubscriptionListResult> {
+    const response = await this.request<UserPushSubscriptionListResult, StewardErrorResponse>(
+      "/user/me/push-subscriptions",
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Register or refresh a push subscription for the authenticated user. Requires user JWT. */
+  async registerUserPushSubscription(
+    input: UserPushSubscriptionInput,
+  ): Promise<UserPushSubscriptionResult> {
+    const response = await this.request<UserPushSubscriptionResult, StewardErrorResponse>(
+      "/user/me/push-subscriptions",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Revoke a push subscription for the authenticated user. Requires user JWT. */
+  async revokeUserPushSubscription(subscriptionId: string): Promise<UserPushSubscriptionResult> {
+    const response = await this.request<UserPushSubscriptionResult, StewardErrorResponse>(
+      `/user/me/push-subscriptions/${encodeURIComponent(subscriptionId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async listAdapters(): Promise<AdapterRegistryDescription> {
+    const response = await this.request<
+      { adapters: AdapterRegistryDescription },
+      StewardErrorResponse
+    >("/adapters");
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.adapters;
+  }
+
+  async getSwapQuote(input: SwapQuoteInput): Promise<SwapQuote> {
+    const response = await this.request<{ quote: SwapQuote }, StewardErrorResponse>(
+      "/adapters/swap/quote",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.quote;
+  }
+
+  async buildSwapIntent(input: SwapBuildInput): Promise<AdapterUnsignedIntent> {
+    const response = await this.request<
+      { unsignedIntent: AdapterUnsignedIntent },
+      StewardErrorResponse
+    >("/adapters/swap/build", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.unsignedIntent;
+  }
+
+  async listEarnVaults(chainId: number): Promise<EarnVault[]> {
+    const response = await this.request<{ vaults: EarnVault[] }, StewardErrorResponse>(
+      `/adapters/earn/vaults?chainId=${encodeURIComponent(String(chainId))}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.vaults;
+  }
+
+  async getEarnPosition(vault: string, owner: string): Promise<EarnPosition> {
+    const params = new URLSearchParams({ owner });
+    const response = await this.request<{ position: EarnPosition }, StewardErrorResponse>(
+      `/adapters/earn/vaults/${encodeURIComponent(vault)}/position?${params.toString()}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.position;
+  }
+
+  async buildEarnDepositIntent(input: EarnDepositInput): Promise<AdapterUnsignedIntent> {
+    const response = await this.request<
+      { unsignedIntent: AdapterUnsignedIntent },
+      StewardErrorResponse
+    >("/adapters/earn/deposit", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.unsignedIntent;
+  }
+
+  async buildEarnWithdrawIntent(input: EarnWithdrawInput): Promise<AdapterUnsignedIntent> {
+    const response = await this.request<
+      { unsignedIntent: AdapterUnsignedIntent },
+      StewardErrorResponse
+    >("/adapters/earn/withdraw", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.unsignedIntent;
+  }
+
+  async getBridgeQuote(input: BridgeQuoteInput): Promise<BridgeQuote> {
+    const response = await this.request<{ quote: BridgeQuote }, StewardErrorResponse>(
+      "/adapters/bridge/quote",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.quote;
+  }
+
+  async buildBridgeIntent(input: BridgeBuildInput): Promise<BridgeBuildResult> {
+    const response = await this.request<
+      { unsignedIntent?: AdapterUnsignedIntent; handoff?: BridgeHandoff },
+      StewardErrorResponse
+    >("/adapters/bridge/build", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    const result = response.data.unsignedIntent ?? response.data.handoff;
+    if (!result) throw new StewardApiError("Bridge adapter returned no build result", 502);
+    return result;
+  }
+
+  async createBridgeSession(quote: BridgeQuote): Promise<BridgeSession> {
+    const response = await this.request<{ session: BridgeSession }, StewardErrorResponse>(
+      "/adapters/bridge/sessions",
+      {
+        method: "POST",
+        body: JSON.stringify({ quote }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.session;
+  }
+
+  async getBridgeSession(sessionId: string): Promise<BridgeSession> {
+    const response = await this.request<{ session: BridgeSession }, StewardErrorResponse>(
+      `/adapters/bridge/sessions/${encodeURIComponent(sessionId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.session;
+  }
+
+  async createSparkWallet(input: SparkWalletCreateInput): Promise<SparkWallet> {
+    const response = await this.request<{ wallet: SparkWallet }, StewardErrorResponse>(
+      "/adapters/spark/wallets",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.wallet;
+  }
+
+  async getSparkWallet(walletId: string): Promise<SparkWallet> {
+    const response = await this.request<{ wallet: SparkWallet }, StewardErrorResponse>(
+      `/adapters/spark/wallets/${encodeURIComponent(walletId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.wallet;
+  }
+
+  async getSparkBalance(walletId: string): Promise<SparkBalance> {
+    const response = await this.request<{ balance: SparkBalance }, StewardErrorResponse>(
+      `/adapters/spark/wallets/${encodeURIComponent(walletId)}/balance`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.balance;
+  }
+
+  async createSparkStaticBtcDepositQuote(
+    input: SparkStaticBtcDepositQuoteInput,
+  ): Promise<SparkStaticBtcDepositQuote> {
+    const response = await this.request<
+      { quote: SparkStaticBtcDepositQuote },
+      StewardErrorResponse
+    >("/adapters/spark/static-btc-deposits", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.quote;
+  }
+
+  async buildSparkStaticBtcDepositClaimIntent(
+    input: SparkStaticBtcDepositClaimInput,
+  ): Promise<AdapterUnsignedIntent> {
+    const response = await this.request<
+      { unsignedIntent: AdapterUnsignedIntent },
+      StewardErrorResponse
+    >("/adapters/spark/static-btc-deposits/claim", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.unsignedIntent;
+  }
+
+  async createSparkLightningInvoice(
+    input: SparkLightningInvoiceInput,
+  ): Promise<SparkLightningInvoice> {
+    const response = await this.request<{ invoice: SparkLightningInvoice }, StewardErrorResponse>(
+      "/adapters/spark/lightning/invoices",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.invoice;
+  }
+
+  async getSparkLightningInvoice(invoiceId: string): Promise<SparkLightningInvoice> {
+    const response = await this.request<{ invoice: SparkLightningInvoice }, StewardErrorResponse>(
+      `/adapters/spark/lightning/invoices/${encodeURIComponent(invoiceId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.invoice;
+  }
+
+  async buildSparkLightningPaymentIntent(
+    input: SparkLightningPaymentInput,
+  ): Promise<AdapterUnsignedIntent> {
+    const response = await this.request<
+      { unsignedIntent: AdapterUnsignedIntent },
+      StewardErrorResponse
+    >("/adapters/spark/lightning/pay", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.unsignedIntent;
+  }
+
+  async buildSparkTransferIntent(input: SparkTransferInput): Promise<AdapterUnsignedIntent> {
+    const response = await this.request<
+      { unsignedIntent: AdapterUnsignedIntent },
+      StewardErrorResponse
+    >("/adapters/spark/transfers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.unsignedIntent;
+  }
+
+  async buildSparkTokenTransferIntent(
+    input: SparkTokenTransferInput,
+  ): Promise<AdapterUnsignedIntent> {
+    const response = await this.request<
+      { unsignedIntent: AdapterUnsignedIntent },
+      StewardErrorResponse
+    >("/adapters/spark/token-transfers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.unsignedIntent;
+  }
+
+  async requestSparkIdentitySignature(input: SparkIdentitySignInput): Promise<never> {
+    const response = await this.request<never, StewardErrorResponse>(
+      "/adapters/spark/identity/sign",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    throw new StewardApiError("Spark identity signing returned unexpectedly", 500);
+  }
+
+  async createExchangeEmbedSession(
+    input: ExchangeEmbedSessionInput,
+  ): Promise<ExchangeEmbedSession> {
+    const response = await this.request<{ session: ExchangeEmbedSession }, StewardErrorResponse>(
+      "/adapters/exchange/sessions",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.session;
+  }
+
+  async getExchangeEmbedSession(sessionId: string): Promise<ExchangeEmbedSession> {
+    const response = await this.request<{ session: ExchangeEmbedSession }, StewardErrorResponse>(
+      `/adapters/exchange/sessions/${encodeURIComponent(sessionId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.session;
+  }
+
+  async listExchangeAccounts(userId?: string): Promise<ExchangeAccountLink[]> {
+    const qs = userId ? `?userId=${encodeURIComponent(userId)}` : "";
+    const response = await this.request<{ accounts: ExchangeAccountLink[] }, StewardErrorResponse>(
+      `/adapters/exchange/accounts${qs}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.accounts;
+  }
+
+  async revokeExchangeAccount(accountId: string): Promise<ExchangeAccountLink> {
+    const response = await this.request<{ account: ExchangeAccountLink }, StewardErrorResponse>(
+      `/adapters/exchange/accounts/${encodeURIComponent(accountId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.account;
+  }
+
+  /** Preview a global-wallet consent request for a tenant app. Requires user JWT. */
+  async getGlobalWalletConsentRequest(input: {
+    appId: string;
+    origin?: string;
+    redirectUri?: string;
+    scopes?: string[];
+    walletIndex?: number;
+  }): Promise<GlobalWalletConsentRequest> {
+    const params = new URLSearchParams({ app_id: input.appId });
+    if (input.origin) params.set("origin", input.origin);
+    if (input.redirectUri) params.set("redirect_uri", input.redirectUri);
+    if (input.walletIndex !== undefined) params.set("wallet_index", String(input.walletIndex));
+    for (const scope of input.scopes ?? []) params.append("scope", scope);
+    const response = await this.request<GlobalWalletConsentRequest, StewardErrorResponse>(
+      `/global-wallet/consent/request?${params.toString()}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Approve global-wallet access for a tenant app. Requires user JWT with recent MFA. */
+  async approveGlobalWalletConsent(input: {
+    appId: string;
+    origin?: string;
+    redirectUri?: string;
+    scopes?: string[];
+    walletIndex?: number;
+  }): Promise<GlobalWalletApproveResult> {
+    const response = await this.request<GlobalWalletApproveResult, StewardErrorResponse>(
+      "/global-wallet/consent/approve",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          app_id: input.appId,
+          origin: input.origin,
+          redirect_uri: input.redirectUri,
+          scopes: input.scopes,
+          wallet_index: input.walletIndex,
+        }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** List global-wallet app consents for the authenticated user. Requires user JWT. */
+  async listGlobalWalletConsents(): Promise<{ consents: GlobalWalletConsent[] }> {
+    const response = await this.request<{ consents: GlobalWalletConsent[] }, StewardErrorResponse>(
+      "/global-wallet/consents",
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Revoke a global-wallet app consent. Requires user JWT with recent MFA. */
+  async revokeGlobalWalletConsent(consentId: string): Promise<{ consent: GlobalWalletConsent }> {
+    const response = await this.request<{ consent: GlobalWalletConsent }, StewardErrorResponse>(
+      `/global-wallet/consents/${encodeURIComponent(consentId)}/revoke`,
+      { method: "POST" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Call the global-wallet RPC bridge. Write methods require explicit server-side enablement. */
+  async confirmGlobalWalletAction(input: {
+    appId: string;
+    origin?: string;
+    method: "personal_sign" | "eth_signTypedData_v4" | "eth_sendTransaction" | string;
+    params?: unknown;
+    walletIndex?: number;
+  }): Promise<GlobalWalletActionConfirmation> {
+    const response = await this.request<GlobalWalletActionConfirmation, StewardErrorResponse>(
+      "/global-wallet/rpc/confirm",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          app_id: input.appId,
+          origin: input.origin,
+          method: input.method,
+          params: input.params,
+          wallet_index: input.walletIndex,
+        }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Scan a global-wallet transaction request before confirming/executing it. */
+  async scanGlobalWalletTransaction(input: {
+    appId: string;
+    origin?: string;
+    method?: "eth_sendTransaction";
+    params: unknown;
+    walletIndex?: number;
+  }): Promise<GlobalWalletTransactionScan> {
+    const response = await this.request<GlobalWalletTransactionScan, StewardErrorResponse>(
+      "/global-wallet/rpc/scan",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          app_id: input.appId,
+          origin: input.origin,
+          method: input.method ?? "eth_sendTransaction",
+          params: input.params,
+          wallet_index: input.walletIndex,
+        }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Call the global-wallet RPC bridge. Write methods require a one-time action confirmation. */
+  async globalWalletRpc<T = unknown>(input: {
+    appId: string;
+    origin?: string;
+    method: string;
+    params?: unknown;
+    confirmationId?: string;
+    id?: unknown;
+    jsonrpc?: string;
+    walletIndex?: number;
+  }): Promise<GlobalWalletRpcResult<T>> {
+    const response = await this.request<GlobalWalletRpcResult<T>, StewardErrorResponse>(
+      "/global-wallet/rpc",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          app_id: input.appId,
+          origin: input.origin,
+          method: input.method,
+          params: input.params,
+          confirmation_id: input.confirmationId,
+          id: input.id,
+          jsonrpc: input.jsonrpc,
+          wallet_index: input.walletIndex,
+        }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Create a one-time message for linking an Ethereum wallet to the authenticated user. */
+  async createUserEthereumWalletLinkNonce(address?: string): Promise<UserEthereumWalletLinkNonce> {
+    const response = await this.request<UserEthereumWalletLinkNonce, StewardErrorResponse>(
+      "/user/me/accounts/wallet/ethereum/nonce",
+      {
+        method: "POST",
+        body: JSON.stringify(address ? { address } : {}),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Link an Ethereum wallet to the authenticated user using the signed nonce message. */
+  async linkUserEthereumWallet(input: {
+    address: string;
+    message: string;
+    signature: string;
+  }): Promise<UserEthereumWalletLinkResult> {
+    const response = await this.request<UserEthereumWalletLinkResult, StewardErrorResponse>(
+      "/user/me/accounts/wallet/ethereum",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Create a one-time message for linking a Solana wallet to the authenticated user. */
+  async createUserSolanaWalletLinkNonce(publicKey?: string): Promise<UserSolanaWalletLinkNonce> {
+    const response = await this.request<UserSolanaWalletLinkNonce, StewardErrorResponse>(
+      "/user/me/accounts/wallet/solana/nonce",
+      {
+        method: "POST",
+        body: JSON.stringify(publicKey ? { publicKey } : {}),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Link a Solana wallet to the authenticated user using the signed nonce message. */
+  async linkUserSolanaWallet(input: {
+    publicKey: string;
+    message: string;
+    signature: string;
+  }): Promise<UserSolanaWalletLinkResult> {
+    const response = await this.request<UserSolanaWalletLinkResult, StewardErrorResponse>(
+      "/user/me/accounts/wallet/solana",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Create a one-time state challenge for linking an OAuth account. */
+  async createUserOAuthAccountLinkChallenge(
+    provider: string,
+    input: { redirectUri: string; codeChallenge?: string; codeChallengeMethod?: string },
+  ): Promise<UserOAuthAccountLinkChallenge> {
+    const response = await this.request<UserOAuthAccountLinkChallenge, StewardErrorResponse>(
+      `/user/me/accounts/oauth/${encodeURIComponent(provider)}/challenge`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Link an OAuth account to the authenticated user using an authorization code and state. */
+  async linkUserOAuthAccount(
+    provider: string,
+    input: { code: string; redirectUri: string; state: string; codeVerifier?: string },
+  ): Promise<UserOAuthAccountLinkResult> {
+    const response = await this.request<UserOAuthAccountLinkResult, StewardErrorResponse>(
+      `/user/me/accounts/oauth/${encodeURIComponent(provider)}/token`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Send an OTP for linking a phone number to the authenticated user. */
+  async sendUserPhoneAccountLinkOtp(
+    phone: string,
+    channel: "sms" | "whatsapp" = "sms",
+  ): Promise<UserPhoneAccountLinkSendResult> {
+    const response = await this.request<UserPhoneAccountLinkSendResult, StewardErrorResponse>(
+      `/user/me/accounts/phone/${channel}/send`,
+      {
+        method: "POST",
+        body: JSON.stringify({ phone }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Verify an OTP and link a phone number to the authenticated user. */
+  async verifyUserPhoneAccountLinkOtp(
+    input: { phone: string; code: string },
+    channel: "sms" | "whatsapp" = "sms",
+  ): Promise<UserPhoneAccountLinkResult> {
+    const response = await this.request<UserPhoneAccountLinkResult, StewardErrorResponse>(
+      `/user/me/accounts/phone/${channel}/verify`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Link a Telegram Login Widget account to the authenticated user. */
+  async createUserTelegramAccountLinkChallenge(): Promise<UserSocialAccountLinkChallenge> {
+    const response = await this.request<UserSocialAccountLinkChallenge, StewardErrorResponse>(
+      "/user/me/accounts/telegram/challenge",
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Link a Telegram Login Widget account to the authenticated user. */
+  async linkUserTelegramAccount(
+    input: Record<string, unknown>,
+  ): Promise<UserSocialAccountLinkResult> {
+    const response = await this.request<UserSocialAccountLinkResult, StewardErrorResponse>(
+      "/user/me/accounts/telegram",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Create a one-time nonce for linking a Farcaster account to the authenticated user. */
+  async createUserFarcasterAccountLinkNonce(): Promise<UserSocialAccountLinkChallenge> {
+    const response = await this.request<UserSocialAccountLinkChallenge, StewardErrorResponse>(
+      "/user/me/accounts/farcaster/nonce",
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Link a Farcaster SIWF account to the authenticated user. */
+  async linkUserFarcasterAccount(input: {
+    message: string;
+    signature: string;
+    custodyAddress?: string;
+    address?: string;
+    fid?: string | number;
+    username?: string;
+    displayName?: string;
+    pfpUrl?: string;
+    pfp?: string;
+  }): Promise<UserSocialAccountLinkResult> {
+    const response = await this.request<UserSocialAccountLinkResult, StewardErrorResponse>(
+      "/user/me/accounts/farcaster",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Unlink a linked account from the authenticated user. Requires another login method. */
+  async unlinkUserAccount(
+    provider: string,
+    providerAccountId: string,
+  ): Promise<UserAccountUnlinkResult> {
+    const response = await this.request<UserAccountUnlinkResult, StewardErrorResponse>(
+      `/user/me/accounts/${encodeURIComponent(provider)}/${encodeURIComponent(providerAccountId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
     return response.data;
   }
 
@@ -435,6 +3786,46 @@ export class StewardClient {
     const response = await this.request<ExportKeyResult, StewardErrorResponse>(
       `/vault/${encodeURIComponent(agentId)}/export`,
       { method: "POST" },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** Initialize a one-time encrypted private-key import session for a vault agent. */
+  async initializeEncryptedAgentKeyImport(
+    agentId: string,
+    chain: "evm" | "solana",
+  ): Promise<EncryptedAgentKeyImportInitResult> {
+    const response = await this.request<EncryptedAgentKeyImportInitResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/import/init`,
+      {
+        method: "POST",
+        body: JSON.stringify({ chain }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return response.data;
+  }
+
+  /** Submit an encrypted private-key import envelope for a vault agent. */
+  async submitEncryptedAgentKeyImport(
+    agentId: string,
+    input: EncryptedAgentKeyImportSubmitInput,
+  ): Promise<EncryptedAgentKeyImportResult> {
+    const response = await this.request<EncryptedAgentKeyImportResult, StewardErrorResponse>(
+      `/vault/${encodeURIComponent(agentId)}/import/submit`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
     );
 
     if (!response.ok) {
@@ -471,12 +3862,660 @@ export class StewardClient {
     return response.data;
   }
 
+  /** List tenant app origins used for CORS, passkeys, SIWE/SIWS, and OAuth redirects. */
+  async listAppOrigins(tenantId: string): Promise<string[]> {
+    const response = await this.request<{ entries: string[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-origins`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** Add one or more tenant app origins. Requires tenant-admin MFA server-side. */
+  async addAppOrigin(tenantId: string, origin: string): Promise<string[]> {
+    return this.addAppOrigins(tenantId, [origin]);
+  }
+
+  /** Add one or more tenant app origins. Requires tenant-admin MFA server-side. */
+  async addAppOrigins(tenantId: string, origins: string[]): Promise<string[]> {
+    const response = await this.request<{ entries: string[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-origins`,
+      {
+        method: "POST",
+        body: JSON.stringify({ origins }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** Remove one tenant app origin. Requires tenant-admin MFA server-side. */
+  async removeAppOrigin(tenantId: string, origin: string): Promise<string[]> {
+    return this.removeAppOrigins(tenantId, [origin]);
+  }
+
+  /** Remove one or more tenant app origins. Requires tenant-admin MFA server-side. */
+  async removeAppOrigins(tenantId: string, origins: string[]): Promise<string[]> {
+    const response = await this.request<{ entries: string[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-origins`,
+      {
+        method: "DELETE",
+        body: JSON.stringify({ origins }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** List tenant redirect URLs used for OAuth and email auth callbacks. */
+  async listRedirectUrls(tenantId: string): Promise<string[]> {
+    const response = await this.request<{ entries: string[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/redirect-urls`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** Add one tenant redirect URL. Requires tenant-admin MFA server-side. */
+  async addRedirectUrl(tenantId: string, url: string): Promise<string[]> {
+    return this.addRedirectUrls(tenantId, [url]);
+  }
+
+  /** Add one or more tenant redirect URLs. Requires tenant-admin MFA server-side. */
+  async addRedirectUrls(tenantId: string, urls: string[]): Promise<string[]> {
+    const response = await this.request<{ entries: string[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/redirect-urls`,
+      {
+        method: "POST",
+        body: JSON.stringify({ urls }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** Remove one tenant redirect URL. Requires tenant-admin MFA server-side. */
+  async removeRedirectUrl(tenantId: string, url: string): Promise<string[]> {
+    return this.removeRedirectUrls(tenantId, [url]);
+  }
+
+  /** Remove one or more tenant redirect URLs. Requires tenant-admin MFA server-side. */
+  async removeRedirectUrls(tenantId: string, urls: string[]): Promise<string[]> {
+    const response = await this.request<{ entries: string[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/redirect-urls`,
+      {
+        method: "DELETE",
+        body: JSON.stringify({ urls }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** List tenant app clients/environments. Requires tenant-admin MFA server-side. */
+  async listTenantAppClients(tenantId: string): Promise<TenantAppClient[]> {
+    const response = await this.request<{ clients: TenantAppClient[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-clients`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.clients;
+  }
+
+  /** Replace the tenant app client/environment registry. Requires tenant-admin MFA server-side. */
+  async replaceTenantAppClients(
+    tenantId: string,
+    clients: TenantAppClient[],
+  ): Promise<TenantAppClient[]> {
+    const response = await this.request<{ clients: TenantAppClient[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-clients`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ clients }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.clients;
+  }
+
+  /** Create one tenant app client/environment. Requires tenant-admin MFA server-side. */
+  async createTenantAppClient(tenantId: string, client: TenantAppClient): Promise<TenantAppClient> {
+    const response = await this.request<{ client: TenantAppClient }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-clients`,
+      {
+        method: "POST",
+        body: JSON.stringify({ client }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.client;
+  }
+
+  /** Delete one tenant app client/environment. Requires tenant-admin MFA server-side. */
+  async deleteTenantAppClient(tenantId: string, clientId: string): Promise<TenantAppClient[]> {
+    const response = await this.request<{ clients: TenantAppClient[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-clients/${encodeURIComponent(clientId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.clients;
+  }
+
+  /** List app-client secret metadata. Raw secrets are never returned by this endpoint. */
+  async listTenantAppClientSecrets(
+    tenantId: string,
+    clientId: string,
+  ): Promise<{ appId: string; secrets: TenantAppClientSecret[] }> {
+    const response = await this.request<
+      { appId: string; secrets: TenantAppClientSecret[] },
+      StewardErrorResponse
+    >(
+      `/tenants/${encodeURIComponent(tenantId)}/app-clients/${encodeURIComponent(clientId)}/secrets`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Rotate an app-client secret. Returns the raw appSecret once. */
+  async rotateTenantAppClientSecret(
+    tenantId: string,
+    clientId: string,
+  ): Promise<TenantAppClientSecretCreateResult> {
+    const response = await this.request<TenantAppClientSecretCreateResult, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-clients/${encodeURIComponent(clientId)}/secrets`,
+      { method: "POST" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Revoke one app-client secret immediately. */
+  async revokeTenantAppClientSecret(
+    tenantId: string,
+    clientId: string,
+    secretId: string,
+  ): Promise<TenantAppClientSecret> {
+    const response = await this.request<{ secret: TenantAppClientSecret }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/app-clients/${encodeURIComponent(
+        clientId,
+      )}/secrets/${encodeURIComponent(secretId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.secret;
+  }
+
+  /** List tenant app access allowlist entries for email, domain, wallet, and phone login. */
+  async listAccessAllowlistEntries(tenantId: string): Promise<TenantAccessAllowlistEntry[]> {
+    const response = await this.request<
+      { entries: TenantAccessAllowlistEntry[] },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/access-allowlist`);
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** Add one tenant app access allowlist entry. Requires tenant-admin MFA server-side. */
+  async addAccessAllowlistEntry(
+    tenantId: string,
+    entry: TenantAccessAllowlistEntryInput,
+  ): Promise<TenantAccessAllowlistEntry[]> {
+    return this.addAccessAllowlistEntries(tenantId, [entry]);
+  }
+
+  /** Add one or more tenant app access allowlist entries. Requires tenant-admin MFA server-side. */
+  async addAccessAllowlistEntries(
+    tenantId: string,
+    entries: TenantAccessAllowlistEntryInput[],
+  ): Promise<TenantAccessAllowlistEntry[]> {
+    const response = await this.request<
+      { entries: TenantAccessAllowlistEntry[] },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/access-allowlist`, {
+      method: "POST",
+      body: JSON.stringify({ entries }),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** Remove one tenant app access allowlist entry. Requires tenant-admin MFA server-side. */
+  async removeAccessAllowlistEntry(
+    tenantId: string,
+    entry: TenantAccessAllowlistEntryInput | { id: string },
+  ): Promise<TenantAccessAllowlistEntry[]> {
+    if ("id" in entry) {
+      return this.removeAccessAllowlistEntries(tenantId, { ids: [entry.id] });
+    }
+    return this.removeAccessAllowlistEntries(tenantId, { entries: [entry] });
+  }
+
+  /** Remove tenant app access allowlist entries by id or by type/value pair. */
+  async removeAccessAllowlistEntries(
+    tenantId: string,
+    input: { ids?: string[]; entries?: TenantAccessAllowlistEntryInput[] },
+  ): Promise<TenantAccessAllowlistEntry[]> {
+    const response = await this.request<
+      { entries: TenantAccessAllowlistEntry[] },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/access-allowlist`, {
+      method: "DELETE",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.entries;
+  }
+
+  /** Get tenant-scoped OIDC/JWT login provider configuration. */
+  async getTenantOidcProviders(tenantId: string): Promise<TenantOidcProviderConfig[]> {
+    const response = await this.request<
+      { providers: TenantOidcProviderConfig[] },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/oidc-providers`);
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.providers;
+  }
+
+  /** Discover whether an email domain should route to tenant SSO. */
+  async discoverSso(email: string): Promise<SsoDiscoveryResult> {
+    const response = await this.request<SsoDiscoveryResult, StewardErrorResponse>(
+      "/auth/sso/discover",
+      {
+        method: "POST",
+        body: JSON.stringify({ email }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** List tenant verified/draft SSO email domains. Requires tenant-admin MFA server-side. */
+  async listTenantSsoDomains(tenantId: string): Promise<TenantSsoDomain[]> {
+    const response = await this.request<{ domains: TenantSsoDomain[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/sso-domains`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.domains;
+  }
+
+  /** Create or reset a tenant SSO email-domain verification token. */
+  async createTenantSsoDomain(
+    tenantId: string,
+    input: { domain: string; ssoRequired?: boolean },
+  ): Promise<TenantSsoDomain> {
+    const response = await this.request<{ domain: TenantSsoDomain }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/sso-domains`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.domain;
+  }
+
+  /** Mark a tenant SSO domain verified after out-of-band DNS/manual verification. */
+  async verifyTenantSsoDomain(tenantId: string, domain: string): Promise<TenantSsoDomain> {
+    const response = await this.request<{ domain: TenantSsoDomain }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/sso-domains/${encodeURIComponent(domain)}/verify`,
+      { method: "POST" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.domain;
+  }
+
+  /** Delete a tenant SSO domain. */
+  async deleteTenantSsoDomain(tenantId: string, domain: string): Promise<void> {
+    const response = await this.request<{ deleted: boolean }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/sso-domains/${encodeURIComponent(domain)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+  }
+
+  /** Get tenant SAML dashboard/team SSO config and generated SP URLs. */
+  async getTenantSamlSso(tenantId: string): Promise<{
+    config: TenantSamlSsoConfig | null;
+    serviceProvider: { spEntityId: string; acsUrl: string; metadataUrl: string };
+  }> {
+    const response = await this.request<
+      {
+        config: TenantSamlSsoConfig | null;
+        serviceProvider: { spEntityId: string; acsUrl: string; metadataUrl: string };
+      },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/saml-sso`);
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Replace tenant SAML dashboard/team SSO config. Requires tenant-admin MFA server-side. */
+  async updateTenantSamlSso(
+    tenantId: string,
+    input: TenantSamlSsoUpdate,
+  ): Promise<TenantSamlSsoConfig> {
+    const response = await this.request<{ config: TenantSamlSsoConfig }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/saml-sso`,
+      { method: "PUT", body: JSON.stringify(input) },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.config;
+  }
+
+  /** Delete tenant SAML dashboard/team SSO config. */
+  async deleteTenantSamlSso(tenantId: string): Promise<void> {
+    const response = await this.request<{ deleted: boolean }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/saml-sso`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+  }
+
+  /** Replace tenant-scoped OIDC/JWT login provider configuration. */
+  async updateTenantOidcProviders(
+    tenantId: string,
+    providers: TenantOidcProviderConfig[],
+  ): Promise<TenantOidcProviderConfig[]> {
+    const response = await this.request<
+      { providers: TenantOidcProviderConfig[] },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/oidc-providers`, {
+      method: "PUT",
+      body: JSON.stringify({ providers }),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.providers;
+  }
+
+  /** Get tenant-scoped auth abuse and login method controls. */
+  async getTenantAuthAbuseConfig(tenantId: string): Promise<TenantAuthAbuseConfig> {
+    const response = await this.request<
+      { authAbuseConfig: TenantAuthAbuseConfig },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/auth-abuse-config`);
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.authAbuseConfig;
+  }
+
+  /** Replace tenant-scoped auth abuse and login method controls. */
+  async updateTenantAuthAbuseConfig(
+    tenantId: string,
+    authAbuseConfig: TenantAuthAbuseConfig,
+  ): Promise<TenantAuthAbuseConfig> {
+    const response = await this.request<
+      { authAbuseConfig: TenantAuthAbuseConfig },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/auth-abuse-config`, {
+      method: "PUT",
+      body: JSON.stringify({ authAbuseConfig }),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.authAbuseConfig;
+  }
+
+  /** Get tenant gas sponsorship/paymaster configuration. */
+  async getTenantGasSponsorshipConfig(tenantId: string): Promise<TenantGasSponsorshipConfig> {
+    const response = await this.request<
+      { gasSponsorshipConfig: TenantGasSponsorshipConfig },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/gas-sponsorship`);
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.gasSponsorshipConfig;
+  }
+
+  /** Replace tenant gas sponsorship/paymaster configuration. Requires tenant-admin MFA server-side. */
+  async updateTenantGasSponsorshipConfig(
+    tenantId: string,
+    gasSponsorshipConfig: TenantGasSponsorshipConfig,
+  ): Promise<TenantGasSponsorshipConfig> {
+    const response = await this.request<
+      { gasSponsorshipConfig: TenantGasSponsorshipConfig },
+      StewardErrorResponse
+    >(`/tenants/${encodeURIComponent(tenantId)}/gas-sponsorship`, {
+      method: "PATCH",
+      body: JSON.stringify({ gasSponsorshipConfig }),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.gasSponsorshipConfig;
+  }
+
+  /** Get the production security checklist for a tenant deployment. Requires tenant-admin MFA server-side. */
+  async getTenantSecurityChecklist(tenantId: string): Promise<TenantSecurityChecklist> {
+    const response = await this.request<TenantSecurityChecklist, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/security-checklist`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Get privacy-preserving idempotency counters for a tenant. Requires tenant-admin MFA server-side. */
+  async getTenantIdempotencyMetrics(tenantId: string): Promise<TenantIdempotencyMetrics> {
+    const response = await this.request<TenantIdempotencyMetrics, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/idempotency-metrics`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** List tenant request-signing key metadata. Requires tenant-admin MFA server-side. */
+  async listTenantRequestSigningKeys(tenantId: string): Promise<TenantRequestSigningKey[]> {
+    const response = await this.request<{ keys: TenantRequestSigningKey[] }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/request-signing-keys`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.keys;
+  }
+
+  /** Rotate tenant request-signing keys and reveal the new secret once. */
+  async rotateTenantRequestSigningKey(
+    tenantId: string,
+    input: { name?: string } = {},
+  ): Promise<TenantRequestSigningKeyCreateResult> {
+    const response = await this.request<TenantRequestSigningKeyCreateResult, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/request-signing-keys`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Revoke a tenant request-signing key. Requires tenant-admin MFA server-side. */
+  async revokeTenantRequestSigningKey(
+    tenantId: string,
+    keyId: string,
+  ): Promise<TenantRequestSigningKey> {
+    const response = await this.request<{ key: TenantRequestSigningKey }, StewardErrorResponse>(
+      `/tenants/${encodeURIComponent(tenantId)}/request-signing-keys/${encodeURIComponent(keyId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.key;
+  }
+
   // ─── Agent Dashboard ──────────────────────────────────────────
 
   /** Get the aggregated dashboard for an agent (balance, spend, policies, recent tx, pending approvals). */
   async getAgentDashboard(agentId: string): Promise<AgentDashboardResponse> {
     const response = await this.request<AgentDashboardResponse, StewardErrorResponse>(
       `/dashboard/${encodeURIComponent(agentId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Get on-chain and realtime spend accounting for an agent. */
+  async getAgentSpend(agentId: string): Promise<AgentSpendSummary> {
+    const response = await this.request<AgentSpendSummary, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/spend`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Get the aggregated digital asset account for an agent. */
+  async getAgentAccount(
+    agentId: string,
+    opts: { chainId?: number; tokens?: string[] } = {},
+  ): Promise<AgentAccountSummary> {
+    const params = new URLSearchParams();
+    if (opts.chainId) params.set("chainId", String(opts.chainId));
+    if (opts.tokens?.length) params.set("tokens", opts.tokens.join(","));
+    const qs = params.toString();
+    const response = await this.request<AgentAccountSummary, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/account${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Privy-style alias for an agent's aggregated digital asset account. */
+  async getAgentAccountAggregation(
+    agentId: string,
+    opts: { chainId?: number; tokens?: string[] } = {},
+  ): Promise<AgentAccountSummary> {
+    const params = new URLSearchParams();
+    if (opts.chainId) params.set("chainId", String(opts.chainId));
+    if (opts.tokens?.length) params.set("tokens", opts.tokens.join(","));
+    const qs = params.toString();
+    const response = await this.request<AgentAccountSummary, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/aggregation${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async listAgentSigners(
+    agentId: string,
+    opts?: { status?: AgentSignerStatus },
+  ): Promise<AgentSigner[]> {
+    const params = new URLSearchParams();
+    if (opts?.status) params.set("status", opts.status);
+    const qs = params.toString();
+    const response = await this.request<{ signers: AgentSigner[] }, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/signers${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.signers;
+  }
+
+  async createAgentSigner(
+    agentId: string,
+    input: AgentSignerCreate,
+  ): Promise<AgentSignerCreateResult> {
+    const response = await this.request<AgentSignerCreateResult, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/signers`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Privy-style alias for agent signer authorization-key inventory. */
+  async listAuthorizationKeys(
+    agentId: string,
+    opts?: { status?: AgentSignerStatus },
+  ): Promise<AuthorizationKey[]> {
+    return this.listAgentSigners(agentId, opts);
+  }
+
+  /** Privy-style alias for registering an agent signer authorization key. */
+  async createAuthorizationKey(
+    agentId: string,
+    input: AuthorizationKeyCreate,
+  ): Promise<AuthorizationKeyCreateResult> {
+    return this.createAgentSigner(agentId, input);
+  }
+
+  async updateAgentSigner(
+    agentId: string,
+    signerId: string,
+    input: AgentSignerUpdate,
+  ): Promise<AgentSigner> {
+    const response = await this.request<AgentSigner, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/signers/${encodeURIComponent(signerId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Privy-style alias for updating an agent signer authorization key. */
+  async updateAuthorizationKey(
+    agentId: string,
+    keyId: string,
+    input: AuthorizationKeyUpdate,
+  ): Promise<AuthorizationKey> {
+    return this.updateAgentSigner(agentId, keyId, input);
+  }
+
+  async revokeAgentSigner(agentId: string, signerId: string): Promise<AgentSigner> {
+    const response = await this.request<AgentSigner, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/signers/${encodeURIComponent(signerId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Privy-style alias for revoking an agent signer authorization key. */
+  async revokeAuthorizationKey(agentId: string, keyId: string): Promise<AuthorizationKey> {
+    return this.revokeAgentSigner(agentId, keyId);
+  }
+
+  async listAgentKeyQuorums(
+    agentId: string,
+    opts?: { status?: AgentKeyQuorumStatus },
+  ): Promise<AgentKeyQuorum[]> {
+    const params = new URLSearchParams();
+    if (opts?.status) params.set("status", opts.status);
+    const qs = params.toString();
+    const response = await this.request<{ quorums: AgentKeyQuorum[] }, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/key-quorums${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.quorums;
+  }
+
+  async createAgentKeyQuorum(
+    agentId: string,
+    input: AgentKeyQuorumCreate,
+  ): Promise<AgentKeyQuorum> {
+    const response = await this.request<AgentKeyQuorum, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/key-quorums`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async updateAgentKeyQuorum(
+    agentId: string,
+    quorumId: string,
+    input: AgentKeyQuorumUpdate,
+  ): Promise<AgentKeyQuorum> {
+    const response = await this.request<AgentKeyQuorum, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/key-quorums/${encodeURIComponent(quorumId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async revokeAgentKeyQuorum(agentId: string, quorumId: string): Promise<AgentKeyQuorum> {
+    const response = await this.request<AgentKeyQuorum, StewardErrorResponse>(
+      `/agents/${encodeURIComponent(agentId)}/key-quorums/${encodeURIComponent(quorumId)}`,
+      { method: "DELETE" },
     );
     if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
     return response.data;
@@ -535,9 +4574,145 @@ export class StewardClient {
     return response.data;
   }
 
+  /** Poll one held proxy request through the control-plane API. */
+  async getPendingProxyRequest(id: string): Promise<PendingProxyRequest> {
+    const response = await this.request<PendingProxyRequest, StewardErrorResponse>(
+      `/approvals/proxy/${encodeURIComponent(id)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** List approval-gated proxy requests for an operator. */
+  async listPendingProxyRequests(
+    status?: PendingProxyRequestStatus,
+  ): Promise<PendingProxyRequest[]> {
+    const qs = status ? `?status=${encodeURIComponent(status)}` : "";
+    const response = await this.request<PendingProxyRequest[], StewardErrorResponse>(
+      `/approvals/proxy${qs}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Approve a held proxy request. It executes exactly once when the agent polls the proxy. */
+  async approveProxyRequest(
+    id: string,
+  ): Promise<{ id: string; status: PendingProxyRequestStatus }> {
+    const response = await this.request<
+      { id: string; status: PendingProxyRequestStatus },
+      StewardErrorResponse
+    >(`/approvals/proxy/${encodeURIComponent(id)}/approve`, { method: "POST", body: "{}" });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Deny a held proxy request without forwarding it. */
+  async denyProxyRequest(
+    id: string,
+    reason?: string,
+  ): Promise<{ id: string; status: PendingProxyRequestStatus }> {
+    const response = await this.request<
+      { id: string; status: PendingProxyRequestStatus },
+      StewardErrorResponse
+    >(`/approvals/proxy/${encodeURIComponent(id)}/deny`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
   /** Get approval statistics for the tenant. */
   async getApprovalStats(): Promise<ApprovalStats> {
     const response = await this.request<ApprovalStats, StewardErrorResponse>("/approvals/stats");
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  // ─── Intents ─────────────────────────────────────────────────
+
+  async listIntents(opts?: IntentListOptions): Promise<{
+    intents: Intent[];
+    limit: number;
+    offset: number;
+  }> {
+    const params = new URLSearchParams();
+    if (opts?.status) params.set("status", opts.status);
+    if (opts?.intentType) params.set("intentType", opts.intentType);
+    if (opts?.intent_type) params.set("intent_type", opts.intent_type);
+    if (opts?.agentId) params.set("agentId", opts.agentId);
+    if (opts?.wallet_id) params.set("wallet_id", opts.wallet_id);
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    if (opts?.offset) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const response = await this.request<
+      { intents: Intent[]; limit: number; offset: number },
+      StewardErrorResponse
+    >(`/intents${qs ? `?${qs}` : ""}`);
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async createIntent(input: IntentCreate): Promise<Intent> {
+    const response = await this.request<Intent, StewardErrorResponse>("/intents", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async getIntent(intentId: string): Promise<Intent> {
+    const response = await this.request<Intent, StewardErrorResponse>(
+      `/intents/${encodeURIComponent(intentId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async authorizeIntent(intentId: string, input?: { reason?: string }): Promise<Intent> {
+    return this.updateIntentLifecycle(intentId, "authorize", input);
+  }
+
+  async approveIntent(intentId: string, input?: { reason?: string }): Promise<Intent> {
+    return this.updateIntentLifecycle(intentId, "approve", input);
+  }
+
+  async rejectIntent(intentId: string, input?: { reason?: string }): Promise<Intent> {
+    return this.updateIntentLifecycle(intentId, "reject", input);
+  }
+
+  async cancelIntent(intentId: string, input?: { reason?: string }): Promise<Intent> {
+    return this.updateIntentLifecycle(intentId, "cancel", input);
+  }
+
+  async executeIntent(
+    intentId: string,
+    input?: { executionResult?: Record<string, unknown> },
+  ): Promise<Intent> {
+    return this.updateIntentLifecycle(intentId, "execute", input);
+  }
+
+  async failIntent(
+    intentId: string,
+    input?: { reason?: string; executionResult?: Record<string, unknown> },
+  ): Promise<Intent> {
+    return this.updateIntentLifecycle(intentId, "fail", input);
+  }
+
+  private async updateIntentLifecycle(
+    intentId: string,
+    action: "authorize" | "approve" | "reject" | "execute" | "fail" | "cancel",
+    input?: Record<string, unknown>,
+  ): Promise<Intent> {
+    const response = await this.request<Intent, StewardErrorResponse>(
+      `/intents/${encodeURIComponent(intentId)}/${action}`,
+      {
+        method: "POST",
+        body: JSON.stringify(input ?? {}),
+      },
+    );
     if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
     return response.data;
   }
@@ -623,11 +4798,20 @@ export class StewardClient {
   /** Get delivery history for a webhook. */
   async getWebhookDeliveries(
     webhookId: string,
-    opts?: { limit?: number; offset?: number },
+    opts?: {
+      limit?: number;
+      offset?: number;
+      status?: WebhookDelivery["status"];
+      eventType?: string;
+      hasError?: boolean;
+    },
   ): Promise<WebhookDelivery[]> {
     const params = new URLSearchParams();
     if (opts?.limit) params.set("limit", String(opts.limit));
     if (opts?.offset) params.set("offset", String(opts.offset));
+    if (opts?.status) params.set("status", opts.status);
+    if (opts?.eventType) params.set("eventType", opts.eventType);
+    if (opts?.hasError !== undefined) params.set("hasError", String(opts.hasError));
     const qs = params.toString();
     const response = await this.request<WebhookDelivery[], StewardErrorResponse>(
       `/webhooks/${encodeURIComponent(webhookId)}/deliveries${qs ? `?${qs}` : ""}`,
@@ -636,10 +4820,67 @@ export class StewardClient {
     return response.data;
   }
 
+  /** Export redacted webhook delivery history as CSV. */
+  async exportWebhookDeliveriesCsv(
+    webhookId: string,
+    opts?: {
+      limit?: number;
+      status?: WebhookDelivery["status"];
+      eventType?: string;
+      hasError?: boolean;
+    },
+  ): Promise<string> {
+    const params = new URLSearchParams();
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    if (opts?.status) params.set("status", opts.status);
+    if (opts?.eventType) params.set("eventType", opts.eventType);
+    if (opts?.hasError !== undefined) params.set("hasError", String(opts.hasError));
+    const qs = params.toString();
+    const url = `${this.baseUrl}/webhooks/${encodeURIComponent(webhookId)}/deliveries/export${qs ? `?${qs}` : ""}`;
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        headers: this.buildHeaders({ Accept: "text/csv" }),
+      });
+    } catch (error) {
+      throw new StewardApiError(
+        error instanceof Error ? error.message : "Network request failed",
+        0,
+      );
+    }
+    if (!response.ok) {
+      throw new StewardApiError(
+        `Webhook delivery export failed: ${response.status}`,
+        response.status,
+      );
+    }
+    return response.text();
+  }
+
   /** Retry a failed webhook delivery. */
   async retryDelivery(deliveryId: string): Promise<WebhookDelivery> {
     const response = await this.request<WebhookDelivery, StewardErrorResponse>(
       `/webhooks/deliveries/${encodeURIComponent(deliveryId)}/retry`,
+      { method: "POST" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Replay a historical webhook delivery as a new signed delivery. */
+  async replayDelivery(deliveryId: string): Promise<WebhookDelivery> {
+    const response = await this.request<WebhookDelivery, StewardErrorResponse>(
+      `/webhooks/deliveries/${encodeURIComponent(deliveryId)}/replay`,
+      { method: "POST" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Send a signed one-off diagnostic webhook delivery. */
+  async testWebhook(webhookId: string): Promise<WebhookDelivery> {
+    const response = await this.request<WebhookDelivery, StewardErrorResponse>(
+      `/webhooks/${encodeURIComponent(webhookId)}/test`,
       { method: "POST" },
     );
     if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
@@ -791,7 +5032,11 @@ export class StewardClient {
   async assignPolicyTemplate(
     templateId: string,
     agentIds: string[],
-  ): Promise<{ templateId: string; assignedAgents: string[]; rulesApplied: number }> {
+  ): Promise<{
+    templateId: string;
+    assignedAgents: string[];
+    rulesApplied: number;
+  }> {
     const response = await this.request<
       { templateId: string; assignedAgents: string[]; rulesApplied: number },
       StewardErrorResponse
@@ -811,6 +5056,180 @@ export class StewardClient {
     );
     if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
     return response.data;
+  }
+
+  // ─── Condition Sets ────────────────────────────
+
+  async listConditionSets(): Promise<ConditionSet[]> {
+    const response = await this.request<
+      { conditionSets: ConditionSet[]; limit?: number; offset?: number },
+      StewardErrorResponse
+    >("/condition-sets");
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data.conditionSets ?? [];
+  }
+
+  async createConditionSet(
+    payload: ConditionSetCreate,
+    options?: IdempotencyOptions,
+  ): Promise<ConditionSet> {
+    const response = await this.request<ConditionSet, StewardErrorResponse>("/condition-sets", {
+      method: "POST",
+      headers: options?.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : undefined,
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async getConditionSet(conditionSetId: string): Promise<ConditionSet> {
+    const response = await this.request<ConditionSet, StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async updateConditionSet(
+    conditionSetId: string,
+    payload: ConditionSetUpdate,
+    options?: IdempotencyOptions,
+  ): Promise<ConditionSet> {
+    const response = await this.request<ConditionSet, StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}`,
+      {
+        method: "PATCH",
+        headers: options?.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : undefined,
+        body: JSON.stringify(payload),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async deleteConditionSet(conditionSetId: string, options?: IdempotencyOptions): Promise<void> {
+    const response = await this.request<Record<string, never> | undefined, StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}`,
+      {
+        method: "DELETE",
+        headers: options?.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : undefined,
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+  }
+
+  async listConditionSetItems(
+    conditionSetId: string,
+    options: { limit?: number; offset?: number } = {},
+  ): Promise<ConditionSetItem[]> {
+    const result = await this.listConditionSetItemsPage(conditionSetId, options);
+    return result.items;
+  }
+
+  async listConditionSetItemsPage(
+    conditionSetId: string,
+    options: { limit?: number; offset?: number } = {},
+  ): Promise<ConditionSetItemListResult> {
+    const qs = new URLSearchParams();
+    if (options.limit !== undefined) qs.set("limit", String(options.limit));
+    if (options.offset !== undefined) qs.set("offset", String(options.offset));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    const response = await this.request<
+      ConditionSetItem[] | ConditionSetItemListResult,
+      StewardErrorResponse
+    >(`/condition-sets/${encodeURIComponent(conditionSetId)}/items${suffix}`);
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    if (Array.isArray(response.data)) {
+      return { items: response.data, limit: response.data.length, offset: 0 };
+    }
+    return response.data;
+  }
+
+  async getConditionSetItem(conditionSetId: string, itemId: string): Promise<ConditionSetItem> {
+    const response = await this.request<ConditionSetItem, StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}/items/${encodeURIComponent(itemId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async upsertConditionSetItem(
+    conditionSetId: string,
+    payload: ConditionSetItemInput,
+    options?: IdempotencyOptions,
+  ): Promise<ConditionSetItem> {
+    const response = await this.request<ConditionSetItem, StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}/items`,
+      {
+        method: "POST",
+        headers: options?.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : undefined,
+        body: JSON.stringify(payload),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async replaceConditionSetItems(
+    conditionSetId: string,
+    items: ConditionSetItemInput[],
+    options?: IdempotencyOptions,
+  ): Promise<ConditionSetItem[]> {
+    const response = await this.request<ConditionSetItem[], StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}/items`,
+      {
+        method: "PUT",
+        headers: options?.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : undefined,
+        body: JSON.stringify({ items }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async updateConditionSetItem(
+    conditionSetId: string,
+    itemId: string,
+    payload: ConditionSetItemUpdate,
+    options?: IdempotencyOptions,
+  ): Promise<ConditionSetItem> {
+    const response = await this.request<ConditionSetItem, StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}/items/${encodeURIComponent(itemId)}`,
+      {
+        method: "PATCH",
+        headers: options?.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : undefined,
+        body: JSON.stringify(payload),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  async deleteConditionSetItem(
+    conditionSetId: string,
+    itemId: string,
+    options?: IdempotencyOptions,
+  ): Promise<void> {
+    const response = await this.request<Record<string, never> | undefined, StewardErrorResponse>(
+      `/condition-sets/${encodeURIComponent(conditionSetId)}/items/${encodeURIComponent(itemId)}`,
+      {
+        method: "DELETE",
+        headers: options?.idempotencyKey
+          ? { "Idempotency-Key": options.idempotencyKey }
+          : undefined,
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
   }
 
   // ─── Audit ──────────────────────────────────
@@ -855,9 +5274,47 @@ export class StewardClient {
     return response.data;
   }
 
+  /** Fetch raw tamper-evident audit events for the tenant audit chain. */
+  async getAuditEvents(params?: {
+    action?: string;
+    actionPrefix?: string;
+    actorType?: string;
+    actorId?: string;
+    resourceType?: string;
+    resourceId?: string;
+    requestId?: string;
+    metadata?: Record<string, string>;
+    dateFrom?: string;
+    dateTo?: string;
+    page?: number;
+    limit?: number;
+  }): Promise<AuditEventsResponse> {
+    const search = new URLSearchParams();
+    if (params?.action) search.set("action", params.action);
+    if (params?.actionPrefix) search.set("actionPrefix", params.actionPrefix);
+    if (params?.actorType) search.set("actorType", params.actorType);
+    if (params?.actorId) search.set("actorId", params.actorId);
+    if (params?.resourceType) search.set("resourceType", params.resourceType);
+    if (params?.resourceId) search.set("resourceId", params.resourceId);
+    if (params?.requestId) search.set("requestId", params.requestId);
+    for (const [key, value] of Object.entries(params?.metadata ?? {})) {
+      search.set(`metadata.${key}`, value);
+    }
+    if (params?.dateFrom) search.set("dateFrom", params.dateFrom);
+    if (params?.dateTo) search.set("dateTo", params.dateTo);
+    if (params?.page) search.set("page", String(params.page));
+    if (params?.limit) search.set("limit", String(params.limit));
+    const qs = search.toString();
+    const response = await this.request<AuditEventsResponse, StewardErrorResponse>(
+      `/audit/events${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
   /**
    * Download the audit log as CSV. Returns the raw CSV body as a string.
-   * Does not use the `/api/v1` JSON envelope — streams text directly.
+   * Does not use the `/api/v1` JSON envelope - streams text directly.
    */
   async exportAuditCsv(params?: {
     agentId?: string;
@@ -900,6 +5357,192 @@ export class StewardClient {
     return response.data;
   }
 
+  /** Search users in a tenant directory. Requires user JWT, tenant admin role, and recent MFA. */
+  async listTenantUsers(
+    tenantId: string,
+    opts?: {
+      q?: string;
+      email?: string;
+      walletExternalId?: string;
+      limit?: number;
+      offset?: number;
+    },
+  ): Promise<TenantAdminUserSearchResult> {
+    const params = new URLSearchParams();
+    if (opts?.q) params.set("q", opts.q);
+    if (opts?.email) params.set("email", opts.email);
+    if (opts?.walletExternalId) params.set("walletExternalId", opts.walletExternalId);
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    if (opts?.offset) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const response = await this.request<TenantAdminUserSearchResult, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return {
+      ...response.data,
+      users: response.data.users.map(parseTenantAdminUser),
+    };
+  }
+
+  /** Report existing tenant users that violate the one third-party wallet policy. Requires user JWT, tenant admin role, and recent MFA. */
+  async getTenantWalletPolicyViolations(
+    tenantId: string,
+    opts?: { limit?: number; offset?: number },
+  ): Promise<TenantWalletPolicyViolationReport> {
+    const params = new URLSearchParams();
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    if (opts?.offset) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const response = await this.request<TenantWalletPolicyViolationReport, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/wallet-policy/violations${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Remove one linked third-party wallet from a tenant member as audited one-wallet-policy remediation. Requires user JWT, tenant admin role, and recent MFA. */
+  async remediateTenantWalletPolicyViolation(
+    tenantId: string,
+    userId: string,
+    accountId: string,
+  ): Promise<TenantWalletPolicyRemediationResult> {
+    const response = await this.request<TenantWalletPolicyRemediationResult, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}/wallet-policy/wallets/${encodeURIComponent(accountId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Bulk-remediate selected linked third-party wallets from tenant members. Requires user JWT, tenant admin role, and recent MFA. */
+  async bulkRemediateTenantWalletPolicyViolations(
+    tenantId: string,
+    wallets: TenantWalletPolicyBulkRemediationItem[],
+  ): Promise<TenantWalletPolicyBulkRemediationResponse> {
+    const response = await this.request<
+      TenantWalletPolicyBulkRemediationResponse,
+      StewardErrorResponse
+    >(`/user/me/tenants/${encodeURIComponent(tenantId)}/users/wallet-policy/remediations`, {
+      method: "POST",
+      body: JSON.stringify({ wallets }),
+    });
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return response.data;
+  }
+
+  /** Export the tenant-scoped user directory as CSV. Requires user JWT, tenant admin role, and recent MFA. */
+  async exportTenantUsersCsv(
+    tenantId: string,
+    opts?: { q?: string; email?: string; limit?: number },
+  ): Promise<string> {
+    const params = new URLSearchParams();
+    if (opts?.q) params.set("q", opts.q);
+    if (opts?.email) params.set("email", opts.email);
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    const url = `${this.baseUrl}/user/me/tenants/${encodeURIComponent(tenantId)}/users/export${qs ? `?${qs}` : ""}`;
+    let response: Response;
+    try {
+      response = await fetch(url, { headers: this.buildHeaders() });
+    } catch (error) {
+      throw new StewardApiError(
+        error instanceof Error ? error.message : "Network request failed",
+        0,
+      );
+    }
+    if (!response.ok) {
+      throw new StewardApiError(`Tenant user export failed: ${response.status}`, response.status);
+    }
+    return response.text();
+  }
+
+  /** Read a tenant-scoped user record. Requires user JWT, tenant admin role, and recent MFA. */
+  async getTenantUser(tenantId: string, userId: string): Promise<TenantAdminUser> {
+    const response = await this.request<TenantAdminUser, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return parseTenantAdminUser(response.data);
+  }
+
+  /** List tenant-scoped activity for a user. Requires user JWT, tenant admin role, and recent MFA. */
+  async listTenantUserEvents(
+    tenantId: string,
+    userId: string,
+    opts?: { limit?: number; offset?: number },
+  ): Promise<TenantAdminUserEventsResult> {
+    const params = new URLSearchParams();
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    if (opts?.offset) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    const response = await this.request<TenantAdminUserEventsResult, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}/events${qs ? `?${qs}` : ""}`,
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return parseTenantAdminUserEvents(response.data);
+  }
+
+  /** Update a tenant user's team role. Requires user JWT, tenant admin role, and recent MFA. */
+  async updateTenantUserRole(
+    tenantId: string,
+    userId: string,
+    role: TenantTeamRole,
+  ): Promise<TenantAdminUser> {
+    const response = await this.request<TenantAdminUser, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}/role`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ role }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return parseTenantAdminUser(response.data);
+  }
+
+  /** Replace tenant-scoped custom metadata. Requires user JWT, tenant admin role, and recent MFA. */
+  async updateTenantUserMetadata(
+    tenantId: string,
+    userId: string,
+    tenantCustomMetadata: Record<string, unknown>,
+  ): Promise<TenantAdminUser> {
+    const response = await this.request<TenantAdminUser, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}/metadata`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ tenantCustomMetadata }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return parseTenantAdminUser(response.data);
+  }
+
+  /** Deactivate or reactivate an app-scoped tenant user. Requires user JWT, admin role, and MFA. */
+  async setTenantUserDeactivated(
+    tenantId: string,
+    userId: string,
+    deactivated = true,
+  ): Promise<TenantAdminUser> {
+    const response = await this.request<TenantAdminUser, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}/deactivate`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ deactivated }),
+      },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+    return parseTenantAdminUser(response.data);
+  }
+
+  /** Remove a user from the current tenant. Requires user JWT, tenant admin role, and recent MFA. */
+  async removeTenantUser(tenantId: string, userId: string): Promise<void> {
+    const response = await this.request<Record<string, never>, StewardErrorResponse>(
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/users/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) throw new StewardApiError(response.error, response.status, response.data);
+  }
+
   /**
    * Create multiple agent wallets in a single request.
    * Optionally supply a shared policy set to apply to every created agent.
@@ -908,9 +5551,13 @@ export class StewardClient {
     agents: BatchAgentSpec[],
     policies?: PolicyRule[],
   ): Promise<BatchCreateResult> {
+    const normalizedAgents = agents.map(({ externalId, platformId, ...agent }) => ({
+      ...agent,
+      platformId: platformId ?? externalId,
+    }));
     const response = await this.request<BatchCreateResult, StewardErrorResponse>("/agents/batch", {
       method: "POST",
-      body: JSON.stringify({ agents, applyPolicies: policies }),
+      body: JSON.stringify({ agents: normalizedAgents, applyPolicies: policies }),
     });
 
     if (!response.ok) {
@@ -924,6 +5571,69 @@ export class StewardClient {
     };
   }
 
+  /**
+   * Privy-style alias for homogeneous server-wallet batch creation.
+   * `externalId` maps to Steward's immutable per-tenant wallet `platformId`.
+   */
+  async createWalletsBatch(
+    wallets: WalletBatchSpec[],
+    policies?: PolicyRule[],
+  ): Promise<WalletBatchCreateResult> {
+    const response = await this.request<WalletBatchCreateResult, StewardErrorResponse>(
+      "/wallets/batch",
+      {
+        method: "POST",
+        body: JSON.stringify({ wallets, applyPolicies: policies }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    const result = response.data;
+    return {
+      ...result,
+      created: result.created.map(parseAgentIdentity),
+    };
+  }
+
+  /**
+   * Pre-generate encrypted wallets that can later be claimed by end users.
+   * Claim tokens are returned once; Steward stores only token hashes.
+   */
+  async createPregeneratedUserWallets(input: {
+    count?: number;
+    namePrefix?: string;
+    policies?: PolicyRule[];
+    claimExpiresInSeconds?: number;
+  }): Promise<PregeneratedUserWalletCreateResult> {
+    const response = await this.request<PregeneratedUserWalletCreateResult, StewardErrorResponse>(
+      "/agents/pregenerated",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          count: input.count,
+          namePrefix: input.namePrefix,
+          applyPolicies: input.policies,
+          claimExpiresInSeconds: input.claimExpiresInSeconds,
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new StewardApiError(response.error, response.status, response.data);
+    }
+
+    return {
+      ...response.data,
+      wallets: response.data.wallets.map((wallet) => ({
+        ...wallet,
+        agent: parseAgentIdentity(wallet.agent),
+      })),
+    };
+  }
+
   private async request<TSuccess, TFailure = unknown>(
     path: string,
     init: RequestInit = {},
@@ -931,9 +5641,10 @@ export class StewardClient {
     let response: Response;
 
     try {
+      const headers = await this.buildRequestHeaders(path, init);
       response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
-        headers: this.buildHeaders(init.headers),
+        headers,
       });
     } catch (error) {
       throw new StewardApiError(
@@ -964,6 +5675,40 @@ export class StewardClient {
     };
   }
 
+  /** Handle lifecycle endpoints whose successful response is intentionally raw. */
+  private async requestRawJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, {
+        ...init,
+        headers: await this.buildRequestHeaders(path, init),
+      });
+    } catch (error) {
+      throw new StewardApiError(
+        error instanceof Error ? error.message : "Network request failed",
+        0,
+      );
+    }
+
+    const payload = await this.parseJson<unknown>(response);
+    if (!response.ok) {
+      let message = `Request failed with status ${response.status}`;
+      if (payload && typeof payload === "object") {
+        const candidate = payload as {
+          error?: string | { code?: string; message?: string };
+          code?: string;
+          message?: string;
+        };
+        if (typeof candidate.error === "string") message = candidate.error;
+        else if (candidate.error && typeof candidate.error === "object") {
+          message = candidate.error.code ?? candidate.error.message ?? message;
+        } else message = candidate.code ?? candidate.message ?? message;
+      }
+      throw new StewardApiError(message, response.status, payload);
+    }
+    return payload as T;
+  }
+
   private buildHeaders(headers?: HeadersInit): Headers {
     const merged = new Headers(headers);
 
@@ -973,8 +5718,13 @@ export class StewardClient {
     if (!merged.has("Accept")) {
       merged.set("Accept", "application/json");
     }
-    if (this.bearerToken) {
+    if (this.platformKey) {
+      merged.set("X-Steward-Platform-Key", this.platformKey);
+    } else if (this.bearerToken) {
       merged.set("Authorization", `Bearer ${this.bearerToken}`);
+    } else if (this.appId && this.appSecret) {
+      merged.set("Authorization", `Basic ${btoa(`${this.appId}:${this.appSecret}`)}`);
+      merged.set("X-Steward-App-Id", this.appId);
     } else if (this.apiKey) {
       merged.set("X-Steward-Key", this.apiKey);
     }
@@ -983,6 +5733,56 @@ export class StewardClient {
     }
 
     return merged;
+  }
+
+  private async buildRequestHeaders(path: string, init: RequestInit): Promise<Headers> {
+    const headers = this.buildHeaders(init.headers);
+    const method = (init.method ?? "GET").toUpperCase();
+    if (!this.requestSigningSecret || !isSensitiveMutatingRequest(path, method)) return headers;
+
+    if (!headers.has("X-Steward-Request-Timestamp")) {
+      headers.set("X-Steward-Request-Timestamp", String(Math.floor(Date.now() / 1000)));
+    }
+    if (!headers.has("Idempotency-Key")) {
+      headers.set("Idempotency-Key", randomIdempotencyKey());
+    }
+    if (this.requestSigningKeyId && !headers.has("X-Steward-Signing-Key-Id")) {
+      headers.set("X-Steward-Signing-Key-Id", this.requestSigningKeyId);
+    }
+
+    const body = typeof init.body === "string" ? init.body : "";
+    const bodyHash = await sha256Hex(body);
+    const authHash = await sha256Hex(headers.get("Authorization") ?? "");
+    const apiKeyHash = await sha256Hex(headers.get("X-Steward-Key") ?? "");
+    const platformKeyHash = await sha256Hex(headers.get("X-Steward-Platform-Key") ?? "");
+    const signerIdHash = await sha256Hex(headers.get("X-Steward-Signer-Id") ?? "");
+    const signerSecretHash = await sha256Hex(headers.get("X-Steward-Signer-Secret") ?? "");
+    const quorumIdHash = await sha256Hex(headers.get("X-Steward-Key-Quorum-Id") ?? "");
+    const quorumCredentialsHash = await sha256Hex(
+      headers.get("X-Steward-Key-Quorum-Credentials") ?? "",
+    );
+    const canonical = [
+      "steward-request-signature-v1",
+      method,
+      path,
+      headers.get("X-Steward-Tenant") ?? "",
+      authHash,
+      apiKeyHash,
+      platformKeyHash,
+      signerIdHash,
+      signerSecretHash,
+      quorumIdHash,
+      quorumCredentialsHash,
+      headers.get("X-Steward-Request-Timestamp") ?? "",
+      headers.get("X-Steward-Request-Expires-At") ?? "",
+      headers.get("Idempotency-Key") ?? "",
+      bodyHash,
+    ].join("\n");
+    headers.set(
+      "X-Steward-Signature",
+      `v1=${await hmacSha256Hex(this.requestSigningSecret, canonical)}`,
+    );
+    return headers;
   }
 
   private async parseJson<T>(response: Response): Promise<T> {

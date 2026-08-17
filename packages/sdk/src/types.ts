@@ -2,7 +2,42 @@
 // These mirror @stwd/shared but are bundled here for npm distribution
 
 /** Identifies the blockchain family for a wallet key/address. */
-export type ChainFamily = "evm" | "solana";
+export type ChainFamily = "evm" | "solana" | "bitcoin" | "monero";
+
+export type BitcoinNetwork = "mainnet" | "testnet";
+export type BitcoinAddressType = "p2wpkh" | "p2tr";
+
+export interface BitcoinWalletMetadata {
+  network: BitcoinNetwork;
+  addressType: BitcoinAddressType;
+  path: string;
+  publicKey: string;
+  xOnlyPublicKey?: string;
+  account: number;
+  change: 0 | 1;
+  index: number;
+  caip2: string;
+}
+
+export type MoneroNetwork = "mainnet" | "stagenet";
+
+/** Public Monero wallet metadata — never contains private spend/view keys. */
+export interface MoneroWalletMetadata {
+  network: MoneroNetwork;
+  address: string;
+  publicSpendKey: string;
+  publicViewKey: string;
+  /** Chain height at wallet creation; wallet scanning starts here. */
+  restoreHeight: number;
+  account: number;
+  caip2: string;
+}
+
+export interface WalletAddressMetadata {
+  bitcoin?: BitcoinWalletMetadata;
+  monero?: MoneroWalletMetadata;
+  [key: string]: unknown;
+}
 
 export interface AgentIdentity {
   id: string;
@@ -14,7 +49,7 @@ export interface AgentIdentity {
    * All addresses for this agent, keyed by chain family.
    * Present for agents created with multi-wallet support.
    */
-  walletAddresses?: { evm?: string; solana?: string };
+  walletAddresses?: { evm?: string; solana?: string; bitcoin?: string; monero?: string };
   erc8004TokenId?: string;
   platformId?: string;
   createdAt: Date;
@@ -27,8 +62,12 @@ export type PolicyType =
   | "time-window"
   | "rate-limit"
   | "allowed-chains"
+  | "condition-set"
+  | "contract-allowlist"
   | "reputation-threshold"
-  | "reputation-scaling";
+  | "reputation-scaling"
+  | "venue-allowlist"
+  | "leverage-cap";
 
 export interface PolicyRule {
   id: string;
@@ -44,15 +83,549 @@ export interface PolicyResult {
   reason?: string;
 }
 
+export interface ConditionSetConfig {
+  conditionSetId: string;
+  field?:
+    | "to"
+    | "ethereum_transaction.to"
+    | "ethereum_transaction.chain_id"
+    | "ethereum_transaction.value"
+    | "ethereum_transaction.data"
+    | "solana_system_program_instruction.Transfer.to"
+    | "chain_id"
+    | "value"
+    | "data";
+  operator?: "in_condition_set" | "not_in_condition_set";
+  caseSensitive?: boolean;
+}
+
+export interface ContractAllowlistConfig {
+  contracts: Array<{
+    address: string;
+    selectors: string[];
+    constraints?: Record<
+      string,
+      {
+        recipientAllowlist?: string[];
+        recipientBlocklist?: string[];
+        spenderAllowlist?: string[];
+        spenderBlocklist?: string[];
+        fromAllowlist?: string[];
+        fromBlocklist?: string[];
+        /** Maximum native chain value, in decimal wei, permitted with this selector. */
+        maxNativeValueWei?: string;
+        maxAmount?: string;
+      }
+    >;
+  }>;
+}
+
 export interface ApiResponse<T = unknown> {
   ok: boolean;
   data?: T;
   error?: string;
 }
 
+export interface PlatformLinkedAccount {
+  id: string;
+  provider: string;
+  providerAccountId: string;
+  expiresAt: number | null;
+}
+
+export interface PlatformWalletExternalId {
+  id: string;
+  tenantId: string;
+  walletExternalId: string;
+}
+
+export interface PlatformTenantUser {
+  userId: string;
+  tenantId: string;
+  role: string;
+  joinedAt: Date;
+  email: string | null;
+  emailVerified: boolean | null;
+  name: string | null;
+  tenantCustomMetadata: Record<string, unknown>;
+  deactivatedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type TenantTeamRole = "owner" | "admin" | "developer" | "billing" | "viewer" | "member";
+
+export interface TenantAdminUser {
+  userId: string;
+  tenantId: string;
+  role: TenantTeamRole | string;
+  joinedAt: Date;
+  email: string | null;
+  emailVerified: boolean | null;
+  name: string | null;
+  tenantCustomMetadata: Record<string, unknown>;
+  deactivatedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface TenantAdminUserSearchResult {
+  users: TenantAdminUser[];
+  limit: number;
+  offset: number;
+}
+
+export interface TenantAdminUserEvent {
+  id: number;
+  seq: number;
+  action: string;
+  actorType: string;
+  actorId: string | null;
+  resourceType: string | null;
+  resourceId: string | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: Date;
+}
+
+export interface TenantAdminUserEventsResult {
+  events: TenantAdminUserEvent[];
+  limit: number;
+  offset: number;
+  total: number;
+}
+
+export interface TenantThirdPartyWalletViolation {
+  userId: string;
+  email: string | null;
+  name: string | null;
+  role: TenantTeamRole | string;
+  walletCount: number;
+  wallets: Array<{
+    accountId: string;
+    provider: "wallet:ethereum" | "wallet:solana";
+    providerAccountId: string;
+  }>;
+}
+
+export interface TenantWalletPolicyViolationReport {
+  tenantId: string;
+  policyEnabled: boolean;
+  violations: TenantThirdPartyWalletViolation[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TenantWalletPolicyRemediationResult {
+  deleted: true;
+  accountId: string;
+  provider: "wallet:ethereum" | "wallet:solana";
+  providerAccountId: string;
+  issuedBefore: number;
+}
+
+export type TenantWalletPolicyBulkRemediationItem = {
+  userId: string;
+  accountId: string;
+};
+
+export type TenantWalletPolicyBulkRemediationResult =
+  | ({
+      ok: true;
+      targetUserId: string;
+    } & TenantWalletPolicyRemediationResult)
+  | {
+      ok: false;
+      targetUserId: string;
+      accountId: string;
+      status: number;
+      error: string;
+    };
+
+export interface TenantWalletPolicyBulkRemediationResponse {
+  tenantId: string;
+  results: TenantWalletPolicyBulkRemediationResult[];
+  succeeded: number;
+  failed: number;
+}
+
+export interface PlatformUserIdentity {
+  userId: string;
+  email: string | null;
+  emailVerified: boolean | null;
+  name: string | null;
+  image: string | null;
+  walletAddress: string | null;
+  walletChain: string | null;
+  customMetadata: Record<string, unknown>;
+  deactivatedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  tenantIds: string[];
+  linkedAccounts: PlatformLinkedAccount[];
+  walletExternalIds?: PlatformWalletExternalId[];
+}
+
+export interface PlatformUserCreateInput {
+  email: string;
+  emailVerified?: boolean;
+  name?: string;
+  customMetadata?: Record<string, unknown>;
+  tenantId?: string;
+  walletExternalId?: string;
+}
+
+export interface PlatformUserCreateResult {
+  userId: string;
+  isNew: boolean;
+  tenantId?: string;
+  walletExternalId?: string;
+}
+
+export interface PlatformWalletExternalIdAssignInput {
+  tenantId: string;
+  walletExternalId: string;
+}
+
+export interface PlatformWalletExternalIdAssignResult {
+  userId: string;
+  tenantId: string;
+  walletExternalId: string;
+  field: "walletExternalId";
+}
+
+export interface PlatformWalletExternalIdConnectOrCreateInput {
+  tenantId: string;
+  walletExternalId: string;
+  email?: string;
+  emailVerified?: boolean;
+  name?: string;
+  customMetadata?: Record<string, unknown>;
+}
+
+export interface PlatformWalletExternalIdConnectOrCreateResult {
+  userId: string;
+  isNew: boolean;
+  tenantId: string;
+  walletExternalId: string;
+}
+
+export interface PlatformUserLookupResult {
+  user: PlatformUserIdentity | null;
+}
+
+export interface PlatformUserSearchResult {
+  users: PlatformTenantUser[];
+  limit: number;
+  offset: number;
+}
+
+export interface DigitalAssetAccountWallet {
+  id: string;
+  walletId: string;
+  membershipId: string;
+  name: string | null;
+  ownerUserId?: string | null;
+  owner_user_id?: string | null;
+  walletType?: string | null;
+  wallet_type?: string | null;
+  custody?: {
+    type: "server" | "user_embedded" | string;
+    ownerUserId?: string | null;
+    owner_user_id?: string | null;
+  };
+  signing?: {
+    signerCount: number;
+    activeSignerCount: number;
+    quorumCount: number;
+    activeQuorumCount: number;
+  };
+  capabilities: DigitalAssetAccountCapability[];
+  capabilityMetadata: DigitalAssetAccountWalletCapabilityMetadata;
+  capability_metadata?: DigitalAssetAccountWalletCapabilityMetadata;
+  chainType: "ethereum" | "solana" | "bitcoin";
+  chainFamily: ChainFamily;
+  address: string | null;
+  purpose?: string | null;
+  venue?: string | null;
+  metadata?: WalletAddressMetadata;
+  createdAt?: Date | string | null;
+}
+
+export type DigitalAssetAccountCapability =
+  | "sign_transaction"
+  | "sign_message"
+  | "sign_typed_data"
+  | "sign_user_operation"
+  | "sign_authorization"
+  | "send_calls"
+  | "transfer"
+  | "solana_transaction"
+  | "export_private_key";
+
+export interface DigitalAssetAccountWalletCapabilityMetadata {
+  custody: {
+    type: "server" | "user_embedded" | string;
+    ownerUserId?: string | null;
+    owner_user_id?: string | null;
+    serverManaged: boolean;
+    server_managed?: boolean;
+    userOwned: boolean;
+    user_owned?: boolean;
+  };
+  signing: {
+    mode: "server" | "user" | "delegated" | "quorum" | string;
+    signerCount: number;
+    signer_count?: number;
+    activeSignerCount: number;
+    active_signer_count?: number;
+    quorumCount: number;
+    quorum_count?: number;
+    activeQuorumCount: number;
+    active_quorum_count?: number;
+    hasDelegatedSigners: boolean;
+    has_delegated_signers?: boolean;
+    hasActiveDelegatedSigners: boolean;
+    has_active_delegated_signers?: boolean;
+    hasKeyQuorums: boolean;
+    has_key_quorums?: boolean;
+    hasActiveKeyQuorums: boolean;
+    has_active_key_quorums?: boolean;
+  };
+  operations: {
+    readBalance: boolean;
+    read_balance?: boolean;
+    transfer: boolean;
+    signTransaction: boolean;
+    sign_transaction?: boolean;
+    signMessage: boolean;
+    sign_message?: boolean;
+    signTypedData: boolean;
+    sign_typed_data?: boolean;
+    signUserOperation: boolean;
+    sign_user_operation?: boolean;
+    signAuthorization: boolean;
+    sign_authorization?: boolean;
+    sendCalls: boolean;
+    send_calls?: boolean;
+    solanaTransaction: boolean;
+    solana_transaction?: boolean;
+    exportPrivateKey: boolean;
+    export_private_key?: boolean;
+  };
+}
+
+export interface DigitalAssetAccountCapabilityMetadata {
+  walletCount: number;
+  wallet_count?: number;
+  walletIds: string[];
+  wallet_ids?: string[];
+  chainFamilies: ChainFamily[];
+  chain_families?: ChainFamily[];
+  custodyTypes: string[];
+  custody_types?: string[];
+  walletTypes: string[];
+  wallet_types?: string[];
+  hasServerWallets: boolean;
+  has_server_wallets?: boolean;
+  hasUserEmbeddedWallets: boolean;
+  has_user_embedded_wallets?: boolean;
+  hasDelegatedSigners: boolean;
+  has_delegated_signers?: boolean;
+  hasActiveDelegatedSigners: boolean;
+  has_active_delegated_signers?: boolean;
+  hasKeyQuorums: boolean;
+  has_key_quorums?: boolean;
+  hasActiveKeyQuorums: boolean;
+  has_active_key_quorums?: boolean;
+}
+
+export interface DigitalAssetAccount {
+  id: string;
+  tenantId: string;
+  displayName: string | null;
+  display_name?: string | null;
+  metadata: Record<string, unknown>;
+  ownerUserIds?: string[];
+  owner_user_ids?: string[];
+  additionalSignerIds?: string[];
+  additional_signer_ids?: string[];
+  signerPolicyIds?: string[];
+  signer_policy_ids?: string[];
+  walletIds: string[];
+  wallet_ids?: string[];
+  wallets: DigitalAssetAccountWallet[];
+  capabilities: DigitalAssetAccountCapability[];
+  capabilityMetadata: DigitalAssetAccountCapabilityMetadata;
+  capability_metadata?: DigitalAssetAccountCapabilityMetadata;
+  createdAt: Date | string;
+  created_at?: Date | string;
+  updatedAt: Date | string;
+  updated_at?: Date | string;
+}
+
+export interface DigitalAssetAccountWalletConfiguration {
+  chain_type?: "ethereum" | "evm" | "solana" | "bitcoin";
+  chainType?: "ethereum" | "evm" | "solana" | "bitcoin";
+  name?: string;
+  wallet_id?: string;
+  walletId?: string;
+}
+
+export interface DigitalAssetAccountMutationInput {
+  id?: string;
+  display_name?: string | null;
+  displayName?: string | null;
+  metadata?: Record<string, unknown>;
+  owner_user_ids?: string[];
+  ownerUserIds?: string[];
+  additional_signer_ids?: string[];
+  additionalSignerIds?: string[];
+  signer_policy_ids?: string[];
+  signerPolicyIds?: string[];
+  wallet_ids?: string[];
+  walletIds?: string[];
+  user_wallet_ids?: string[];
+  userWalletIds?: string[];
+  wallets_configuration?: DigitalAssetAccountWalletConfiguration[];
+  walletsConfiguration?: DigitalAssetAccountWalletConfiguration[];
+}
+
+export interface DigitalAssetAccountListResult {
+  accounts: DigitalAssetAccount[];
+}
+
+export interface DigitalAssetAccountAggregation {
+  id: string;
+  accountId: string;
+  account_id?: string;
+  tenantId: string;
+  displayName: string | null;
+  display_name?: string | null;
+  walletIds: string[];
+  wallet_ids?: string[];
+  chainFamilies: ChainFamily[];
+  chain_families?: ChainFamily[];
+  metadata: Record<string, unknown>;
+  createdAt: Date | string;
+  created_at?: Date | string;
+  updatedAt: Date | string;
+  updated_at?: Date | string;
+}
+
+export interface DigitalAssetAccountAggregationMutationInput {
+  id?: string;
+  display_name?: string | null;
+  displayName?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface DigitalAssetAccountAggregationListResult {
+  aggregations: DigitalAssetAccountAggregation[];
+}
+
+export interface DigitalAssetAccountAggregationDeleteResult {
+  id: string;
+  deleted: boolean;
+}
+
+export interface DigitalAssetAccountBalance {
+  id: string;
+  accountId: string;
+  account_id?: string;
+  wallets: DigitalAssetAccountWallet[];
+  capabilities: DigitalAssetAccountCapability[];
+  capabilityMetadata: DigitalAssetAccountCapabilityMetadata;
+  capability_metadata?: DigitalAssetAccountCapabilityMetadata;
+  balances?: Array<{
+    walletId: string;
+    chainFamily: ChainFamily;
+    chainId: number | null;
+    symbol: string | null;
+    native: string | null;
+    nativeFormatted: string | null;
+    walletAddress: string | null;
+    unavailableReason?: string;
+  }>;
+  tokenBalances?: Array<{
+    walletId: string;
+    chainId: number;
+    token: string;
+    symbol: string;
+    balance: string;
+    formatted: string;
+    decimals: number;
+    unavailableReason?: string;
+  }>;
+  rollups?: {
+    native: Array<{
+      chainId: number;
+      symbol: string;
+      native: string;
+    }>;
+    tokens?: Array<{
+      chainId: number;
+      token: string;
+      symbol: string;
+      balance: string;
+      decimals: number;
+    }>;
+  };
+}
+
+export interface DigitalAssetAccountDeleteResult {
+  id: string;
+  deleted: boolean;
+}
+
+export interface PlatformTenantInvitation {
+  id: string;
+  tenantId: string;
+  email: string;
+  role: Exclude<TenantTeamRole, "owner"> | string;
+  status: "pending" | "accepted" | "revoked" | "expired" | string;
+  invitedByUserId?: string | null;
+  acceptedByUserId?: string | null;
+  acceptedAt?: Date | null;
+  revokedAt?: Date | null;
+  expiresAt: Date;
+  createdAt: Date;
+  updatedAt?: Date;
+}
+
+export interface PlatformTenantInvitationListResult {
+  invitations: PlatformTenantInvitation[];
+}
+
+export interface PlatformTenantInvitationCreateResult {
+  invitation: PlatformTenantInvitation;
+  token: string;
+  emailSent?: boolean;
+}
+
+export interface PlatformLinkAccountResult extends PlatformLinkedAccount {
+  isNew: boolean;
+}
+
+export interface PlatformTransferAccountResult extends PlatformLinkedAccount {
+  fromUserId: string;
+  toUserId: string;
+}
+
+export interface PlatformUserDeleteResult {
+  userId: string;
+  deleted: boolean;
+}
+
+export interface PlatformUserDeactivateResult {
+  userId: string;
+  deactivatedAt: Date | null;
+}
+
 export interface AgentBalance {
   agentId: string;
   walletAddress: string;
+  walletIndex?: number;
   balances: {
     native: string;
     nativeFormatted: string;
@@ -129,12 +702,43 @@ export interface SignTypedDataRequest {
   value: Record<string, unknown>;
 }
 
+export interface SignUserOperationRequest {
+  agentId: string;
+  tenantId: string;
+  userOperation: {
+    sender: string;
+    nonce: string;
+    initCode?: string;
+    callData: string;
+    verificationGasLimit: string;
+    callGasLimit: string;
+    preVerificationGas: string;
+    maxPriorityFeePerGas: string;
+    maxFeePerGas: string;
+    paymasterAndData?: string;
+  };
+  entryPoint?: string;
+  chainId: number;
+  to: string;
+  value: string;
+}
+
+export interface SignAuthorizationRequest {
+  agentId: string;
+  tenantId: string;
+  contractAddress: string;
+  chainId: number;
+  nonce: number;
+}
+
 export interface SignSolanaTransactionRequest {
   agentId: string;
   tenantId: string;
   transaction: string;
   chainId?: number;
   broadcast?: boolean;
+  expectedTo?: string;
+  expectedValue?: string;
 }
 
 export interface RpcRequest {
@@ -155,6 +759,8 @@ export interface TxRecord {
   agentId: string;
   status: TxStatus;
   request: SignRequest;
+  actionType?: string | null;
+  actionPayload?: Record<string, unknown> | null;
   txHash?: string;
   policyResults: PolicyResult[];
   createdAt: Date;
@@ -164,6 +770,315 @@ export interface TxRecord {
 
 // ─── Tenant Config Types ──────────────────────────────────────
 
+export interface TenantOidcProviderConfig {
+  id: string;
+  enabled: boolean;
+  issuer: string;
+  audience: string[];
+  jwksUri: string;
+  clientId?: string;
+  clientSecretEnv?: string;
+  authorizationUrl?: string;
+  tokenUrl?: string;
+  scopes?: string[];
+  subjectClaim?: "sub";
+  emailClaim?: string;
+  emailVerifiedClaim?: string;
+  nameClaim?: string;
+  pictureClaim?: string;
+  allowedAlgs?: Array<"RS256" | "ES256">;
+  allowJitProvisioning?: boolean;
+}
+
+export type TenantSamlSsoStatus = "pending" | "active" | "error";
+export type TenantSamlGroupRole = "admin" | "developer" | "billing" | "viewer" | "member";
+
+export interface TenantSamlGroupRoleMapping {
+  group: string;
+  role: TenantSamlGroupRole;
+}
+
+export interface TenantSamlSsoConfig {
+  tenantId: string;
+  enabled: boolean;
+  status: TenantSamlSsoStatus;
+  idpEntityId: string;
+  idpSsoUrl: string;
+  idpCertPems: string[];
+  spEntityId: string;
+  acsUrl: string;
+  nameIdFormat?: string;
+  emailAttribute: string;
+  groupsAttribute?: string;
+  groupRoleMappings: TenantSamlGroupRoleMapping[];
+  allowJitProvisioning: boolean;
+  jitDefaultRole: "viewer";
+  lastTestedAt?: Date | string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+export interface TenantSamlSsoUpdate {
+  enabled?: boolean;
+  idpEntityId?: string;
+  idpSsoUrl?: string;
+  idpCertPems?: string[];
+  nameIdFormat?: string;
+  emailAttribute?: string;
+  groupsAttribute?: string;
+  groupRoleMappings?: TenantSamlGroupRoleMapping[];
+  allowJitProvisioning?: boolean;
+}
+
+export type TenantCaptchaProvider = "turnstile" | "hcaptcha";
+export type TenantCaptchaAction = "email_otp" | "sms_otp";
+
+export interface TenantMfaPolicyConfig {
+  maxAgeSeconds?: number;
+  requireFor?: {
+    vaultSigning?: boolean;
+    keyImport?: boolean;
+    keyExport?: boolean;
+    recoveryCodes?: boolean;
+    tenantAdmin?: boolean;
+  };
+  allowDelegatedSignerAutomation?: boolean;
+  allowKeyQuorumAutomation?: boolean;
+}
+
+export interface TenantAuthAbuseConfig {
+  loginMethods?: {
+    passkey?: boolean;
+    email?: boolean;
+    sms?: boolean;
+    whatsapp?: boolean;
+    totp?: boolean;
+    siwe?: boolean;
+    siws?: boolean;
+    telegram?: boolean;
+    farcaster?: boolean;
+    oauth?: Record<string, boolean>;
+    oidc?: Record<string, boolean>;
+  };
+  captcha?: {
+    enabled?: boolean;
+    provider?: TenantCaptchaProvider;
+    siteKey?: string;
+    secretKeyEnv?: string;
+    requiredFor?: TenantCaptchaAction[];
+  };
+  email?: {
+    blockDisposable?: boolean;
+    blockPlusAliases?: boolean;
+    allowedEmails?: string[];
+    blockedEmails?: string[];
+    allowedDomains?: string[];
+    blockedDomains?: string[];
+  };
+  wallet?: {
+    allowedWallets?: string[];
+    blockedWallets?: string[];
+    restrictToOneThirdPartyWallet?: boolean;
+  };
+  phone?: {
+    blockVoip?: boolean;
+    allowedPhoneNumbers?: string[];
+    blockedPhoneNumbers?: string[];
+    allowedCountryCodes?: string[];
+    blockedCountryCodes?: string[];
+  };
+  mfa?: TenantMfaPolicyConfig;
+}
+
+export type TenantAccessAllowlistEntryType = "email" | "email_domain" | "wallet" | "phone";
+
+export interface TenantAccessAllowlistEntry {
+  id: string;
+  tenantId: string;
+  type: TenantAccessAllowlistEntryType;
+  value: string;
+  acceptedAt: string | null;
+}
+
+export interface TenantAccessAllowlistEntryInput {
+  type: TenantAccessAllowlistEntryType;
+  value: string;
+}
+
+export type TenantAppClientEnvironment = "development" | "preview" | "staging" | "production";
+
+export interface TenantAppClientEmbeddedWalletConfig {
+  createOnLogin?: EmbeddedWalletCreateOnLogin;
+}
+
+export interface TenantAppClient {
+  id: string;
+  name: string;
+  environment: TenantAppClientEnvironment;
+  enabled?: boolean;
+  isDefault?: boolean;
+  allowedOrigins?: string[];
+  allowedRedirectUrls?: string[];
+  allowedBundleIds?: string[];
+  allowedPackageNames?: string[];
+  loginMethods?: TenantAuthAbuseConfig["loginMethods"];
+  embeddedWallets?: TenantAppClientEmbeddedWalletConfig;
+  globalWalletEnabled?: boolean;
+  globalWalletAllowedScopes?: string[];
+  createdAt?: Date | string;
+  updatedAt?: Date | string;
+}
+
+export interface TenantAppClientSecret {
+  id: string;
+  tenantId: string;
+  clientId: string;
+  appId: string;
+  secretPrefix: string;
+  status: "active" | "retiring" | "revoked";
+  createdAt: Date | string;
+  updatedAt: Date | string;
+  expiresAt?: Date | string | null;
+  revokedAt?: Date | string | null;
+}
+
+export interface TenantAppClientSecretCreateResult {
+  secret: TenantAppClientSecret;
+  appId: string;
+  appSecret: string;
+}
+
+export interface TenantSsoDomain {
+  id: string;
+  tenantId: string;
+  domain: string;
+  verificationToken: string;
+  status: "pending" | "verified";
+  ssoRequired: boolean;
+  verifiedAt?: Date | string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+export interface SsoDiscoveryResult {
+  domain: string;
+  tenantId: string | null;
+  ssoRequired: boolean;
+  available: boolean;
+}
+
+export interface TenantTheme {
+  primaryColor?: string;
+  accentColor?: string;
+  backgroundColor?: string;
+  surfaceColor?: string;
+  textColor?: string;
+  mutedColor?: string;
+  successColor?: string;
+  errorColor?: string;
+  warningColor?: string;
+  borderRadius?: number;
+  fontFamily?: string;
+  colorScheme?: "light" | "dark" | "system";
+  logoUrl?: string;
+  faviconUrl?: string;
+}
+
+export interface TenantTestAccountConfig {
+  enabled?: boolean;
+  email?: string;
+  phone?: string;
+  otp?: string;
+  otpHash?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export type GasSponsorshipProvider =
+  | "custom_evm_paymaster"
+  | "custom_bundler"
+  | "solana_fee_payer"
+  | "mock";
+
+export type GasSponsorshipMode = "erc4337" | "eip7702" | "solana_fee_payer";
+
+export interface TenantGasSponsorshipConfig {
+  enabled?: boolean;
+  provider?: GasSponsorshipProvider;
+  mode?: GasSponsorshipMode;
+  allowedChainIds?: number[];
+  allowedCaip2?: string[];
+  paymasterUrl?: string;
+  bundlerUrl?: string;
+  entryPoint?: string;
+  feePayerAgentId?: string;
+  maxPerTxUsd?: number;
+  maxPerWalletDayUsd?: number;
+  maxTenantDayUsd?: number;
+  maxTenantMonthUsd?: number;
+  allowClientSponsorship?: boolean;
+  requireSimulation?: boolean;
+  circuitBreakerEnabled?: boolean;
+}
+
+export interface GasSponsorshipState {
+  enabled: boolean;
+  provider: GasSponsorshipProvider | null;
+  mode?: GasSponsorshipMode;
+  circuitBreakerEnabled?: boolean;
+}
+
+export type AccountGasSponsorshipState = GasSponsorshipState;
+
+export interface SponsoredGasSpendEntry {
+  id: string;
+  tenantId: string;
+  agentId: string;
+  userId?: string | null;
+  txId?: string | null;
+  chainFamily: ChainFamily;
+  chainId?: number | null;
+  caip2?: string | null;
+  provider: GasSponsorshipProvider | string;
+  mode: GasSponsorshipMode | string;
+  status: string;
+  reservedUsd?: string | null;
+  actualUsd?: string | null;
+  txHash?: string | null;
+  userOperationHash?: string | null;
+  signature?: string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+export interface SponsoredGasSpendSummary {
+  currency: "USD";
+  reservedUsd: string;
+  actualUsd: string;
+  count: number;
+  entries: SponsoredGasSpendEntry[];
+}
+
+export type EmbeddedWalletCreateOnLogin = "off" | "users-without-wallets" | "all-users";
+
+export interface TenantEmbeddedWalletFeatureFlags {
+  createOnLogin?: EmbeddedWalletCreateOnLogin;
+}
+
+export interface TenantFeatureFlags extends Record<string, unknown> {
+  showFundingQR?: boolean;
+  showTransactionHistory?: boolean;
+  showSpendDashboard?: boolean;
+  showPolicyControls?: boolean;
+  showApprovalQueue?: boolean;
+  showSecretManager?: boolean;
+  enableSolana?: boolean;
+  showChainSelector?: boolean;
+  allowAddressExport?: boolean;
+  embeddedWallets?: TenantEmbeddedWalletFeatureFlags;
+  embeddedWalletCreateOnLogin?: EmbeddedWalletCreateOnLogin;
+}
+
 export interface TenantControlPlaneConfig {
   tenantId: string;
   displayName?: string;
@@ -171,10 +1086,81 @@ export interface TenantControlPlaneConfig {
   policyTemplates?: Array<{ id: string; name: string; policies: PolicyRule[] }>;
   secretRoutePresets?: Array<{ id: string; name: string; path: string }>;
   approvalConfig?: Record<string, unknown>;
-  featureFlags?: Record<string, boolean>;
-  theme?: Record<string, unknown>;
+  featureFlags?: TenantFeatureFlags;
+  oidcProviders?: TenantOidcProviderConfig[];
+  samlSso?: TenantSamlSsoConfig;
+  authAbuseConfig?: TenantAuthAbuseConfig;
+  appClients?: TenantAppClient[];
+  testAccount?: TenantTestAccountConfig;
+  gasSponsorshipConfig?: TenantGasSponsorshipConfig;
+  /** Tenant-owned browser origins allowed for CORS, passkeys, and SIWE/SIWS. */
+  allowedOrigins?: string[];
+  /** Tenant-owned redirect URLs allowed for OAuth and email auth callbacks. */
+  allowedRedirectUrls?: string[];
+  theme?: TenantTheme;
   createdAt?: Date;
   updatedAt?: Date;
+}
+
+export type TenantSecurityChecklistStatus = "pass" | "warning" | "fail";
+
+export interface TenantSecurityChecklistItem {
+  id: string;
+  label: string;
+  status: TenantSecurityChecklistStatus;
+  description: string;
+  remediation?: string;
+}
+
+export interface TenantSecurityChecklist {
+  tenantId: string;
+  generatedAt: Date | string;
+  summary: {
+    pass: number;
+    warning: number;
+    fail: number;
+  };
+  items: TenantSecurityChecklistItem[];
+}
+
+export interface IdempotencyMetricCounters {
+  observed: number;
+  reserved: number;
+  completed: number;
+  replayed: number;
+  conflicts: number;
+  inFlightConflicts: number;
+  suppressedAuthResponses: number;
+  invalidKeys: number;
+  storeErrors: number;
+  skippedUnsafeContext: number;
+  releasedOnError: number;
+}
+
+export interface TenantIdempotencyMetrics {
+  tenantId: string;
+  generatedAt: Date | string;
+  windowStartedAt: Date | string;
+  lastSeenAt: Date | string | null;
+  ttlMs: number;
+  counters: IdempotencyMetricCounters;
+}
+
+export interface TenantRequestSigningKey {
+  id: string;
+  tenantId: string;
+  name: string;
+  secretPrefix: string;
+  status: "active" | "retiring" | "revoked";
+  createdAt: Date | string;
+  updatedAt: Date | string;
+  expiresAt?: Date | string | null;
+  revokedAt?: Date | string | null;
+}
+
+export interface TenantRequestSigningKeyCreateResult {
+  key: TenantRequestSigningKey;
+  signingSecret: string;
 }
 
 // ─── Dashboard Types ──────────────────────────────────────────
@@ -201,6 +1187,331 @@ export interface AgentDashboardResponse {
   pendingApprovals: number;
   recentTransactions: TxRecord[];
 }
+
+export interface AgentSpendSummary {
+  agentId: string;
+  walletAddress: string;
+  onchain: {
+    todayWei: string;
+    weekWei: string;
+    monthWei: string;
+  };
+  realtime: {
+    enabled: boolean;
+    periods: Array<{
+      period: "day" | "week" | "month";
+      spentUsd: number | null;
+      byHost: Record<string, number>;
+    }>;
+  };
+  sponsorship: AccountGasSponsorshipState;
+}
+
+export interface AgentAccountWallet {
+  id: string;
+  chainFamily: ChainFamily;
+  address: string;
+  venue: string | null;
+  purpose: string | null;
+  metadata: WalletAddressMetadata;
+  createdAt: Date | string;
+}
+
+export type AgentAccountCapability =
+  | "sign_transaction"
+  | "sign_message"
+  | "sign_typed_data"
+  | "sign_user_operation"
+  | "sign_authorization"
+  | "send_calls"
+  | "transfer"
+  | "solana_transaction";
+
+export interface AgentPortfolioAsset {
+  token: string;
+  symbol: string;
+  balance: string;
+  formatted: string;
+  decimals: number;
+  usdPrice: number | null;
+  usdValue: number | null;
+  usdPriceText: string | null;
+  usdValueText: string | null;
+}
+
+export interface AgentAccountSummary {
+  id: string;
+  type: "agent";
+  agentId: string;
+  tenantId: string;
+  name: string;
+  walletAddress: string;
+  walletAddresses: Partial<Record<ChainFamily, string>>;
+  wallets: AgentAccountWallet[];
+  balances: {
+    evm: null | {
+      native: string;
+      nativeFormatted: string;
+      chainId: number;
+      symbol: string;
+      walletAddress: string;
+    };
+    unavailableReason?: string;
+  };
+  portfolio: {
+    chainId: number | null;
+    walletAddress: string;
+    native: AgentPortfolioAsset | null;
+    tokens: AgentPortfolioAsset[];
+    totalUsd: number | null;
+    totalUsdText: string | null;
+    unavailableReason?: string;
+  };
+  spend: {
+    todayWei: string;
+    weekWei: string;
+    monthWei: string;
+  };
+  capabilities: AgentAccountCapability[];
+  sponsorship: AccountGasSponsorshipState;
+  createdAt: Date | string;
+}
+
+export type UserAccountCapability =
+  | "sign_transaction"
+  | "sign_message"
+  | "transfer"
+  | "solana_transaction"
+  | "export_private_key";
+
+export interface UserAccountWallet {
+  id: string;
+  chainFamily: ChainFamily;
+  address: string;
+  venue: string | null;
+  purpose: string | null;
+  metadata: WalletAddressMetadata;
+  createdAt: Date | string;
+}
+
+export interface UserAccountSummary {
+  id: string;
+  type: "user";
+  userId: string;
+  tenantId: string;
+  email: string | null;
+  emailVerified: boolean | null;
+  name: string | null;
+  image: string | null;
+  walletAddress: string | null;
+  walletChain: string | null;
+  customMetadata: Record<string, unknown>;
+  linkedAccounts: Array<{
+    id: string;
+    provider: string;
+    providerAccountId: string;
+    expiresAt: number | null;
+    type?: string;
+    embeddedWallets?: Array<{ address: string }>;
+    smartWallets?: Array<{ address: string }>;
+    providerApp?: {
+      id: string;
+      name: string | null;
+      logoUrl: string | null;
+    };
+    firstVerifiedAt?: Date | string;
+    latestVerifiedAt?: Date | string;
+  }>;
+  primaryLoginMethods: Array<{ provider: "email" | "wallet"; providerAccountId: string }>;
+  wallet: null | {
+    id: string;
+    agentId: string;
+    walletAddress: string;
+    walletAddresses: Partial<Record<ChainFamily, string>>;
+    createdAt: Date | string;
+  };
+  walletAddresses: Partial<Record<ChainFamily, string>>;
+  wallets: UserAccountWallet[];
+  balances: {
+    evm: null | {
+      native: string;
+      nativeFormatted: string;
+      chainId: number;
+      symbol: string;
+      walletAddress: string;
+    };
+    unavailableReason?: string;
+  };
+  portfolio: {
+    chainId: number | null;
+    walletAddress: string | null;
+    native: AgentPortfolioAsset | null;
+    tokens: AgentPortfolioAsset[];
+    totalUsd: number | null;
+    totalUsdText: string | null;
+    unavailableReason?: string;
+  };
+  spend: {
+    todayWei: string;
+    weekWei: string;
+    monthWei: string;
+  };
+  capabilities: UserAccountCapability[];
+  sponsorship: AccountGasSponsorshipState;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+export type UserPushProvider = "expo" | "apns" | "fcm";
+export type UserPushPlatform = "ios" | "android";
+
+export interface UserPushSubscription {
+  id: string;
+  tenantId: string | null;
+  provider: UserPushProvider;
+  token: string;
+  platform: UserPushPlatform | null;
+  deviceId: string | null;
+  appId: string | null;
+  locale: string | null;
+  timezone: string | null;
+  metadata: Record<string, unknown>;
+  status: "active" | "revoked";
+  lastSeenAt: Date | string;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+export interface UserPushSubscriptionInput {
+  provider: UserPushProvider;
+  token: string;
+  platform?: UserPushPlatform;
+  tenantId?: string;
+  deviceId?: string;
+  appId?: string;
+  locale?: string;
+  timezone?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface UserPushSubscriptionResult {
+  subscription: UserPushSubscription;
+}
+
+export interface UserPushSubscriptionListResult {
+  subscriptions: UserPushSubscription[];
+}
+
+export type AgentSignerType = "owner" | "delegated" | "service" | "quorum_member";
+export type AgentSignerSubjectType = "user" | "wallet" | "api_key" | "external";
+export type AgentSignerStatus = "active" | "paused" | "revoked";
+export type AgentSignerKeyType = "hmac" | "p256";
+
+export interface AgentSigner {
+  id: string;
+  tenantId: string;
+  agentId: string;
+  signerType: AgentSignerType;
+  subjectType: AgentSignerSubjectType;
+  subjectId: string;
+  keyType: AgentSignerKeyType;
+  /** Registered P-256 public key for Privy-style asymmetric authorization keys. */
+  publicKey: string | null;
+  address: string | null;
+  chainFamily: ChainFamily | null;
+  label: string | null;
+  permissions: string[];
+  policyIds: string[];
+  metadata: Record<string, unknown>;
+  hasCredential?: boolean;
+  status: AgentSignerStatus;
+  createdBy: string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+export interface AgentSignerCreate {
+  signerType: AgentSignerType;
+  subjectType: AgentSignerSubjectType;
+  subjectId: string;
+  /** Defaults to hmac. Use p256 to register a Privy-style asymmetric authorization key. */
+  keyType?: AgentSignerKeyType;
+  /** Required when keyType is p256. Accepts SPKI base64, raw point, or JWK encodings server-side. */
+  publicKey?: string | null;
+  address?: string | null;
+  chainFamily?: ChainFamily | null;
+  label?: string | null;
+  permissions?: string[];
+  policyIds?: string[];
+  metadata?: Record<string, unknown>;
+  /** Provide a caller-generated credential secret. Stored server-side as a hash only. */
+  credentialSecret?: string;
+  /** Ask the server to issue a one-time credentialSecret in the create response. */
+  issueCredential?: boolean;
+}
+
+export type AgentSignerCreateResult = AgentSigner & {
+  credentialSecret?: string;
+};
+
+export type AgentSignerUpdate = Partial<
+  Pick<
+    AgentSignerCreate,
+    | "signerType"
+    | "keyType"
+    | "publicKey"
+    | "address"
+    | "chainFamily"
+    | "label"
+    | "permissions"
+    | "policyIds"
+    | "metadata"
+  >
+> & {
+  status?: AgentSignerStatus;
+};
+
+/** Privy-style authorization-key aliases for Steward's agent signer resources. */
+export type AuthorizationKey = AgentSigner;
+export type AuthorizationKeyCreate = AgentSignerCreate;
+export type AuthorizationKeyCreateResult = AgentSignerCreateResult;
+export type AuthorizationKeyUpdate = AgentSignerUpdate;
+
+export type AgentKeyQuorumStatus = "active" | "paused" | "revoked";
+
+export interface AgentKeyQuorum {
+  id: string;
+  tenantId: string;
+  agentId: string;
+  name: string;
+  threshold: number;
+  memberSignerIds: string[];
+  memberQuorumIds: string[];
+  permissions: string[];
+  metadata: Record<string, unknown>;
+  status: AgentKeyQuorumStatus;
+  createdBy: string | null;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+export interface AgentKeyQuorumCreate {
+  name: string;
+  threshold: number;
+  memberSignerIds: string[];
+  memberQuorumIds?: string[];
+  permissions?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export type AgentKeyQuorumUpdate = Partial<
+  Pick<
+    AgentKeyQuorumCreate,
+    "name" | "threshold" | "memberSignerIds" | "memberQuorumIds" | "permissions" | "metadata"
+  >
+> & {
+  status?: AgentKeyQuorumStatus;
+};
 
 // ─── Approval Types ───────────────────────────────────────────
 
@@ -240,15 +1551,395 @@ export interface AutoApprovalRule {
   updatedAt?: Date;
 }
 
+export type IntentStatus =
+  | "pending"
+  | "authorized"
+  | "executing"
+  | "executed"
+  | "failed"
+  | "rejected"
+  | "canceled"
+  | "expired";
+export type IntentType =
+  | "rpc"
+  | "transfer"
+  | "wallet_update"
+  | "policy_update"
+  | "policy_rule_create"
+  | "policy_rule_delete"
+  | "policy_rule_update"
+  | "quorum_update"
+  | "wallet_action"
+  | "provider-action";
+
+export interface ProviderActionInvokeInput {
+  workspaceId: string;
+  providerAccountId: string;
+  operationKey: string;
+  /** Adapter-defined public arguments. Credentials are resolved only by Steward. */
+  arguments: Record<string, unknown>;
+  idempotencyKey: string;
+}
+
+export interface ProviderActionInvokeSuccessResult {
+  id: string;
+  status: "pending_approval" | "stub_succeeded" | "stub_failed";
+  requestHash: string;
+  actionDigest: string;
+  result?: {
+    ok: boolean;
+    status: "stub_succeeded" | "stub_failed";
+    echo: { operationId: string; actionDigest: string };
+  };
+}
+
+/** A policy/access denial is a durable lifecycle record, not a failed submission. */
+export interface ProviderActionInvokeDeniedResult {
+  id: string;
+  status: "denied_access" | "denied_policy";
+  reasonCode: string;
+  requestHash: string;
+  actionDigest: string;
+  persisted: true;
+}
+
+export type ProviderActionInvokeResult =
+  | ProviderActionInvokeSuccessResult
+  | ProviderActionInvokeDeniedResult;
+
+/** Authoritative values persisted in `provider_action_bindings.status`. */
+export type ProviderActionBindingStatus =
+  | "denied"
+  | "pending_approval"
+  | "allowed_stub"
+  | "stub_succeeded"
+  | "stub_failed"
+  | "approved"
+  | "execution_ready"
+  | "approval_denied"
+  | "approval_expired"
+  | "approval_stale"
+  | "executing"
+  | "succeeded"
+  | "failed"
+  | "outcome_unknown";
+
+/** Scalar-only agent view of the persisted provider-action binding. */
+export interface ProviderActionStatus {
+  id: string;
+  status: ProviderActionBindingStatus;
+  version: number;
+  workspaceId: string;
+  providerAccountId: string;
+  operationId: string;
+  operationRevision: number;
+  actionDigest: string;
+  requestHash: string;
+  expiresAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProviderActionApprovalDetail {
+  id: string;
+  status: ProviderActionBindingStatus;
+  version: number;
+  requestHash: string;
+  actionDigest: string;
+  expiresAt: string | null;
+  safeSummary: Record<string, unknown> | null;
+  operationId: string;
+  providerAccountId: string;
+  workspaceId: string;
+}
+
+export interface ProviderActionApprovalDecisionInput {
+  decision: "approve" | "deny";
+  expectedVersion: number;
+  expectedRequestHash: string;
+  expectedActionDigest: string;
+  reasonCode?: ProviderApprovalReasonCode;
+  reason?: string;
+  idempotencyKey: string;
+}
+
+export type ProviderApprovalReasonCode =
+  | "approver_manual_approve"
+  | "approver_manual_deny"
+  | "approver_risk_deny"
+  | "approver_scope_deny"
+  | "approver_duplicate_deny"
+  | "approver_other";
+
+export interface ProviderActionTransitionResult {
+  id: string;
+  status: ProviderActionBindingStatus;
+  version: number;
+  requestHash: string;
+  actionDigest: string;
+  replayed?: true;
+  resumeAttemptId?: string;
+}
+
+export type ProviderCaseTerminalState =
+  | "denied_access"
+  | "denied_policy"
+  | "pending_approval"
+  | "approval_denied"
+  | "approval_expired"
+  | "approval_staled"
+  | "execution_ready"
+  | "executing"
+  | "succeeded"
+  | "failed"
+  | "outcome_unknown"
+  | "unknown";
+
+export type ProviderCaseEventRole =
+  | "genesis"
+  | "access_decided"
+  | "policy_decided"
+  | "approval_requested"
+  | "approval_decided"
+  | "approval_terminal"
+  | "resume_ready"
+  | "exec_authorized"
+  | "exec_claimed"
+  | "exec_denied_at_boundary"
+  | "exec_dispatched"
+  | "exec_terminal"
+  | "exec_reconciled"
+  | "unclassified";
+
+export type ProviderCaseDispatchState =
+  | "none"
+  | "claimed"
+  | "dispatched"
+  | "succeeded"
+  | "failed"
+  | "outcome_unknown";
+
+export interface ProviderCaseManifest {
+  schemaVersion: "steward.provider-case-manifest.v1";
+  caseId: string;
+  tenantId: string;
+  workspaceId: string;
+  requestActor: { type: "agent"; id: string; revision: number };
+  approvalActor: { type: "user"; id: string } | null;
+  resumeActor: "steward-system" | null;
+  providerAccount: { id: string; revision: number };
+  operation: {
+    id: string;
+    key: string;
+    revision: number;
+    canonicalProfile: string;
+    riskClass: string;
+  };
+  actionDigest: string;
+  requestHash: string;
+  idempotencyKeyHash: string;
+  accessDecision: { id: string; hash: string; effect: "allow" | "deny" };
+  policyDecision: { id: string | null; hash: string | null; effect: string };
+  approvalCommitmentHash: string | null;
+  execution: {
+    authorizationId: string | null;
+    dispatchState: ProviderCaseDispatchState;
+    providerIdempotencyKeyHash: string | null;
+    upstreamStatusCode: number | null;
+    reconciled: boolean;
+  } | null;
+  dependencyRevisions: {
+    actor: number;
+    workspace: number;
+    providerAccount: number;
+    operation: number;
+    matchedGrants: Array<{ id: string; revision: number }>;
+    matchedBindings: Array<{ id: string; revision: number }>;
+    route: { id: string; revision: number } | null;
+    secret: { id: string; version: number } | null;
+    policyRevisionHash: string | null;
+  };
+  events: Array<{ seq: number; action: string; role: ProviderCaseEventRole; hmac: string }>;
+  eventSeqRange: { from: number; to: number } | null;
+  terminalState: ProviderCaseTerminalState;
+  completeness: "complete" | "incomplete" | "unknown";
+  missingRequiredRoles: ProviderCaseEventRole[];
+  incompletenessReasons: string[];
+  safeSummary: Record<string, unknown> | null;
+  genesisAt: string | null;
+  terminalAt: string | null;
+  assembledAt: string;
+}
+
+export interface ProviderCaseEvidence {
+  version: 1;
+  tenantId: string;
+  caseId: string;
+  manifest: ProviderCaseManifest;
+  bundle: {
+    version: 1;
+    tenantId: string;
+    range: { from: number; to: number; includesHead: boolean };
+    canonicalizationSpec: string;
+    events: unknown[];
+    checkpoint: { payload: unknown; signature: string; publicKey: string };
+    generatedAt: string;
+  };
+  completeness: "complete" | "incomplete" | "unknown";
+  generatedAt: string;
+}
+
+export interface Intent {
+  id: string;
+  intent_id: string;
+  tenantId: string;
+  agentId: string | null;
+  wallet_id?: string | null;
+  intentType: IntentType | string;
+  intent_type: IntentType | string;
+  status: IntentStatus;
+  resourceType: string | null;
+  resourceId: string | null;
+  resource_id?: string | null;
+  createdByType: string;
+  createdById: string | null;
+  created_by_id?: string | null;
+  createdByDisplayName: string | null;
+  created_by_display_name?: string | null;
+  authorizationDetails: Array<Record<string, unknown>>;
+  authorization_details?: Array<Record<string, unknown>>;
+  payload: Record<string, unknown>;
+  executionResult: Record<string, unknown> | null;
+  execution_result?: Record<string, unknown> | null;
+  expiresAt: Date | string | null;
+  expires_at?: number | null;
+  authorizedBy: string | null;
+  authorized_by?: string | null;
+  canceledAt: Date | string | null;
+  canceledBy: string | null;
+  canceled_by?: string | null;
+  cancellationReason: string | null;
+  cancellation_reason?: string | null;
+  expiredAt: Date | string | null;
+  expiredBy: string | null;
+  expired_by?: string | null;
+  rejectedAt: Date | string | null;
+  rejectedBy: string | null;
+  rejected_by?: string | null;
+  rejectionReason: string | null;
+  rejection_reason?: string | null;
+  executedBy: string | null;
+  executed_by?: string | null;
+  failedAt: Date | string | null;
+  failedBy: string | null;
+  failed_by?: string | null;
+  failureReason: string | null;
+  failure_reason?: string | null;
+  createdAt: Date | string;
+  created_at?: number;
+  updatedAt: Date | string;
+  authorizedAt: Date | string | null;
+  executedAt: Date | string | null;
+}
+
+export interface IntentCreate {
+  intentType?: IntentType | string;
+  intent_type?: IntentType | string;
+  agentId?: string | null;
+  wallet_id?: string | null;
+  resourceType?: string | null;
+  resource_type?: string | null;
+  resourceId?: string | null;
+  resource_id?: string | null;
+  authorizationDetails?: Array<Record<string, unknown>>;
+  authorization_details?: Array<Record<string, unknown>>;
+  payload?: Record<string, unknown>;
+  createdByDisplayName?: string | null;
+  created_by_display_name?: string | null;
+  expiresAt?: string | null;
+  expires_at?: string | null;
+  ttlSeconds?: number;
+  ttl_seconds?: number;
+}
+
+export interface IntentListOptions {
+  status?: IntentStatus;
+  intentType?: IntentType | string;
+  intent_type?: IntentType | string;
+  agentId?: string;
+  wallet_id?: string;
+  limit?: number;
+  offset?: number;
+}
+
 // ─── Webhook Types ────────────────────────────────────────────
 
-export type WebhookEventType =
-  | "tx.pending"
-  | "tx.approved"
-  | "tx.denied"
-  | "tx.signed"
-  | "spend.threshold"
-  | "policy.violation";
+export const WEBHOOK_EVENT_TYPES = [
+  "tx.pending",
+  "tx.approved",
+  "tx.denied",
+  "tx.signed",
+  "spend.threshold",
+  "policy.violation",
+  "user.created",
+  "user.authenticated",
+  "user.linked_account",
+  "user.unlinked_account",
+  "user.updated_account",
+  "user.transferred_account",
+  "user.wallet_created",
+  "mfa.enabled",
+  "mfa.disabled",
+  "private_key.exported",
+  "wallet.imported",
+  "wallet.recovery_setup",
+  "wallet.recovered",
+  "wallet.raw_signature.created",
+  "wallet.funds_deposited",
+  "wallet.funds_withdrawn",
+  "transaction.broadcasted",
+  "transaction.confirmed",
+  "transaction.execution_reverted",
+  "transaction.replaced",
+  "transaction.failed",
+  "transaction.provider_error",
+  "transaction.still_pending",
+  "user_operation.completed",
+  "user_operation.failed",
+  "intent.created",
+  "intent.authorized",
+  "intent.executed",
+  "intent.failed",
+  "intent.rejected",
+  "intent.canceled",
+  "intent.expired",
+  "wallet_action.transfer.created",
+  "wallet_action.transfer.succeeded",
+  "wallet_action.transfer.rejected",
+  "wallet_action.transfer.failed",
+  "wallet_action.send_calls.created",
+  "wallet_action.send_calls.succeeded",
+  "wallet_action.send_calls.rejected",
+  "wallet_action.send_calls.failed",
+  "wallet_action.swap.created",
+  "wallet_action.swap.succeeded",
+  "wallet_action.swap.rejected",
+  "wallet_action.swap.failed",
+  "wallet_action.earn_deposit.created",
+  "wallet_action.earn_deposit.succeeded",
+  "wallet_action.earn_deposit.rejected",
+  "wallet_action.earn_deposit.failed",
+  "wallet_action.earn_withdraw.created",
+  "wallet_action.earn_withdraw.succeeded",
+  "wallet_action.earn_withdraw.rejected",
+  "wallet_action.earn_withdraw.failed",
+  "wallet_action.earn_incentive_claim.created",
+  "wallet_action.earn_incentive_claim.succeeded",
+  "wallet_action.earn_incentive_claim.rejected",
+  "wallet_action.earn_incentive_claim.failed",
+] as const;
+
+export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 
 export interface WebhookConfig {
   id: string;
@@ -266,15 +1957,15 @@ export interface WebhookConfig {
 
 export interface WebhookDelivery {
   id: string;
-  tenantId: string;
-  url: string;
-  event: string;
-  payload: Record<string, unknown>;
-  status: "pending" | "delivered" | "failed";
+  eventType: string;
+  replayedFromDeliveryId?: string | null;
+  status: "pending" | "processing" | "delivered" | "failed" | "dead";
   attempts: number;
-  nextRetryAt?: Date;
-  lastError?: string;
-  createdAt: Date;
+  maxAttempts: number;
+  nextRetryAt: string | Date | null;
+  hasError: boolean;
+  createdAt: string | Date;
+  deliveredAt: string | Date | null;
 }
 
 export const SUPPORTED_CHAINS = {
@@ -282,6 +1973,7 @@ export const SUPPORTED_CHAINS = {
   baseSepolia: 84532,
   bsc: 56,
   bscTestnet: 97,
+  gnosis: 100,
 } as const;
 
 // ─── CAIP-2 Chain Identifiers ───
@@ -289,7 +1981,7 @@ export const SUPPORTED_CHAINS = {
 export interface ChainIdentifier {
   caip2: string;
   numericId: number;
-  family: "evm" | "solana";
+  family: ChainFamily;
   name: string;
   symbol: string;
   testnet: boolean;
@@ -300,10 +1992,164 @@ export interface AllowedChainsConfig {
 }
 
 /** Result of exporting private keys from a vault agent or user wallet. */
+export interface BitcoinPrivateKeyExport {
+  privateKey: string;
+  address: string;
+  venue: string | null;
+  purpose: string | null;
+  metadata: WalletAddressMetadata;
+}
+
 export interface ExportKeyResult {
   evm?: { privateKey: string; address: string };
   solana?: { privateKey: string; address: string };
+  bitcoin?: BitcoinPrivateKeyExport[];
   warning: string;
+}
+
+export interface EncryptedAgentKeyImportInitResult {
+  importSessionId: string;
+  publicKey: string;
+  algorithm: "X25519-HKDF-SHA256-AES-256-GCM";
+  expiresAt: string;
+  aad: {
+    importSessionId: string;
+    tenantId: string;
+    agentId: string;
+    chain: "evm" | "solana";
+  };
+}
+
+export interface EncryptedAgentKeyImportSubmitInput {
+  importSessionId: string;
+  ephemeralPublicKey: string;
+  iv: string;
+  ciphertext: string;
+  tag: string;
+}
+
+export interface EncryptedAgentKeyImportResult {
+  agentId: string;
+  walletAddress: string;
+  chain: "evm" | "solana" | string;
+}
+
+export interface EncryptedUserWalletKeyImportInitResult {
+  importSessionId: string;
+  publicKey: string;
+  algorithm: "X25519-HKDF-SHA256-AES-256-GCM";
+  expiresAt: string;
+  aad: {
+    importSessionId: string;
+    tenantId: string;
+    userId: string;
+    agentId: string;
+    chain: "evm" | "solana";
+    walletIndex: number;
+    appClientId: string | null;
+  };
+}
+
+export interface EncryptedUserWalletKeyImportSubmitInput {
+  importSessionId: string;
+  ephemeralPublicKey: string;
+  iv: string;
+  ciphertext: string;
+  tag: string;
+  walletIndex?: number;
+}
+
+export interface EncryptedUserWalletKeyImportResult {
+  agentId: string;
+  walletAddress: string;
+  chain: "evm" | "solana" | string;
+  walletIndex: number;
+  imported: true;
+}
+
+export interface UserWalletRecoverySetupResult {
+  wallet: {
+    agentId: string;
+    walletAddress: string;
+    recoverable: true;
+    walletIndex?: number;
+  };
+  recovery: {
+    type: "bip39";
+    mnemonic: string;
+    warning: string;
+  };
+}
+
+export interface UserWalletRecoveryRestoreResult {
+  wallet: {
+    agentId: string;
+    walletAddress: string;
+    recoverable: true;
+    restoredExisting: boolean;
+    walletIndex?: number;
+  };
+  recovery: {
+    type: "bip39";
+    restored: true;
+  };
+}
+
+export interface UserWalletCreateResult {
+  agentId: string;
+  walletAddress: string;
+  walletIndex?: number;
+}
+
+export interface UserWalletSignResult {
+  txId: string;
+  txHash: string;
+}
+
+export interface UserWalletSignMessageResult {
+  signature: string;
+  address: string;
+}
+
+export interface UserWalletHistoryResult {
+  transactions: TxRecord[];
+  limit: number;
+  offset: number;
+}
+
+export type UserWalletSigner = AgentSigner;
+
+export type UserWalletSignerCreate = Partial<
+  Pick<
+    AgentSignerCreate,
+    "subjectType" | "subjectId" | "address" | "chainFamily" | "label" | "permissions" | "metadata"
+  >
+> & {
+  walletIndex?: number;
+};
+
+export type UserWalletSignerCreateResult = UserWalletSigner & {
+  credentialSecret: string;
+};
+
+export interface UserWalletSignerListResult {
+  signers: UserWalletSigner[];
+}
+
+export interface PregeneratedUserWalletCreateResult {
+  wallets: Array<{
+    agent: AgentIdentity;
+    claimToken: string;
+    claimExpiresAt: string;
+  }>;
+  warning: string;
+}
+
+export interface PregeneratedUserWalletClaimResult {
+  agentId: string;
+  walletAddress: string;
+  walletIndex: number;
+  claimed: true;
 }
 
 /**
@@ -337,6 +2183,14 @@ export const CHAINS: Record<string, ChainIdentifier> = {
     name: "BSC Testnet",
     symbol: "tBNB",
     testnet: true,
+  },
+  "eip155:100": {
+    caip2: "eip155:100",
+    numericId: 100,
+    family: "evm",
+    name: "Gnosis",
+    symbol: "xDAI",
+    testnet: false,
   },
   "eip155:137": {
     caip2: "eip155:137",
@@ -428,6 +2282,7 @@ export type InjectAs = "header" | "query" | "body";
 
 export interface RouteRecord {
   id: string;
+  agentId: string | null;
   secretId: string;
   hostPattern: string;
   pathPattern?: string;
@@ -443,11 +2298,14 @@ export interface RouteRecord {
   bodyPath?: string;
   priority?: number;
   enabled?: boolean;
+  requiresApproval?: boolean;
+  approvalConfig?: Record<string, unknown>;
   createdAt: string;
 }
 
 export interface CreateRoutePayload {
   secretId: string;
+  agentId: string;
   hostPattern: string;
   pathPattern?: string;
   method?: string;
@@ -463,6 +2321,31 @@ export interface CreateRoutePayload {
   bodyPath?: string;
   priority?: number;
   enabled?: boolean;
+  requiresApproval?: boolean;
+  approvalConfig?: Record<string, unknown>;
+}
+
+export type PendingProxyRequestStatus =
+  | "pending"
+  | "approved"
+  | "denied"
+  | "executing"
+  | "executed"
+  | "expired"
+  | "failed";
+export interface PendingProxyRequest {
+  id: string;
+  agentId: string;
+  routeId: string;
+  method: string;
+  targetHost: string;
+  targetPath: string;
+  preview: Record<string, unknown>;
+  status: PendingProxyRequestStatus;
+  expiresAt: string;
+  createdAt?: string;
+  executionStatusCode?: number | null;
+  executionError?: string | null;
 }
 
 export type UpdateRoutePayload = Partial<Omit<CreateRoutePayload, "secretId">>;
@@ -488,6 +2371,53 @@ export interface PolicyTemplateCreate {
 }
 
 export type PolicyTemplateUpdate = Partial<PolicyTemplateCreate>;
+
+// ─── Condition Sets ─────────────────────────────────
+
+export interface ConditionSet {
+  id: string;
+  tenantId: string;
+  name: string;
+  description: string | null;
+  ownerId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConditionSetCreate {
+  name: string;
+  description?: string | null;
+  ownerId: string;
+  metadata?: Record<string, unknown>;
+}
+
+export type ConditionSetUpdate = Partial<ConditionSetCreate>;
+
+export interface ConditionSetItem {
+  id: string;
+  conditionSetId: string;
+  tenantId: string;
+  value: string;
+  label: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConditionSetItemInput {
+  value: string;
+  label?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export type ConditionSetItemUpdate = Partial<ConditionSetItemInput>;
+
+export interface ConditionSetItemListResult {
+  items: ConditionSetItem[];
+  limit: number;
+  offset: number;
+}
 
 /**
  * Transaction-shaped policy simulation request.
@@ -565,6 +2495,31 @@ export interface AuditSummaryResponse {
   policyViolations: number;
   topAgents: Array<{ agentId: string; name: string; txCount: number }>;
   dailyActivity: Array<{ date: string; txCount: number }>;
+}
+
+export interface AuditEventEntry {
+  id: number | string;
+  seq: number;
+  actor_type: string;
+  actor_id?: string | null;
+  action: string;
+  resource_type?: string | null;
+  resource_id?: string | null;
+  metadata: Record<string, unknown>;
+  ip_address?: string | null;
+  user_agent?: string | null;
+  request_id?: string | null;
+  created_at: string;
+}
+
+export interface AuditEventsResponse {
+  data: AuditEventEntry[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
 }
 
 // ─── Tenants ────────────────────────────────────────

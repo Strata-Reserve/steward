@@ -21,6 +21,8 @@ registerSolanaWalletPanel({
     }>,
 });
 
+export type { StewardConnectOrCreateWalletProps } from "../components/StewardConnectOrCreateWallet.js";
+export { StewardConnectOrCreateWallet } from "../components/StewardConnectOrCreateWallet.js";
 export type {
   StewardLoginWithWalletsEvmConfig,
   StewardLoginWithWalletsProps,
@@ -45,3 +47,15 @@ export {
   EVMWalletProvider,
   SolanaWalletProvider,
 } from "../providers/WalletProviders.js";
+export type {
+  StewardEip1193Provider,
+  StewardGlobalWalletConnectorOptions,
+  StewardGlobalWalletOptions,
+  StewardGlobalWalletProviderFactory,
+} from "./global.js";
+export { createStewardGlobalWallet, createStewardGlobalWalletConnector } from "./global.js";
+export type {
+  StewardMetaMaskConnectorOptions,
+  StewardMetaMaskDappMetadata,
+} from "./metamask.js";
+export { createStewardMetaMaskConnector } from "./metamask.js";

@@ -8,6 +8,7 @@
  * Returns null if the path doesn't match any known pattern.
  */
 
+import { isIP } from "node:net";
 import { DEFAULT_ALIASES } from "../config";
 
 export interface ResolvedTarget {
@@ -19,13 +20,74 @@ export interface ResolvedTarget {
   path: string;
 }
 
+function configuredDirectProxyHosts(): Set<string> {
+  return new Set(
+    [
+      ...Object.values(DEFAULT_ALIASES),
+      ...(process.env.STEWARD_PROXY_ALLOWED_HOSTS ?? "")
+        .split(",")
+        .map((host) => host.trim().toLowerCase())
+        .filter(Boolean),
+    ].map((host) => host.toLowerCase()),
+  );
+}
+
+function isBlockedHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  if (isIP(normalized)) return true;
+  if (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized.endsWith(".local") ||
+    normalized.endsWith(".internal")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isPublicDnsHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  if (!normalized.includes(".") || isBlockedHost(normalized)) return false;
+  if (normalized.length > 253) return false;
+  if (
+    !normalized.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isAllowedDirectProxyHost(host: string): boolean {
+  const normalized = host.toLowerCase();
+  if (!isPublicDnsHost(normalized)) return false;
+  return configuredDirectProxyHosts().has(normalized);
+}
+
+function hasUnsafePath(path: string): boolean {
+  if (/[\u0000-\u001f\u007f]/.test(path)) return true;
+  const lowered = path.toLowerCase();
+  if (
+    lowered.includes("%2e") ||
+    lowered.includes("%2f") ||
+    lowered.includes("%5c") ||
+    lowered.includes("\\")
+  ) {
+    return true;
+  }
+  return path.split("/").some((segment) => segment === "." || segment === "..");
+}
+
 /**
  * Resolve a proxy request path to a target URL.
  *
  * @param requestPath - The path from the incoming request (e.g. "/openai/v1/chat/completions")
  * @returns Resolved target or null if path doesn't match any alias or proxy pattern
  */
-export function resolveTarget(requestPath: string): ResolvedTarget | null {
+export function resolveTarget(
+  requestPath: string,
+  options: { governed?: boolean } = {},
+): ResolvedTarget | null {
   // Strip leading slash and split into segments
   const cleaned = requestPath.startsWith("/") ? requestPath.slice(1) : requestPath;
   if (!cleaned) return null;
@@ -35,12 +97,21 @@ export function resolveTarget(requestPath: string): ResolvedTarget | null {
   const remainder = slashIdx === -1 ? "" : cleaned.slice(slashIdx);
 
   // 1. Check named aliases: /openai/... → api.openai.com/...
-  const aliasHost = DEFAULT_ALIASES[firstSegment];
+  const aliasHost = resolveAliasHost(firstSegment);
   if (aliasHost) {
+    const path = remainder || "/";
+    if (hasUnsafePath(path)) return null;
+    // Defense-in-depth: even though current aliases are hardcoded public hosts,
+    // run the alias target through the same SSRF host guard used for direct
+    // proxying. This ensures any future DB-driven / configurable alias can never
+    // resolve to localhost, a private/internal domain, or a bare IP without
+    // being rejected here (in addition to the runtime DNS resolution check).
+    const host = aliasHost.toLowerCase();
+    if (!host.includes(".") || isBlockedHost(host)) return null;
     return {
-      url: `https://${aliasHost}${remainder}`,
-      host: aliasHost,
-      path: remainder || "/",
+      url: `https://${host}${path}`,
+      host,
+      path,
     };
   }
 
@@ -50,11 +121,17 @@ export function resolveTarget(requestPath: string): ResolvedTarget | null {
     if (!afterProxy) return null;
 
     const hostSlashIdx = afterProxy.indexOf("/");
-    const host = hostSlashIdx === -1 ? afterProxy : afterProxy.slice(0, hostSlashIdx);
+    const rawHost = hostSlashIdx === -1 ? afterProxy : afterProxy.slice(0, hostSlashIdx);
+    const host = rawHost.toLowerCase();
     const path = hostSlashIdx === -1 ? "/" : afterProxy.slice(hostSlashIdx);
 
-    // Basic hostname validation
-    if (!host.includes(".")) return null;
+    // Config-driven governed operations bind this exact host to a selected DB
+    // route and carry a non-forgeable in-process execution claim. They must not
+    // require a second environment allowlist. Direct/legacy traffic retains the
+    // explicit STEWARD_PROXY_ALLOWED_HOSTS gate.
+    if (!isAllowedDirectProxyHost(host) && !options.governed) return null;
+    if (!isPublicDnsHost(host)) return null;
+    if (hasUnsafePath(path)) return null;
 
     return {
       url: `https://${host}${path}`,
@@ -64,6 +141,18 @@ export function resolveTarget(requestPath: string): ResolvedTarget | null {
   }
 
   return null;
+}
+
+/**
+ * Resolve a named alias to its target host.
+ *
+ * Single chokepoint for alias → host resolution. When aliases become
+ * configurable (e.g. DB-driven), extend this function rather than reading
+ * DEFAULT_ALIASES directly elsewhere — the SSRF host guard in resolveTarget()
+ * is applied to whatever this returns.
+ */
+function resolveAliasHost(name: string): string | undefined {
+  return DEFAULT_ALIASES[name];
 }
 
 /**

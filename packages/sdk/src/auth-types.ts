@@ -18,10 +18,16 @@ export interface SessionStorage {
 
 export interface StewardUser {
   id: string;
-  email: string;
+  email: string | null;
   walletAddress?: string;
   walletChain?: "ethereum" | "solana";
+  isGuest?: boolean;
+  guestExpiresAt?: string | null;
+  tenantId?: string;
+  alreadyUpgraded?: boolean;
 }
+
+export type StewardMfaMethod = "totp" | "sms" | "passkey" | "recovery_code" | string;
 
 export interface StewardSession {
   /** Raw JWT string (access token, 15 min) */
@@ -31,6 +37,14 @@ export interface StewardSession {
   tenantId: string;
   userId?: string;
   email?: string;
+  isGuest?: boolean;
+  guestExpiresAt?: string | null;
+  /** Unix milliseconds when this session last completed MFA step-up, when present. */
+  mfaVerifiedAt?: number;
+  /** MFA factor used for the current session step-up claim. */
+  mfaMethod?: StewardMfaMethod;
+  /** Unix milliseconds when this session last satisfied factor-enrollment step-up, when present. */
+  factorEnrollmentVerifiedAt?: number;
   /** Expiry as unix timestamp (seconds) — parsed from JWT `exp` claim */
   expiresAt?: number;
   /** The user object returned at sign-in time (if available) */
@@ -49,13 +63,54 @@ export interface StewardAuthResult {
   user: StewardUser;
 }
 
+export interface StewardGuestSignInOptions {
+  tenantId?: string;
+  /** Server accepts bounded durations like "30m", "24h", or "7d". */
+  expiresIn?: string;
+}
+
+export interface StewardGuestState {
+  isGuest: boolean;
+  userId?: string;
+  tenantId?: string;
+  expiresAt?: string | null;
+  expiresAtMs?: number | null;
+  isExpired: boolean;
+  secondsUntilExpiry?: number | null;
+  expiryMessage: string | null;
+}
+
+export interface StewardGuestUpgradeEmailInput {
+  email: string;
+  token: string;
+}
+
+export interface StewardGuestDeleteResult {
+  ok: boolean;
+  deleted: boolean;
+  userId?: string;
+}
+
+export interface StewardMfaRequiredResult {
+  ok: true;
+  mfaRequired: true;
+  mfa: {
+    type: "totp" | "sms" | "passkey";
+    challengeId: string;
+    expiresAt: string;
+  };
+  user: StewardUser;
+}
+
 /** Shared response shape for auth flows that exchange a challenge or callback for a session. */
 export interface StewardAuthExchangeResponse {
   ok: boolean;
-  token: string;
+  token?: string;
   user: StewardUser;
   refreshToken?: string;
   expiresIn?: number;
+  mfaRequired?: boolean;
+  mfa?: StewardMfaRequiredResult["mfa"];
   userId?: string;
   address?: string;
   publicKey?: string;
@@ -67,20 +122,205 @@ export interface StewardAuthExchangeResponse {
   };
 }
 
+export interface StewardEmbeddedWalletLoginConfig {
+  tenantId: string;
+  createOnLogin: "off" | "users-without-wallets" | "all-users";
+}
+
+export interface StewardCurrentUserResult {
+  userId: string;
+  address?: string;
+  email?: string;
+  wallet: { address: string; agentId: string } | null;
+  walletAutoCreated: boolean;
+  embeddedWalletConfig: StewardEmbeddedWalletLoginConfig;
+}
+
 export interface StewardEmailResult {
   ok: boolean;
   expiresAt: string;
+  /** Opaque public challenge id for cross-device email sign-in polling. */
+  challengeId?: string;
+  /** High-entropy secret required with challengeId when polling. Store only client-side. */
+  pollSecret?: string;
+}
+
+export type StewardEmailSignInStatusResult =
+  | { ok: true; status: "pending"; expiresAt?: string }
+  | { ok: true; status: "consumed" | "locked" | "expired" | "invalid" };
+
+export interface StewardSmsOtpResult {
+  ok: boolean;
+  expiresAt: string;
+}
+
+export interface StewardWhatsAppOtpResult {
+  ok: boolean;
+  expiresAt: string;
+}
+
+/**
+ * Result of `sendEmailOtp` — a 6-digit code was emailed (Privy-style signup).
+ * The actual proof-of-ownership is obtained via `verifyEmailOtp`.
+ */
+export interface StewardEmailOtpResult {
+  ok: boolean;
+  /** ISO timestamp the emailed code expires at, when the server provides it. */
+  expiresAt?: string;
+}
+
+/**
+ * Result of `verifyEmailOtp` — a short-lived, single-use grant proving
+ * ownership of the email. Pass `emailGrant` to `addPasskey({ emailGrant })`
+ * so a brand-new, signed-out user can register a passkey WITHOUT a session.
+ */
+export interface StewardEmailGrantResult {
+  ok: boolean;
+  /** Single-use grant token bound to {email, tenant}. Expires shortly. */
+  emailGrant: string;
+  /** Seconds until the grant expires (server-provided). */
+  expiresInSeconds: number;
+}
+
+export interface StewardTestAccountLoginOptions {
+  tenantId?: string;
+  email?: string;
+  phone?: string;
+  otp: string;
+}
+
+export interface StewardTelegramLoginPayload {
+  id: string | number;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  photo_url?: string;
+  auth_date: string | number;
+  hash: string;
+  [key: string]: string | number | boolean | null | undefined;
+}
+
+export interface StewardTelegramLoginConfig {
+  tenantId?: string;
+}
+
+export interface StewardFarcasterLoginPayload {
+  message: string;
+  signature: string;
+  custodyAddress?: string;
+  address?: string;
+  fid?: string | number;
+  username?: string;
+  displayName?: string;
+  pfpUrl?: string;
+  pfp?: string;
+}
+
+export interface StewardFarcasterLoginConfig {
+  tenantId?: string;
+}
+
+export interface StewardTotpEnrollResult {
+  ok: boolean;
+  secret: string;
+  otpauthUri: string;
+  expiresAt: string;
+}
+
+export interface StewardTotpVerifyResult {
+  ok: boolean;
+  enabled?: boolean;
+  verified?: boolean;
+  recoveryCodes?: string[];
+}
+
+export interface StewardTotpStatus {
+  ok: boolean;
+  enabled: boolean;
+  pending: boolean;
+}
+
+export interface StewardRecoveryCodeStatus {
+  ok: boolean;
+  enabled: boolean;
+  remaining: number;
+}
+
+export interface StewardRecoveryCodesResult {
+  ok: boolean;
+  recoveryCodes: string[];
+}
+
+export interface StewardSmsMfaStatus {
+  ok: boolean;
+  enabled: boolean;
+  pending: boolean;
+  phone?: string;
+}
+
+export interface StewardSmsMfaEnrollResult {
+  ok: boolean;
+  phone: string;
+  expiresAt: string;
+}
+
+export interface StewardSmsMfaVerifyResult {
+  ok: boolean;
+  enabled: boolean;
+  phone: string;
+}
+
+export interface StewardLinkedAccount {
+  id: string;
+  provider: string;
+  providerAccountId: string;
+  expiresAt: number | null;
+}
+
+export interface StewardIdentityClaims {
+  sub: string;
+  userId: string;
+  tenantId: string;
+  email: string | null;
+  emailVerified: boolean | null;
+  name: string | null;
+  image: string | null;
+  walletAddress: string | null;
+  walletChain: string | null;
+  customMetadata: Record<string, unknown>;
+  tenantIds: string[];
+  linkedAccounts: StewardLinkedAccount[];
+}
+
+export interface StewardIdentityTokenResult {
+  ok: boolean;
+  token: string;
+  expiresIn: number;
+  claims: StewardIdentityClaims;
+  user: {
+    id: string;
+    email: string | null;
+    walletAddress?: string | null;
+    walletChain?: string | null;
+    emailVerified?: boolean | null;
+    name?: string | null;
+    image?: string | null;
+    customMetadata?: Record<string, unknown>;
+    linkedAccounts?: StewardLinkedAccount[];
+  };
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 export interface StewardAuthConfig {
-  /** Base URL of the Steward API, e.g. "https://api.steward.fi" */
+  /** Base URL of the Steward API, e.g. "http://localhost:3200" for a self-hosted instance */
   baseUrl: string;
   /**
-   * Optional storage backend for persisting the JWT.
-   * Defaults to in-memory (session lost on page reload / process restart).
-   * Pass `localStorage` or `sessionStorage` in browsers for persistence.
+   * Optional storage backend for persisting access and refresh tokens.
+   * Defaults to in-memory (session lost on page reload / process restart) so
+   * browser XSS cannot read long-lived refresh tokens from localStorage by default.
+   * Pass `sessionStorage`, `localStorage`, or a custom implementation only when
+   * that persistence tradeoff is explicit.
    */
   storage?: SessionStorage;
   /**
@@ -93,6 +333,23 @@ export interface StewardAuthConfig {
    * When set, all sign-in methods include this tenantId in requests.
    */
   tenantId?: string;
+  /**
+   * Optional same-origin auth proxy prefix (e.g. "/api/auth") that holds the
+   * long-lived refresh token in an HttpOnly, SameSite=Strict cookie the page's
+   * JavaScript cannot read. When set:
+   *   - sign-in deposits the refresh token with the proxy instead of `storage`;
+   *   - refresh / revoke / tenant-switch calls go to the proxy, which injects
+   *     the cookie-held token before forwarding to the Steward API;
+   *   - only the short-lived access token is kept in `storage`.
+   * Leave unset to keep refresh tokens in `storage` (default, unchanged).
+   */
+  authProxyUrl?: string;
+  /**
+   * Permit a plaintext non-loopback baseUrl (warns at construction). HTTPS is
+   * required by default so session credentials never travel cleartext
+   * off-loopback.
+   */
+  allowInsecureBaseUrl?: boolean;
 }
 
 /** Response shape from POST /auth/refresh */
@@ -100,6 +357,47 @@ export interface StewardRefreshResult {
   token: string;
   refreshToken: string;
   expiresIn: number;
+}
+
+// ─── Device authorization types ──────────────────────────────────────────────
+
+export interface StewardDeviceCodeOptions {
+  tenantId?: string;
+  clientId?: string;
+  scope?: string;
+}
+
+export interface StewardDeviceCodeResult {
+  ok: boolean;
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete: string;
+  expires_in: number;
+  interval: number;
+  tenantId: string;
+  client_id?: string;
+}
+
+export type StewardDeviceTokenError =
+  | "authorization_pending"
+  | "slow_down"
+  | "access_denied"
+  | "expired_token"
+  | "invalid_client"
+  | "invalid_request"
+  | "unsupported_grant_type";
+
+export interface StewardDeviceTokenPendingResult {
+  ok: false;
+  error: StewardDeviceTokenError;
+  interval?: number;
+}
+
+export interface StewardDeviceVerifyResult {
+  ok: boolean;
+  status: "approved" | "denied";
+  tenantId: string;
 }
 
 // ─── OAuth types ──────────────────────────────────────────────────────────────
@@ -128,6 +426,11 @@ export interface StewardOAuthResult extends StewardAuthResult {
   provider: string;
 }
 
+export interface StewardJwtLoginConfig {
+  tenantId: string;
+  providerId?: string;
+}
+
 /**
  * Discovery response from GET /auth/providers.
  * Indicates which authentication methods are enabled on the server.
@@ -135,14 +438,33 @@ export interface StewardOAuthResult extends StewardAuthResult {
 export interface StewardProviders {
   passkey: boolean;
   email: boolean;
+  sms?: boolean;
+  whatsapp?: boolean;
+  totp?: boolean;
   siwe: boolean;
   siws: boolean;
   google: boolean;
   discord: boolean;
   github: boolean;
   twitter: boolean;
+  telegram?: boolean;
+  farcaster?: boolean;
+  linkedin?: boolean;
+  spotify?: boolean;
+  twitch?: boolean;
+  instagram?: boolean;
+  line?: boolean;
+  jwt?: boolean;
+  oidc?: string[];
+  captcha?: {
+    enabled?: boolean;
+    provider?: "turnstile" | "hcaptcha";
+    siteKey?: string;
+    requiredFor?: Array<"email_otp" | "sms_otp">;
+  };
   /** List of all enabled OAuth provider names */
   oauth: string[];
+  disabled?: string[];
 }
 
 // ─── Multi-tenant types ───────────────────────────────────────────────────────

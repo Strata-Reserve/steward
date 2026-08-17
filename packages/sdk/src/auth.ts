@@ -7,7 +7,7 @@
  *   - SIWE (Sign-In With Ethereum) — browser + Node
  *
  * Usage:
- *   const auth = new StewardAuth({ baseUrl: "https://api.steward.fi" });
+ *   const auth = new StewardAuth({ baseUrl: "http://localhost:3200" });
  *   const { token, user } = await auth.signInWithPasskey("me@example.com");
  *   const client = new StewardClient({ baseUrl, bearerToken: auth.getToken() });
  */
@@ -18,15 +18,46 @@ import type {
   StewardAuthConfig,
   StewardAuthExchangeResponse,
   StewardAuthResult,
+  StewardCurrentUserResult,
+  StewardDeviceCodeOptions,
+  StewardDeviceCodeResult,
+  StewardDeviceTokenPendingResult,
+  StewardDeviceVerifyResult,
+  StewardEmailGrantResult,
+  StewardEmailOtpResult,
   StewardEmailResult,
+  StewardEmailSignInStatusResult,
+  StewardFarcasterLoginConfig,
+  StewardFarcasterLoginPayload,
+  StewardGuestDeleteResult,
+  StewardGuestSignInOptions,
+  StewardGuestState,
+  StewardGuestUpgradeEmailInput,
+  StewardIdentityTokenResult,
+  StewardJwtLoginConfig,
+  StewardMfaRequiredResult,
   StewardOAuthConfig,
   StewardOAuthResult,
   StewardProviders,
+  StewardRecoveryCodeStatus,
+  StewardRecoveryCodesResult,
   StewardRefreshResult,
   StewardSession,
+  StewardSmsMfaEnrollResult,
+  StewardSmsMfaStatus,
+  StewardSmsMfaVerifyResult,
+  StewardSmsOtpResult,
+  StewardTelegramLoginConfig,
+  StewardTelegramLoginPayload,
   StewardTenantMembership,
+  StewardTestAccountLoginOptions,
+  StewardTotpEnrollResult,
+  StewardTotpStatus,
+  StewardTotpVerifyResult,
   StewardUser,
+  StewardWhatsAppOtpResult,
 } from "./auth-types.ts";
+import { assertSecureBaseUrl } from "./base-url.ts";
 import { StewardApiError } from "./client.ts";
 
 // ─── Storage key ──────────────────────────────────────────────────────────────
@@ -35,9 +66,20 @@ const STORAGE_KEY = "steward_session_token";
 const REFRESH_TOKEN_KEY = "steward_refresh_token";
 const OAUTH_STATE_KEY = "steward_oauth_state";
 const OAUTH_VERIFIER_KEY = "steward_oauth_verifier";
+const OAUTH_TENANT_KEY = "steward_oauth_tenant";
+
+/**
+ * Header the same-origin auth proxy (see `authProxyUrl`) requires on every
+ * call. A cross-site form/fetch cannot attach custom headers without a CORS
+ * preflight, so this is CSRF defense-in-depth on top of the proxy's
+ * SameSite=Strict refresh cookie.
+ */
+const AUTH_PROXY_HEADER = "x-steward-auth-proxy";
+const AUTH_PROXY_HEADERS = { [AUTH_PROXY_HEADER]: "1" } as const;
 
 /** Kick off a token refresh when fewer than this many seconds remain on the access token */
 const REFRESH_THRESHOLD_SECS = 120;
+const GUEST_EXPIRY_WARNING_DAYS = 30;
 
 // ─── Minimal JWT decode (no verification — server already verified) ───────────
 
@@ -59,15 +101,70 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
 function sessionFromToken(token: string, user?: StewardUser): StewardSession | null {
   const payload = decodeJwtPayload(token);
   if (!payload) return null;
+  const mfaVerifiedAt =
+    typeof payload.mfaVerifiedAt === "number" && Number.isFinite(payload.mfaVerifiedAt)
+      ? payload.mfaVerifiedAt
+      : undefined;
+  const factorEnrollmentVerifiedAt =
+    typeof payload.factorEnrollmentVerifiedAt === "number" &&
+    Number.isFinite(payload.factorEnrollmentVerifiedAt)
+      ? payload.factorEnrollmentVerifiedAt
+      : undefined;
   return {
     token,
     address: (payload.address as string) ?? "",
     tenantId: (payload.tenantId as string) ?? "",
     userId: payload.userId as string | undefined,
     email: payload.email as string | undefined,
+    isGuest: payload.guest === true,
+    guestExpiresAt: typeof payload.guestExpiresAt === "string" ? payload.guestExpiresAt : null,
+    mfaVerifiedAt,
+    mfaMethod: typeof payload.mfaMethod === "string" ? payload.mfaMethod : undefined,
+    factorEnrollmentVerifiedAt,
     expiresAt: payload.exp as number | undefined,
     user,
   };
+}
+
+function guestExpiryMessage(expiresAtMs: number | null | undefined): string | null {
+  if (!expiresAtMs || Number.isNaN(expiresAtMs)) return null;
+  const remainingMs = expiresAtMs - Date.now();
+  if (remainingMs <= 0) return "Guest account expired. Sign in or start a new guest session.";
+  const days = Math.ceil(remainingMs / 86_400_000);
+  if (days > GUEST_EXPIRY_WARNING_DAYS) return null;
+  if (days <= 1) return "Guest account expires today. Upgrade to keep your wallet and data.";
+  return `Guest account expires in ${days} days. Upgrade to keep your wallet and data.`;
+}
+
+function getOAuthCallbackParams(url: URL): { code?: string; state?: string; error?: string } {
+  const params = new URLSearchParams(url.search);
+  const fragment = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
+  if (fragment) {
+    const hashParams = new URLSearchParams(fragment);
+    hashParams.forEach((value, key) => {
+      if (!params.has(key)) params.set(key, value);
+    });
+  }
+  return {
+    code: params.get("code") ?? undefined,
+    state: params.get("state") ?? undefined,
+    error: params.get("error") ?? undefined,
+  };
+}
+
+/**
+ * Bind an OAuth callback message to the exact popup opened for this attempt.
+ * Checking only `event.origin` lets any same-origin window race the real popup
+ * and inject a forged error/code. PKCE/state still protect the token exchange,
+ * but rejecting unrelated windows avoids callback confusion and denial of
+ * service before those checks run.
+ */
+function isTrustedOAuthPopupMessage(
+  event: Pick<MessageEvent, "origin" | "source">,
+  popup: Window,
+  expectedOrigin: string,
+): boolean {
+  return event.origin === expectedOrigin && event.source === popup;
 }
 
 // ─── In-memory fallback storage ───────────────────────────────────────────────
@@ -101,7 +198,22 @@ function getSignInOrigin(): { domain: string; origin: string } {
     : { domain: "steward.fi", origin: "https://steward.fi" };
 }
 
-function buildSiweMessage(address: string, nonce: string, issuedAt: string): string {
+// Default EVM chain id (Ethereum mainnet) used only when the caller does not
+// supply the wallet's actually-connected chain. The server reads the Chain ID
+// from the signed message itself (siwe parses it, and it is used for EIP-1271
+// smart-contract-wallet lookups) rather than hardcode-comparing it, so passing
+// the wallet's real chain id is both safe for existing verification and more
+// correct for non-mainnet wallets (e.g. Base, BSC).
+const DEFAULT_EVM_CHAIN_ID = 1;
+// Default SIWS network used only when the caller does not supply one.
+const DEFAULT_SOLANA_CHAIN = "mainnet";
+
+function buildSiweMessage(
+  address: string,
+  nonce: string,
+  issuedAt: string,
+  chainId: number = DEFAULT_EVM_CHAIN_ID,
+): string {
   const { domain, origin } = getSignInOrigin();
   return [
     `${domain} wants you to sign in with your Ethereum account:`,
@@ -111,13 +223,18 @@ function buildSiweMessage(address: string, nonce: string, issuedAt: string): str
     "",
     `URI: ${origin}`,
     "Version: 1",
-    "Chain ID: 1",
+    `Chain ID: ${chainId}`,
     `Nonce: ${nonce}`,
     `Issued At: ${issuedAt}`,
   ].join("\n");
 }
 
-function buildSiwsMessage(publicKey: string, nonce: string, issuedAt: string): string {
+function buildSiwsMessage(
+  publicKey: string,
+  nonce: string,
+  issuedAt: string,
+  chain: string = DEFAULT_SOLANA_CHAIN,
+): string {
   const { domain, origin } = getSignInOrigin();
   return [
     `${domain} wants you to sign in with your Solana account:`,
@@ -127,7 +244,7 @@ function buildSiwsMessage(publicKey: string, nonce: string, issuedAt: string): s
     "",
     `URI: ${origin}`,
     "Version: 1",
-    "Chain ID: mainnet",
+    `Chain ID: ${chain}`,
     `Nonce: ${nonce}`,
     `Issued At: ${issuedAt}`,
   ].join("\n");
@@ -200,17 +317,26 @@ export class StewardAuth {
   private readonly baseUrl: string;
   private readonly storage: SessionStorage;
   private readonly tenantId: string | undefined;
+  private readonly authProxyUrl: string | undefined;
   private readonly listeners: Array<(session: StewardSession | null) => void> = [];
 
-  constructor({ baseUrl, storage, onSessionChange, tenantId }: StewardAuthConfig) {
+  constructor({
+    baseUrl,
+    storage,
+    onSessionChange,
+    tenantId,
+    authProxyUrl,
+    allowInsecureBaseUrl,
+  }: StewardAuthConfig) {
+    assertSecureBaseUrl(baseUrl, allowInsecureBaseUrl);
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.tenantId = tenantId;
+    this.authProxyUrl = authProxyUrl ? authProxyUrl.replace(/\/+$/, "") : undefined;
 
-    // Use provided storage, else localStorage when in browser, else in-memory
+    // Use caller-provided storage only. Tokens default to memory so a browser
+    // XSS cannot read long-lived refresh tokens from localStorage by default.
     if (storage) {
       this.storage = storage;
-    } else if (isBrowser() && typeof localStorage !== "undefined") {
-      this.storage = localStorage;
     } else {
       this.storage = new MemoryStorage();
     }
@@ -290,6 +416,159 @@ export class StewardAuth {
   }
 
   /**
+   * Fetch the authenticated user's bootstrap payload. When a tenant is
+   * configured, it is sent as both query and header so backend app-level
+   * create-on-login wallet config can resolve without exposing platform keys.
+   */
+  async getCurrentUser(options: { tenantId?: string } = {}): Promise<StewardCurrentUserResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+    const tenantId = options.tenantId ?? this.tenantId;
+    const path = tenantId ? `/user/me?tenantId=${encodeURIComponent(tenantId)}` : "/user/me";
+    const res = await authRequest<{
+      ok: boolean;
+      data: StewardCurrentUserResult;
+    }>(
+      this.baseUrl,
+      path,
+      {
+        headers: tenantId ? { "X-Steward-Tenant": tenantId } : undefined,
+      },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data.data;
+  }
+
+  /**
+   * Create or replace the current local session with a bounded guest account.
+   * Guest sessions are persisted through the configured storage just like other
+   * auth flows, so reloads can continue until the server-side guest expiry.
+   */
+  async signInAsGuest(options: StewardGuestSignInOptions = {}): Promise<StewardAuthResult> {
+    const body: Record<string, unknown> = {};
+    const tenantId = options.tenantId ?? this.tenantId;
+    if (tenantId) body.tenantId = tenantId;
+    if (options.expiresIn) body.expiresIn = options.expiresIn;
+
+    const res = await authRequest<StewardAuthExchangeResponse>(this.baseUrl, "/auth/guest", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return (await this.storeExchangeResponse(res.data)) as StewardAuthResult;
+  }
+
+  /**
+   * Returns guest lifecycle state for the current session, including the
+   * 30-day expiry warning copy consumers can surface in their own UI.
+   */
+  getGuestState(): StewardGuestState {
+    const session = this.getSession();
+    if (!session?.isGuest) {
+      return {
+        isGuest: false,
+        isExpired: false,
+        expiryMessage: null,
+      };
+    }
+    const expiresAtMs = session.guestExpiresAt ? Date.parse(session.guestExpiresAt) : null;
+    const isExpired = !!expiresAtMs && expiresAtMs <= Date.now();
+    const secondsUntilExpiry =
+      expiresAtMs && !Number.isNaN(expiresAtMs)
+        ? Math.max(0, Math.floor((expiresAtMs - Date.now()) / 1000))
+        : null;
+    return {
+      isGuest: true,
+      userId: session.userId,
+      tenantId: session.tenantId,
+      expiresAt: session.guestExpiresAt ?? null,
+      expiresAtMs: expiresAtMs && !Number.isNaN(expiresAtMs) ? expiresAtMs : null,
+      isExpired,
+      secondsUntilExpiry,
+      expiryMessage: guestExpiryMessage(expiresAtMs),
+    };
+  }
+
+  /**
+   * Upgrade the current guest into a full user using a verified email magic-link
+   * token. This is intentionally guest-only: callers signed into a full account
+   * must not use this path to merge guest data into an existing identity.
+   */
+  async upgradeGuestWithEmail(
+    input: StewardGuestUpgradeEmailInput,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in as a guest first.", 0);
+    if (!this.getGuestState().isGuest) {
+      throw new StewardApiError("Current session is not a guest account.", 0);
+    }
+    const email = input.email.trim();
+    if (!email || !input.token.trim()) {
+      throw new StewardApiError("email and token are required to upgrade a guest", 0);
+    }
+
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/guest/upgrade",
+      {
+        method: "POST",
+        body: JSON.stringify({ method: "email", email, token: input.token }),
+      },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return await this.storeExchangeResponse(res.data);
+  }
+
+  /**
+   * Explicitly delete the current guest account server-side and clear local
+   * persisted tokens. Full accounts are rejected locally and by the API.
+   */
+  async deleteGuest(): Promise<StewardGuestDeleteResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in as a guest first.", 0);
+    if (!this.getGuestState().isGuest) {
+      throw new StewardApiError("Current session is not a guest account.", 0);
+    }
+
+    const res = await authRequest<{ ok: boolean; deleted: boolean; userId?: string }>(
+      this.baseUrl,
+      "/auth/guest",
+      { method: "DELETE" },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    this.clearToken();
+    this.notifyListeners(null);
+    return res.data;
+  }
+
+  async getIdentityToken(): Promise<StewardIdentityTokenResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardIdentityTokenResult>(
+      this.baseUrl,
+      "/auth/identity-token",
+      {},
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  /**
    * Clears the stored session (both tokens) and notifies listeners.
    */
   signOut(): void {
@@ -303,6 +582,9 @@ export class StewardAuth {
    * Returns the new session, or null if the refresh token is missing or invalid.
    */
   async refreshSession(): Promise<StewardSession | null> {
+    if (this.authProxyUrl) {
+      return this.refreshViaProxy();
+    }
     const refreshToken = this.getRefreshToken();
     if (!refreshToken) return null;
 
@@ -335,6 +617,19 @@ export class StewardAuth {
    * Also clears local session state.
    */
   async revokeSession(): Promise<void> {
+    if (this.authProxyUrl) {
+      // The proxy injects the cookie-held refresh token and clears the cookie.
+      await authRequest(this.authProxyUrl, "/revoke", {
+        method: "POST",
+        headers: AUTH_PROXY_HEADERS,
+        body: JSON.stringify({}),
+      }).catch(() => {
+        /* best-effort */
+      });
+      this.clearToken();
+      this.notifyListeners(null);
+      return;
+    }
     const refreshToken = this.getRefreshToken();
     if (refreshToken) {
       await authRequest(this.baseUrl, "/auth/revoke", {
@@ -346,6 +641,90 @@ export class StewardAuth {
     }
     this.clearToken();
     this.notifyListeners(null);
+  }
+
+  async requestDeviceCode(
+    options: StewardDeviceCodeOptions = {},
+  ): Promise<StewardDeviceCodeResult> {
+    const tenantId = options.tenantId ?? this.tenantId;
+    if (!tenantId) {
+      throw new StewardApiError("tenantId is required for device authorization", 400);
+    }
+    const res = await authRequest<StewardDeviceCodeResult>(this.baseUrl, "/auth/device/code", {
+      method: "POST",
+      body: JSON.stringify({
+        tenantId,
+        ...(options.clientId ? { client_id: options.clientId } : {}),
+        ...(options.scope ? { scope: options.scope } : {}),
+      }),
+    });
+    if (!res.ok) throw new StewardApiError(res.error, res.status);
+    return res.data;
+  }
+
+  async verifyDeviceCode(
+    userCode: string,
+    action: "approve" | "deny" = "approve",
+  ): Promise<StewardDeviceVerifyResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+    const res = await authRequest<StewardDeviceVerifyResult>(
+      this.baseUrl,
+      "/auth/device/verify",
+      {
+        method: "POST",
+        body: JSON.stringify({ user_code: userCode, action }),
+      },
+      token,
+    );
+    if (!res.ok) throw new StewardApiError(res.error, res.status);
+    return res.data;
+  }
+
+  async pollDeviceToken(input: {
+    deviceCode: string;
+    clientId?: string;
+  }): Promise<StewardAuthResult | StewardDeviceTokenPendingResult> {
+    const response = await fetch(`${this.baseUrl}/auth/device/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+        device_code: input.deviceCode,
+        ...(input.clientId ? { client_id: input.clientId } : {}),
+      }),
+    }).catch((err) => {
+      throw new StewardApiError(err instanceof Error ? err.message : "Network request failed", 0);
+    });
+
+    const text = await response.text();
+    const payload = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    if (!response.ok || payload.ok === false) {
+      const error = typeof payload.error === "string" ? payload.error : `status_${response.status}`;
+      if (
+        error === "authorization_pending" ||
+        error === "slow_down" ||
+        error === "access_denied" ||
+        error === "expired_token" ||
+        error === "invalid_client" ||
+        error === "invalid_request" ||
+        error === "unsupported_grant_type"
+      ) {
+        return {
+          ok: false,
+          error,
+          ...(typeof payload.interval === "number" ? { interval: payload.interval } : {}),
+        };
+      }
+      throw new StewardApiError(error, response.status);
+    }
+
+    return (await this.storeExchangeResponse(
+      payload as unknown as StewardAuthExchangeResponse,
+    )) as StewardAuthResult;
   }
 
   /**
@@ -368,7 +747,7 @@ export class StewardAuth {
    * Requires a browser environment and `@simplewebauthn/browser` installed.
    * Throws `StewardApiError` in Node or when the dependency is missing.
    */
-  async signInWithPasskey(email: string): Promise<StewardAuthResult> {
+  async signInWithPasskey(email: string): Promise<StewardAuthResult | StewardMfaRequiredResult> {
     if (!isBrowser()) {
       throw new StewardApiError(
         "Passkeys require a browser environment. Use signInWithEmail or signInWithSIWE in Node.",
@@ -413,11 +792,54 @@ export class StewardAuth {
     throw new StewardApiError(loginOptsRes.error, loginOptsRes.status);
   }
 
+  /**
+   * Register a new passkey for the given email, regardless of whether the
+   * user already has other passkeys on other relying parties (RPs).
+   *
+   * Use this after a successful magic-link / OAuth sign-in to offer the
+   * user one-tap passkey login on the current device. Existing passkeys
+   * for this user on OTHER RPs (e.g. a passkey from `elizacloud.ai` when
+   * the user is now on `waifu.fun`) won’t be removed; this just adds a
+   * fresh credential bound to the current origin’s RP.
+   *
+   * Behavior mirrors `signInWithPasskey` when no credentials exist, except
+   * it skips the login-options probe and goes straight to registration.
+   *
+   * Requires a browser environment and `@simplewebauthn/browser` installed.
+   * Throws `StewardApiError` otherwise.
+   */
+  async addPasskey(
+    email: string,
+    options: { emailGrant?: string } = {},
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    if (!isBrowser()) {
+      throw new StewardApiError("Passkeys require a browser environment.", 0);
+    }
+    let browserLib: SimpleWebAuthnBrowser;
+    try {
+      browserLib = await import("@simplewebauthn/browser");
+    } catch {
+      throw new StewardApiError(
+        "Missing peer dependency: @simplewebauthn/browser. Install it to use passkeys.",
+        0,
+      );
+    }
+    return this.completePasskeyRegister(email, browserLib, options.emailGrant);
+  }
+
   private async completePasskeyLogin(
     email: string,
     options: unknown,
     lib: Pick<SimpleWebAuthnBrowser, "startAuthentication">,
-  ): Promise<StewardAuthResult> {
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const challengeId =
+      options && typeof options === "object" && "challengeId" in options
+        ? String((options as { challengeId?: unknown }).challengeId ?? "")
+        : "";
+    if (!challengeId) {
+      throw new StewardApiError("Passkey login options did not include a challengeId.", 0);
+    }
+
     let authResponse: unknown;
     try {
       // Server-provided options; types are validated by the WebAuthn browser library.
@@ -438,6 +860,7 @@ export class StewardAuth {
         method: "POST",
         body: JSON.stringify({
           email,
+          challengeId,
           response: authResponse,
           ...(this.tenantId ? { tenantId: this.tenantId } : {}),
         }),
@@ -448,19 +871,19 @@ export class StewardAuth {
       throw new StewardApiError(verifyRes.error, verifyRes.status);
     }
 
-    return this.storeAndReturn(
-      verifyRes.data.token,
-      (verifyRes.data as { refreshToken?: string }).refreshToken ?? "",
-      verifyRes.data.user,
-      (verifyRes.data as { expiresIn?: number }).expiresIn,
-    );
+    return await this.storeExchangeResponse(verifyRes.data);
   }
 
   private async completePasskeyRegister(
     email: string,
     lib: Pick<SimpleWebAuthnBrowser, "startRegistration">,
-  ): Promise<StewardAuthResult> {
-    // Fetch registration options
+    emailGrant?: string,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    // Fetch registration options. When an `emailGrant` is supplied (from
+    // `verifyEmailOtp`), Steward accepts it in place of a session so a
+    // brand-new, signed-out user can register their FIRST passkey — the
+    // grant proves ownership of the email. Without it, register/options
+    // requires an authenticated session.
     const regOptsRes = await authRequest<Record<string, unknown>>(
       this.baseUrl,
       "/auth/passkey/register/options",
@@ -468,6 +891,7 @@ export class StewardAuth {
         method: "POST",
         body: JSON.stringify({
           email,
+          ...(emailGrant ? { emailGrant } : {}),
           ...(this.tenantId ? { tenantId: this.tenantId } : {}),
         }),
       },
@@ -498,6 +922,7 @@ export class StewardAuth {
         body: JSON.stringify({
           email,
           response: regResponse,
+          ...(emailGrant ? { emailGrant } : {}),
           ...(this.tenantId ? { tenantId: this.tenantId } : {}),
         }),
       },
@@ -507,12 +932,7 @@ export class StewardAuth {
       throw new StewardApiError(verifyRes.error, verifyRes.status);
     }
 
-    return this.storeAndReturn(
-      verifyRes.data.token,
-      (verifyRes.data as { refreshToken?: string }).refreshToken ?? "",
-      verifyRes.data.user,
-      (verifyRes.data as { expiresIn?: number }).expiresIn,
-    );
+    return await this.storeExchangeResponse(verifyRes.data);
   }
 
   // ─── Email magic link ───────────────────────────────────────────────────────
@@ -521,12 +941,13 @@ export class StewardAuth {
    * Send a magic link to the given email address.
    * Returns `{ ok: true, expiresAt }` — the actual sign-in happens in `verifyEmailCallback`.
    */
-  async signInWithEmail(email: string): Promise<StewardEmailResult> {
+  async signInWithEmail(email: string, captchaToken?: string): Promise<StewardEmailResult> {
     // API shape: { ok: true, data: { expiresAt: string } }
     const res = await authRequest<Record<string, unknown>>(this.baseUrl, "/auth/email/send", {
       method: "POST",
       body: JSON.stringify({
         email,
+        ...(captchaToken ? { captchaToken } : {}),
         ...(this.tenantId ? { tenantId: this.tenantId } : {}),
       }),
     });
@@ -536,19 +957,27 @@ export class StewardAuth {
     }
 
     // Unwrap the expiresAt — may sit directly on the response or inside `data`
+    const data = res.data.data as
+      | { expiresAt?: string; challengeId?: string; pollSecret?: string }
+      | undefined;
     const expiresAt =
-      typeof res.data.expiresAt === "string"
-        ? res.data.expiresAt
-        : ((res.data.data as { expiresAt?: string } | undefined)?.expiresAt ?? "");
+      typeof res.data.expiresAt === "string" ? res.data.expiresAt : (data?.expiresAt ?? "");
+    const challengeId =
+      typeof res.data.challengeId === "string" ? res.data.challengeId : data?.challengeId;
+    const pollSecret =
+      typeof res.data.pollSecret === "string" ? res.data.pollSecret : data?.pollSecret;
 
-    return { ok: true, expiresAt };
+    return { ok: true, expiresAt, challengeId, pollSecret };
   }
 
   /**
    * Exchange a magic link token for a session JWT.
    * Call this from the callback URL handler with the `token` and `email` query params.
    */
-  async verifyEmailCallback(token: string, email: string): Promise<StewardAuthResult> {
+  async verifyEmailCallback(
+    token: string,
+    email: string,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
     const res = await authRequest<StewardAuthExchangeResponse>(this.baseUrl, "/auth/email/verify", {
       method: "POST",
       body: JSON.stringify({
@@ -562,12 +991,715 @@ export class StewardAuth {
       throw new StewardApiError(res.error, res.status);
     }
 
-    return this.storeAndReturn(
+    return await this.storeExchangeResponse(res.data);
+  }
+
+  async verifyEmailSignInCode(
+    email: string,
+    code: string,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/email/code/verify",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          email,
+          code,
+          ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeExchangeResponse(res.data);
+  }
+
+  async pollEmailSignInStatus(
+    challengeId: string,
+    pollSecret: string,
+  ): Promise<StewardEmailSignInStatusResult> {
+    const res = await authRequest<{ ok: true; data?: { status?: string; expiresAt?: string } }>(
+      this.baseUrl,
+      "/auth/email/status",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          challengeId,
+          pollSecret,
+          ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    const payload = res.data;
+    const status = payload.data?.status;
+    if (
+      status === "pending" ||
+      status === "consumed" ||
+      status === "locked" ||
+      status === "expired" ||
+      status === "invalid"
+    ) {
+      return {
+        ok: true,
+        status,
+        ...(status === "pending" ? { expiresAt: payload.data?.expiresAt } : {}),
+      };
+    }
+    throw new StewardApiError("Email sign-in status response was malformed.", res.status);
+  }
+
+  // ─── SMS OTP ───────────────────────────────────────────────────────────────
+
+  async sendSmsOtp(phone: string, captchaToken?: string): Promise<StewardSmsOtpResult> {
+    const res = await authRequest<StewardSmsOtpResult>(this.baseUrl, "/auth/sms/send", {
+      method: "POST",
+      body: JSON.stringify({
+        phone,
+        ...(captchaToken ? { captchaToken } : {}),
+        ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+      }),
+    });
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return res.data;
+  }
+
+  async verifySmsOtp(
+    phone: string,
+    code: string,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const res = await authRequest<StewardAuthExchangeResponse>(this.baseUrl, "/auth/sms/verify", {
+      method: "POST",
+      body: JSON.stringify({
+        phone,
+        code,
+        ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+      }),
+    });
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeExchangeResponse(res.data);
+  }
+
+  // ─── WhatsApp OTP ─────────────────────────────────────────────────────────
+
+  async sendWhatsAppOtp(phone: string, captchaToken?: string): Promise<StewardWhatsAppOtpResult> {
+    const res = await authRequest<StewardWhatsAppOtpResult>(this.baseUrl, "/auth/whatsapp/send", {
+      method: "POST",
+      body: JSON.stringify({
+        phone,
+        ...(captchaToken ? { captchaToken } : {}),
+        ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+      }),
+    });
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return res.data;
+  }
+
+  async verifyWhatsAppOtp(
+    phone: string,
+    code: string,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/whatsapp/verify",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          phone,
+          code,
+          ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeExchangeResponse(res.data);
+  }
+
+  // ─── Email OTP (Privy-style verified signup) ──────────────────────────
+
+  /**
+   * Email a 6-digit one-time code (Privy-style signup). Unlike
+   * `signInWithEmail` (magic link), this issues a code the user types back
+   * via `verifyEmailOtp` to obtain an `emailGrant`. The grant lets a
+   * brand-new, signed-out user register their first passkey with
+   * `addPasskey(email, { emailGrant })` — no prior session required.
+   */
+  async sendEmailOtp(email: string, captchaToken?: string): Promise<StewardEmailOtpResult> {
+    // authRequest returns the raw `{ ok, data }` envelope; the send route's
+    // payload (e.g. { expiresAt }) is nested under `data`.
+    const res = await authRequest<{ ok: boolean; data?: { expiresAt?: string } }>(
+      this.baseUrl,
+      "/auth/email/otp/send",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          email,
+          ...(captchaToken ? { captchaToken } : {}),
+          ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return { ok: true, expiresAt: res.data?.data?.expiresAt };
+  }
+
+  /**
+   * Exchange the 6-digit code from `sendEmailOtp` for a short-lived,
+   * single-use `emailGrant` proving ownership of the email. Pass the grant
+   * to `addPasskey(email, { emailGrant })`.
+   *
+   * NOTE: this does NOT sign the user in by itself — it returns proof of
+   * email ownership, intentionally decoupled so the caller drives the
+   * passkey registration step.
+   */
+  async verifyEmailOtp(email: string, code: string): Promise<StewardEmailGrantResult> {
+    // The verify route returns { ok, data: { emailGrant, expiresInSeconds } }
+    // and authRequest hands back the raw envelope, so unwrap `.data`.
+    const res = await authRequest<{
+      ok: boolean;
+      data?: { emailGrant?: string; expiresInSeconds?: number };
+    }>(this.baseUrl, "/auth/email/otp/verify", {
+      method: "POST",
+      body: JSON.stringify({
+        email,
+        code,
+        ...(this.tenantId ? { tenantId: this.tenantId } : {}),
+      }),
+    });
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    const grant = res.data?.data?.emailGrant;
+    if (typeof grant !== "string" || grant.length === 0) {
+      throw new StewardApiError("Email OTP verify did not return a grant.", res.status);
+    }
+
+    return {
+      ok: true,
+      emailGrant: grant,
+      expiresInSeconds: res.data?.data?.expiresInSeconds ?? 0,
+    };
+  }
+
+  async getTestAccessToken(
+    options: StewardTestAccountLoginOptions,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const tenantId = options.tenantId ?? this.tenantId;
+    const res = await authRequest<StewardAuthExchangeResponse>(this.baseUrl, "/auth/test/token", {
+      method: "POST",
+      body: JSON.stringify({
+        ...(tenantId ? { tenantId } : {}),
+        ...(options.email ? { email: options.email } : {}),
+        ...(options.phone ? { phone: options.phone } : {}),
+        otp: options.otp,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeExchangeResponse(res.data);
+  }
+
+  // ─── Telegram Login Widget ────────────────────────────────────────────────
+
+  async signInWithTelegram(
+    payload: StewardTelegramLoginPayload,
+    config: StewardTelegramLoginConfig = {},
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const tenantId = config.tenantId ?? this.tenantId;
+    const challenge = await authRequest<{ challengeId: string }>(
+      this.baseUrl,
+      "/auth/telegram/challenge",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...(tenantId ? { tenantId } : {}),
+        }),
+      },
+    );
+    if (!challenge.ok) {
+      throw new StewardApiError(challenge.error, challenge.status);
+    }
+
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/telegram/verify",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...payload,
+          challengeId: challenge.data.challengeId,
+          ...(tenantId ? { tenantId } : {}),
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeExchangeResponse({
+      ...res.data,
+      user: {
+        ...res.data.user,
+        id: res.data.user?.id ?? res.data.userId ?? String(payload.id),
+        email: res.data.user?.email ?? "",
+        walletAddress: res.data.user?.walletAddress ?? res.data.address,
+        walletChain: res.data.user?.walletChain,
+      },
+    });
+  }
+
+  async signInWithFarcaster(
+    payload: StewardFarcasterLoginPayload,
+    config: StewardFarcasterLoginConfig = {},
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const tenantId = config.tenantId ?? this.tenantId;
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/farcaster/verify",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...payload,
+          ...(tenantId ? { tenantId } : {}),
+        }),
+      },
+    );
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeExchangeResponse({
+      ...res.data,
+      user: {
+        ...res.data.user,
+        id: res.data.user?.id ?? res.data.userId ?? String(payload.fid ?? ""),
+        email: res.data.user?.email ?? "",
+        walletAddress: res.data.user?.walletAddress ?? res.data.address,
+        walletChain: res.data.user?.walletChain,
+      },
+    });
+  }
+
+  // ─── TOTP MFA ──────────────────────────────────────────────────────────────
+
+  async getTotpStatus(): Promise<StewardTotpStatus> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardTotpStatus>(
+      this.baseUrl,
+      "/auth/mfa/totp/status",
+      {},
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async enrollTotp(): Promise<StewardTotpEnrollResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardTotpEnrollResult>(
+      this.baseUrl,
+      "/auth/mfa/totp/enroll",
+      { method: "POST", body: JSON.stringify({}) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async verifyTotp(code: string): Promise<StewardTotpVerifyResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardTotpVerifyResult>(
+      this.baseUrl,
+      "/auth/mfa/totp/verify",
+      { method: "POST", body: JSON.stringify({ code }) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async completeTotpMfa(challengeId: string, code: string): Promise<StewardAuthResult> {
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/mfa/totp/complete",
+      {
+        method: "POST",
+        body: JSON.stringify({ challengeId, code }),
+      },
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeAndReturn(
       res.data.token,
       (res.data as { refreshToken?: string }).refreshToken ?? "",
       res.data.user,
       (res.data as { expiresIn?: number }).expiresIn,
     );
+  }
+
+  async completeRecoveryCodeMfa(
+    challengeId: string,
+    recoveryCode: string,
+  ): Promise<StewardAuthResult> {
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/mfa/totp/complete",
+      {
+        method: "POST",
+        body: JSON.stringify({ challengeId, recoveryCode }),
+      },
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeAndReturn(
+      res.data.token,
+      (res.data as { refreshToken?: string }).refreshToken ?? "",
+      res.data.user,
+      (res.data as { expiresIn?: number }).expiresIn,
+    );
+  }
+
+  async stepUpWithTotp(code: string): Promise<StewardAuthResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/mfa/totp/step-up",
+      {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeAndReturn(
+      res.data.token,
+      (res.data as { refreshToken?: string }).refreshToken ?? "",
+      res.data.user,
+      (res.data as { expiresIn?: number }).expiresIn,
+    );
+  }
+
+  async stepUpWithRecoveryCode(recoveryCode: string): Promise<StewardAuthResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/mfa/totp/step-up",
+      {
+        method: "POST",
+        body: JSON.stringify({ recoveryCode }),
+      },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeAndReturn(
+      res.data.token,
+      (res.data as { refreshToken?: string }).refreshToken ?? "",
+      res.data.user,
+      (res.data as { expiresIn?: number }).expiresIn,
+    );
+  }
+
+  async getRecoveryCodeStatus(): Promise<StewardRecoveryCodeStatus> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardRecoveryCodeStatus>(
+      this.baseUrl,
+      "/auth/mfa/recovery-codes/status",
+      {},
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async regenerateRecoveryCodes(code: string): Promise<StewardRecoveryCodesResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardRecoveryCodesResult>(
+      this.baseUrl,
+      "/auth/mfa/recovery-codes/regenerate",
+      { method: "POST", body: JSON.stringify({ code }) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async unenrollTotp(code: string): Promise<{ ok: boolean }> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<{ ok: boolean }>(
+      this.baseUrl,
+      "/auth/mfa/totp/unenroll",
+      { method: "POST", body: JSON.stringify({ code }) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  // ─── SMS MFA ───────────────────────────────────────────────────────────────
+
+  async getSmsMfaStatus(): Promise<StewardSmsMfaStatus> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardSmsMfaStatus>(
+      this.baseUrl,
+      "/auth/mfa/sms/status",
+      {},
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async enrollSmsMfa(phone: string): Promise<StewardSmsMfaEnrollResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardSmsMfaEnrollResult>(
+      this.baseUrl,
+      "/auth/mfa/sms/enroll",
+      { method: "POST", body: JSON.stringify({ phone }) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async verifySmsMfa(code: string): Promise<StewardSmsMfaVerifyResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardSmsMfaVerifyResult>(
+      this.baseUrl,
+      "/auth/mfa/sms/verify",
+      { method: "POST", body: JSON.stringify({ code }) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async sendSmsMfaCode(): Promise<StewardSmsMfaEnrollResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardSmsMfaEnrollResult>(
+      this.baseUrl,
+      "/auth/mfa/sms/send",
+      { method: "POST", body: JSON.stringify({}) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
+  }
+
+  async completeSmsMfa(challengeId: string, code: string): Promise<StewardAuthResult> {
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/mfa/sms/complete",
+      {
+        method: "POST",
+        body: JSON.stringify({ challengeId, code }),
+      },
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeAndReturn(
+      res.data.token,
+      (res.data as { refreshToken?: string }).refreshToken ?? "",
+      res.data.user,
+      (res.data as { expiresIn?: number }).expiresIn,
+    );
+  }
+
+  async stepUpWithSms(code: string): Promise<StewardAuthResult> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/mfa/sms/step-up",
+      {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return await this.storeAndReturn(
+      res.data.token,
+      (res.data as { refreshToken?: string }).refreshToken ?? "",
+      res.data.user,
+      (res.data as { expiresIn?: number }).expiresIn,
+    );
+  }
+
+  async completePasskeyMfa(): Promise<StewardAuthResult> {
+    if (!isBrowser()) {
+      throw new StewardApiError("Passkey MFA requires a browser environment.", 0);
+    }
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    let browserLib: SimpleWebAuthnBrowser;
+    try {
+      browserLib = await import("@simplewebauthn/browser");
+    } catch {
+      throw new StewardApiError(
+        "Missing peer dependency: @simplewebauthn/browser. Install it to use passkeys.",
+        0,
+      );
+    }
+
+    const optionsRes = await authRequest<Record<string, unknown>>(
+      this.baseUrl,
+      "/auth/mfa/passkey/options",
+      { method: "POST", body: JSON.stringify({}) },
+      token,
+    );
+    if (!optionsRes.ok) {
+      throw new StewardApiError(optionsRes.error, optionsRes.status);
+    }
+
+    const challengeId =
+      typeof optionsRes.data.challengeId === "string" ? optionsRes.data.challengeId : "";
+    if (!challengeId) {
+      throw new StewardApiError("Passkey MFA options did not include a challengeId.", 0);
+    }
+
+    let authResponse: unknown;
+    try {
+      authResponse = await browserLib.startAuthentication(
+        optionsRes.data as Parameters<SimpleWebAuthnBrowser["startAuthentication"]>[0],
+      );
+    } catch (err) {
+      throw new StewardApiError(
+        `WebAuthn authentication cancelled or failed: ${err instanceof Error ? err.message : String(err)}`,
+        0,
+      );
+    }
+
+    const verifyRes = await authRequest<StewardAuthExchangeResponse>(
+      this.baseUrl,
+      "/auth/mfa/passkey/complete",
+      {
+        method: "POST",
+        body: JSON.stringify({ challengeId, response: authResponse }),
+      },
+      token,
+    );
+    if (!verifyRes.ok) {
+      throw new StewardApiError(verifyRes.error, verifyRes.status);
+    }
+
+    return await this.storeAndReturn(
+      verifyRes.data.token,
+      (verifyRes.data as { refreshToken?: string }).refreshToken ?? "",
+      verifyRes.data.user,
+      (verifyRes.data as { expiresIn?: number }).expiresIn,
+    );
+  }
+
+  async unenrollSmsMfa(code: string): Promise<{ ok: boolean }> {
+    const token = this.getToken();
+    if (!token) throw new StewardApiError("Not authenticated. Sign in first.", 0);
+
+    const res = await authRequest<{ ok: boolean }>(
+      this.baseUrl,
+      "/auth/mfa/sms/unenroll",
+      { method: "POST", body: JSON.stringify({ code }) },
+      token,
+    );
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+    return res.data;
   }
 
   // ─── SIWE ───────────────────────────────────────────────────────────────────
@@ -579,13 +1711,18 @@ export class StewardAuth {
    * @param signMessage - Async function that signs an arbitrary string with the wallet.
    *                      Compatible with ethers.js `signer.signMessage`, viem's `walletClient.signMessage`,
    *                      or any custom implementation.
+   * @param chainId    - The EVM chain id the wallet is connected to (e.g. 1, 8453, 56).
+   *                      Defaults to Ethereum mainnet (1) when omitted. The web app should
+   *                      pass the real connected chain id (e.g. from wagmi `useChainId()`)
+   *                      so the signed message and EIP-1271 verification reflect reality.
    *
    * Flow: GET /auth/nonce → build SIWE message → caller signs → POST /auth/verify → store JWT.
    */
   async signInWithSIWE(
     address: string,
     signMessage: (msg: string) => Promise<string>,
-  ): Promise<StewardAuthResult> {
+    chainId?: number,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
     // 1. Fetch a fresh nonce
     const nonceRes = await authRequest<{ nonce: string }>(this.baseUrl, "/auth/nonce");
 
@@ -597,7 +1734,7 @@ export class StewardAuth {
 
     // 2. Build a minimal SIWE message string (EIP-4361)
     const issuedAt = new Date().toISOString();
-    const siweMessage = buildSiweMessage(address, nonce, issuedAt);
+    const siweMessage = buildSiweMessage(address, nonce, issuedAt, chainId);
 
     // 3. Have the caller sign the message
     let signature: string;
@@ -629,12 +1766,10 @@ export class StewardAuth {
       walletChain: verifyRes.data.walletChain ?? "ethereum",
     };
 
-    return this.storeAndReturn(
-      verifyRes.data.token,
-      (verifyRes.data as { refreshToken?: string }).refreshToken ?? "",
-      user,
-      (verifyRes.data as { expiresIn?: number }).expiresIn,
-    );
+    return await this.storeExchangeResponse({
+      ...verifyRes.data,
+      user: verifyRes.data.user ?? user,
+    });
   }
 
   /**
@@ -643,14 +1778,15 @@ export class StewardAuth {
   async signInWithSolana(
     publicKey: string,
     signMessage: (message: Uint8Array) => Promise<Uint8Array>,
-  ): Promise<StewardAuthResult> {
+    chain?: string,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
     const nonceRes = await authRequest<{ nonce: string }>(this.baseUrl, "/auth/nonce");
     if (!nonceRes.ok) {
       throw new StewardApiError(nonceRes.error, nonceRes.status);
     }
 
     const issuedAt = new Date().toISOString();
-    const message = buildSiwsMessage(publicKey, nonceRes.data.nonce, issuedAt);
+    const message = buildSiwsMessage(publicKey, nonceRes.data.nonce, issuedAt, chain);
 
     let signatureBytes: Uint8Array;
     try {
@@ -687,12 +1823,10 @@ export class StewardAuth {
       walletChain: verifyRes.data.walletChain ?? "solana",
     };
 
-    return this.storeAndReturn(
-      verifyRes.data.token,
-      (verifyRes.data as { refreshToken?: string }).refreshToken ?? "",
-      user,
-      (verifyRes.data as { expiresIn?: number }).expiresIn,
-    );
+    return await this.storeExchangeResponse({
+      ...verifyRes.data,
+      user: verifyRes.data.user ?? user,
+    });
   }
 
   // ─── OAuth / Provider Discovery ───────────────────────────────────────────
@@ -723,6 +1857,36 @@ export class StewardAuth {
     return res.data;
   }
 
+  async signInWithJwt(
+    token: string,
+    config: StewardJwtLoginConfig,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    const tenantId = config.tenantId || this.tenantId;
+    if (!tenantId) {
+      throw new StewardApiError("tenantId is required for JWT login", 400);
+    }
+    const res = await authRequest<StewardAuthExchangeResponse>(this.baseUrl, "/auth/jwt/login", {
+      method: "POST",
+      body: JSON.stringify({
+        tenantId,
+        providerId: config.providerId,
+        token,
+      }),
+    });
+    if (!res.ok) throw new StewardApiError(res.error, res.status);
+
+    const user: StewardUser = {
+      id: res.data.user?.id ?? res.data.userId ?? "",
+      email: res.data.user?.email ?? "",
+      walletAddress: res.data.user?.walletAddress ?? res.data.address,
+      walletChain: res.data.user?.walletChain,
+    };
+    return await this.storeExchangeResponse({
+      ...res.data,
+      user: res.data.user ?? user,
+    });
+  }
+
   /**
    * Sign in with an OAuth provider using a popup-based PKCE flow.
    *
@@ -738,7 +1902,7 @@ export class StewardAuth {
   async signInWithOAuth(
     provider: string,
     config?: Partial<Omit<StewardOAuthConfig, "provider">>,
-  ): Promise<StewardOAuthResult> {
+  ): Promise<StewardOAuthResult | StewardMfaRequiredResult> {
     // Generate PKCE pair
     const codeVerifier = await generateCodeVerifier();
     const codeChallenge = await generateCodeChallenge(codeVerifier);
@@ -753,6 +1917,11 @@ export class StewardAuth {
     // Store state + verifier for later verification
     this.storage.setItem(OAUTH_STATE_KEY, state);
     this.storage.setItem(OAUTH_VERIFIER_KEY, codeVerifier);
+    if (config?.tenantId) {
+      this.storage.setItem(OAUTH_TENANT_KEY, config.tenantId);
+    } else {
+      this.storage.removeItem(OAUTH_TENANT_KEY);
+    }
 
     // Build the redirect URI
     const redirectUri =
@@ -814,7 +1983,14 @@ export class StewardAuth {
     }
 
     // Exchange code for tokens via PKCE
-    return this.exchangeOAuthCode(provider, callbackParams.code, redirectUri, state, codeVerifier);
+    return this.exchangeOAuthCode(
+      provider,
+      callbackParams.code,
+      redirectUri,
+      state,
+      codeVerifier,
+      config?.tenantId,
+    );
   }
 
   /**
@@ -829,7 +2005,7 @@ export class StewardAuth {
   async handleOAuthCallback(
     provider: string,
     params: { code?: string; state?: string; error?: string },
-  ): Promise<StewardOAuthResult> {
+  ): Promise<StewardOAuthResult | StewardMfaRequiredResult> {
     if (params.error) {
       throw new StewardApiError(`OAuth error: ${params.error}`, 0);
     }
@@ -841,6 +2017,7 @@ export class StewardAuth {
     // Retrieve stored state + verifier
     const storedState = this.storage.getItem(OAUTH_STATE_KEY);
     const storedVerifier = this.storage.getItem(OAUTH_VERIFIER_KEY);
+    const storedTenantId = this.storage.getItem(OAUTH_TENANT_KEY) ?? undefined;
 
     if (!storedState || !storedVerifier) {
       throw new StewardApiError(
@@ -858,7 +2035,14 @@ export class StewardAuth {
       ? `${window.location.origin}${window.location.pathname}`
       : "http://localhost/auth/callback";
 
-    return this.exchangeOAuthCode(provider, params.code, redirectUri, params.state, storedVerifier);
+    return this.exchangeOAuthCode(
+      provider,
+      params.code,
+      redirectUri,
+      params.state,
+      storedVerifier,
+      storedTenantId,
+    );
   }
 
   /**
@@ -870,13 +2054,16 @@ export class StewardAuth {
     redirectUri: string,
     state: string,
     codeVerifier: string,
-  ): Promise<StewardOAuthResult> {
+    tenantId?: string,
+  ): Promise<StewardOAuthResult | StewardMfaRequiredResult> {
+    const body: Record<string, string> = { code, redirectUri, state, codeVerifier };
+    if (tenantId) body.tenantId = tenantId;
     const res = await authRequest<StewardAuthExchangeResponse>(
       this.baseUrl,
       `/auth/oauth/${encodeURIComponent(provider)}/token`,
       {
         method: "POST",
-        body: JSON.stringify({ code, redirectUri, state, codeVerifier }),
+        body: JSON.stringify(body),
       },
     );
 
@@ -887,13 +2074,10 @@ export class StewardAuth {
     // Clean up stored PKCE state
     this.storage.removeItem(OAUTH_STATE_KEY);
     this.storage.removeItem(OAUTH_VERIFIER_KEY);
+    this.storage.removeItem(OAUTH_TENANT_KEY);
 
-    const result = this.storeAndReturn(
-      res.data.token,
-      res.data.refreshToken ?? "",
-      res.data.user,
-      res.data.expiresIn,
-    );
+    const result = await this.storeExchangeResponse(res.data);
+    if ("mfaRequired" in result && result.mfaRequired) return result;
 
     return { ...result, provider };
   }
@@ -923,7 +2107,7 @@ export class StewardAuth {
       // Listen for postMessage from the popup (if the callback page sends one)
       const messageHandler = (event: MessageEvent): void => {
         if (resolved) return;
-        if (event.origin !== origin) return;
+        if (!isTrustedOAuthPopupMessage(event, popup, origin)) return;
         const data = event.data as
           | { type?: string; code?: string; state?: string; error?: string }
           | undefined;
@@ -969,12 +2153,7 @@ export class StewardAuth {
             window.removeEventListener("message", messageHandler);
             popup.close();
 
-            const url = new URL(popupUrl);
-            resolve({
-              code: url.searchParams.get("code") ?? undefined,
-              state: url.searchParams.get("state") ?? undefined,
-              error: url.searchParams.get("error") ?? undefined,
-            });
+            resolve(getOAuthCallbackParams(new URL(popupUrl)));
           }
         } catch {
           // Cross-origin: popup still on provider's domain, keep polling
@@ -1009,10 +2188,7 @@ export class StewardAuth {
     return Array.isArray(res.data) ? res.data : res.data.data;
   }
 
-  /**
-   * Join an open tenant/app.
-   * Requires an active session.
-   */
+  /** Join an open tenant/app. Invite-only tenants require acceptTenantInvitation. */
   async joinTenant(tenantId: string): Promise<StewardTenantMembership> {
     const token = this.getToken();
     if (!token) {
@@ -1024,6 +2200,36 @@ export class StewardAuth {
       `/user/me/tenants/${encodeURIComponent(tenantId)}/join`,
       { method: "POST" },
       token,
+    );
+
+    if (!res.ok) {
+      throw new StewardApiError(res.error, res.status);
+    }
+
+    return res.data;
+  }
+
+  /**
+   * Accept a tenant invitation using a single-use invite token.
+   * Requires an active personal session with a verified email.
+   */
+  async acceptTenantInvitation(
+    tenantId: string,
+    token: string,
+  ): Promise<{ tenantId: string; role: string; invitationId: string }> {
+    const sessionToken = this.getToken();
+    if (!sessionToken) {
+      throw new StewardApiError("Not authenticated. Sign in first.", 0);
+    }
+
+    const res = await authRequest<{ tenantId: string; role: string; invitationId: string }>(
+      this.baseUrl,
+      `/user/me/tenants/${encodeURIComponent(tenantId)}/invitations/accept`,
+      {
+        method: "POST",
+        body: JSON.stringify({ token }),
+      },
+      sessionToken,
     );
 
     if (!res.ok) {
@@ -1060,6 +2266,9 @@ export class StewardAuth {
    * Returns the new session, or null if the switch failed (user may need to re-auth).
    */
   async switchTenant(tenantId: string): Promise<StewardSession | null> {
+    if (this.authProxyUrl) {
+      return this.refreshViaProxy(tenantId);
+    }
     const refreshToken = this.getRefreshToken();
     if (!refreshToken) {
       return null;
@@ -1084,26 +2293,127 @@ export class StewardAuth {
 
   // ─── Private helpers ────────────────────────────────────────────────────────
 
-  private storeAndReturn(
-    token: string,
+  /**
+   * Refresh the session through the same-origin auth proxy (`authProxyUrl`),
+   * which holds the refresh token in an HttpOnly cookie. The proxy rotates the
+   * cookie itself; only the new access token comes back to JS-readable storage.
+   */
+  private async refreshViaProxy(tenantId?: string): Promise<StewardSession | null> {
+    const proxyUrl = this.authProxyUrl;
+    if (!proxyUrl) return null;
+
+    let res: Awaited<ReturnType<typeof authRequest<StewardRefreshResult>>>;
+    try {
+      res = await authRequest<StewardRefreshResult>(proxyUrl, "/refresh", {
+        method: "POST",
+        headers: AUTH_PROXY_HEADERS,
+        body: JSON.stringify(tenantId ? { tenantId } : {}),
+      });
+    } catch {
+      return null;
+    }
+
+    if (!res.ok) {
+      if (res.status === 401) {
+        this.signOut();
+      }
+      return null;
+    }
+
+    this.storage.setItem(STORAGE_KEY, res.data.token);
+    const session = sessionFromToken(res.data.token);
+    this.notifyListeners(session);
+    return session;
+  }
+
+  /**
+   * Hand a freshly issued refresh token to the same-origin auth proxy, which
+   * stores it in an HttpOnly cookie. Fails closed: when the deposit cannot be
+   * completed the whole sign-in is aborted rather than silently downgrading to
+   * JS-readable token storage.
+   */
+  private async depositRefreshToken(refreshToken: string): Promise<void> {
+    const proxyUrl = this.authProxyUrl;
+    if (!proxyUrl) return;
+    let res: Awaited<ReturnType<typeof authRequest>>;
+    try {
+      res = await authRequest(proxyUrl, "/session", {
+        method: "POST",
+        headers: AUTH_PROXY_HEADERS,
+        body: JSON.stringify({ refreshToken }),
+      });
+    } catch (err) {
+      throw new StewardApiError(
+        `Failed to secure the refresh token: ${err instanceof Error ? err.message : "network error"}`,
+        0,
+      );
+    }
+    if (!res.ok) {
+      throw new StewardApiError("Failed to secure the refresh token", res.status);
+    }
+  }
+
+  private async storeAndReturn(
+    token: string | undefined,
     refreshToken: string,
     user: StewardUser,
     expiresIn = 900,
-  ): StewardAuthResult {
+  ): Promise<StewardAuthResult> {
+    if (!token) {
+      throw new StewardApiError("Auth response did not include a session token", 0);
+    }
     this.storage.setItem(STORAGE_KEY, token);
     // Only persist the refresh token when it's a non-empty string.
     // An empty string means the API didn't issue one (e.g. SIWE flow).
     if (refreshToken) {
-      this.storage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+      if (this.authProxyUrl) {
+        // HttpOnly cookie custody — never written to JS-readable storage.
+        await this.depositRefreshToken(refreshToken);
+      } else {
+        this.storage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+      }
     }
     const session = sessionFromToken(token, user);
     this.notifyListeners(session);
     return { token, refreshToken, expiresIn, user };
   }
 
+  private async storeExchangeResponse(
+    data: StewardAuthExchangeResponse,
+  ): Promise<StewardAuthResult | StewardMfaRequiredResult> {
+    if (data.mfaRequired) {
+      if (!data.mfa) {
+        throw new StewardApiError("MFA challenge is missing from auth response", 0);
+      }
+      return {
+        ok: true,
+        mfaRequired: true,
+        mfa: data.mfa,
+        user: data.user,
+      };
+    }
+    return await this.storeAndReturn(
+      data.token,
+      data.refreshToken ?? "",
+      data.user,
+      data.expiresIn,
+    );
+  }
+
   private clearToken(): void {
     this.storage.removeItem(STORAGE_KEY);
     this.storage.removeItem(REFRESH_TOKEN_KEY);
+    if (this.authProxyUrl) {
+      // Best-effort: expire the proxy-held refresh cookie too. keepalive lets
+      // the request outlive the page when sign-out is followed by navigation.
+      void authRequest(this.authProxyUrl, "/session", {
+        method: "DELETE",
+        headers: AUTH_PROXY_HEADERS,
+        keepalive: true,
+      }).catch(() => {
+        /* best-effort */
+      });
+    }
   }
 
   private notifyListeners(session: StewardSession | null): void {
@@ -1154,4 +2464,6 @@ function base64urlEncode(bytes: Uint8Array): string {
 export {
   generateCodeChallenge as _generateCodeChallenge,
   generateCodeVerifier as _generateCodeVerifier,
+  getOAuthCallbackParams as _getOAuthCallbackParams,
+  isTrustedOAuthPopupMessage as _isTrustedOAuthPopupMessage,
 };

@@ -14,14 +14,34 @@ import path from "node:path";
  *   6. Cleanup (cascading deletes)
  *
  * Usage:
- *   STEWARD_URL=http://88.99.66.168:3200 bun run scripts/e2e-integration-test.ts
+ *   STEWARD_URL=https://steward.example bun run scripts/e2e-integration-test.ts
  *   STEWARD_URL=http://localhost:3200 bun run scripts/e2e-integration-test.ts
  */
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const STEWARD_URL = process.env.STEWARD_URL || "http://88.99.66.168:3200";
+const STEWARD_URL = process.env.STEWARD_URL || "http://localhost:3200";
 const PROXY_URL = process.env.PROXY_URL || STEWARD_URL.replace(":3200", ":8080");
+
+function assertSecureServiceUrl(name: string, value: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`${name} must be an absolute http(s) URL`);
+  }
+  const loopback = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]).has(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error(`${name} must use https:// unless it targets loopback`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`${name} must not embed credentials in the URL`);
+  }
+}
+
+assertSecureServiceUrl("STEWARD_URL", STEWARD_URL);
+assertSecureServiceUrl("PROXY_URL", PROXY_URL);
+const SKIP_PROXY_E2E = process.env.SKIP_PROXY_E2E === "1" || process.env.SKIP_PROXY_E2E === "true";
 const TEST_PREFIX = `e2e-${Date.now()}`;
 const TENANT_ID = `${TEST_PREFIX}-tenant`;
 const TENANT_KEY = `${TEST_PREFIX}-key-${crypto.randomUUID().slice(0, 8)}`;
@@ -72,6 +92,13 @@ function resolveStoredPlatformKey(): string {
     return "";
   }
 }
+
+const PLATFORM_KEY = firstNonEmpty(
+  process.env.PLATFORM_KEY,
+  process.env.STEWARD_PLATFORM_KEY,
+  firstPlatformKeyFromList(process.env.STEWARD_PLATFORM_KEYS),
+  resolveStoredPlatformKey(),
+);
 
 // ─── Test harness ────────────────────────────────────────────────────────────
 
@@ -136,6 +163,12 @@ function agentHeaders(): Record<string, string> {
   };
 }
 
+function platformHeaders(): Record<string, string> {
+  return {
+    "X-Steward-Platform-Key": PLATFORM_KEY,
+  };
+}
+
 // ─── 1. Cloud Provisioning ───────────────────────────────────────────────────
 
 async function testCloudProvisioning() {
@@ -159,11 +192,22 @@ async function testCloudProvisioning() {
 
   // 1b. Create test tenant
   try {
-    const { status, data } = await api("POST", "/tenants", {
-      id: TENANT_ID,
-      name: "E2E Integration Test",
-      apiKeyHash: TENANT_KEY,
-    });
+    if (!PLATFORM_KEY) {
+      fail("Create test tenant", "STEWARD_PLATFORM_KEY or PLATFORM_KEY is required");
+      return false;
+    }
+    const { status, data } = await api(
+      "POST",
+      "/tenants",
+      {
+        id: TENANT_ID,
+        name: "E2E Integration Test",
+        apiKeyHash: TENANT_KEY,
+      },
+      {
+        "X-Steward-Platform-Key": PLATFORM_KEY,
+      },
+    );
     if (status === 200 && data.ok) {
       pass("Create test tenant");
     } else {
@@ -187,26 +231,13 @@ async function testCloudProvisioning() {
     fail("Get tenant by ID", e.message);
   }
 
-  // 1d. Create test agent with wallet
-  try {
-    const { status, data } = await api(
-      "POST",
-      "/agents",
-      { id: AGENT_ID, name: AGENT_NAME },
-      tenantHeaders(),
-    );
-    if (status === 200 && data.ok && data.data?.walletAddress) {
-      pass(`Create test agent (wallet: ${data.data.walletAddress.slice(0, 10)}...)`);
-    } else {
-      fail("Create test agent", `${data.error || JSON.stringify(data)}`);
-      return false;
-    }
-  } catch (e: any) {
-    fail("Create test agent", e.message);
-    return false;
-  }
-
-  // 1e. Set policies (spending limit, approved addresses, rate limit)
+  // 1d/1e. Create test agent with wallet + policies via the platform API.
+  //
+  // The #79 hardening made tenant-scoped agent create/policy writes
+  // owner/admin-session-only. Platform operators provision agents (and their
+  // initial policy set) through the scoped platform key instead — here via the
+  // batch endpoint, which both creates the agent and applies policies in one
+  // call (POST /platform/tenants/:id/agents/batch, scope platform:agent:create).
   try {
     const policies = [
       {
@@ -230,18 +261,26 @@ async function testCloudProvisioning() {
       },
     ];
     const { status, data } = await api(
-      "PUT",
-      `/agents/${AGENT_ID}/policies`,
-      policies,
-      tenantHeaders(),
+      "POST",
+      `/platform/tenants/${TENANT_ID}/agents/batch`,
+      { agents: [{ id: AGENT_ID, name: AGENT_NAME }], applyPolicies: policies },
+      platformHeaders(),
     );
-    if (status === 200 && data.ok && Array.isArray(data.data) && data.data.length === 3) {
+    const createdAgent = data?.data?.created?.[0];
+    const batchErrors = data?.data?.errors ?? [];
+    if (status === 200 && data.ok && createdAgent?.walletAddress && batchErrors.length === 0) {
+      pass(`Create test agent (wallet: ${createdAgent.walletAddress.slice(0, 10)}...)`);
       pass("Set agent policies (spending-limit, approved-addresses, rate-limit)");
     } else {
-      fail("Set agent policies", `${data.error || JSON.stringify(data)}`);
+      const reason = batchErrors[0]?.error || data.error || JSON.stringify(data);
+      fail("Create test agent", `${reason}`);
+      fail("Set agent policies", `${reason}`);
+      return false;
     }
   } catch (e: any) {
+    fail("Create test agent", e.message);
     fail("Set agent policies", e.message);
+    return false;
   }
 
   // 1f. Get agent policies
@@ -261,13 +300,15 @@ async function testCloudProvisioning() {
     fail("Get agent policies", e.message);
   }
 
-  // 1g. Get agent JWT
+  // 1g. Get agent JWT via the platform API (hardened model — tenant-scoped
+  // token minting is owner/admin-session-only). Request both agent and
+  // api:proxy scopes so the token works for vault signing and proxy forwarding.
   try {
     const { status, data } = await api(
       "POST",
-      `/agents/${AGENT_ID}/token`,
-      { expiresIn: "1h" },
-      tenantHeaders(),
+      `/platform/tenants/${TENANT_ID}/agents/${AGENT_ID}/token`,
+      { expiresIn: "1h", scopes: ["agent", "api:proxy"] },
+      platformHeaders(),
     );
     if (status === 200 && data.ok && data.data?.token) {
       agentJwt = data.data.token;
@@ -356,6 +397,13 @@ async function testWalletOperations() {
       pass("Sign tx to whitelisted address (no broadcast)");
     } else if (status === 200 && data.ok) {
       pass("Sign tx to whitelisted address (signed)");
+    } else if (status === 403) {
+      // Hardened model (#79): an agent JWT on its own cannot sign — signing
+      // requires either an owner/admin MFA session or signer-bound
+      // X-Steward-Signer-Id/X-Steward-Signer-Secret headers. The
+      // platform-operator e2e holds neither, so a 403 here confirms the
+      // signing-authorization gate is enforced.
+      pass("Sign tx requires signer-bound auth (hardened, 403)");
     } else {
       // Could fail if RPC is down — that's OK, policy should still evaluate
       fail(
@@ -432,8 +480,11 @@ async function testWalletOperations() {
       ...tenantHeaders(),
       ...agentHeaders(),
     });
-    if (status === 200 && data.ok && Array.isArray(data.data)) {
-      pass(`Transaction history (${data.data.length} entries)`);
+    // History responds as { transactions: [...], limit, offset }; older builds
+    // returned a bare array. Tolerate both shapes.
+    const txList = Array.isArray(data.data) ? data.data : data.data?.transactions;
+    if (status === 200 && data.ok && Array.isArray(txList)) {
+      pass(`Transaction history (${txList.length} entries)`);
     } else {
       fail("Transaction history", `${data.error || JSON.stringify(data)}`);
     }
@@ -449,7 +500,13 @@ async function testSecretManagement() {
   console.log("║  3. Secret Management                        ║");
   console.log("╚══════════════════════════════════════════════╝\n");
 
-  // 3a. Create a test secret
+  // 3a. Create a test secret.
+  //
+  // Hardened model (#79): secret management is owner/admin-session-only. The
+  // platform-operator e2e authenticates with a tenant API key (not an admin
+  // session), so the expected outcome here is a 403 confirming the gate is
+  // enforced. If the deployment still allows API-key secret management (older
+  // builds), fall through to the full CRUD/rotation flow below.
   try {
     const { status, data } = await api(
       "POST",
@@ -464,12 +521,25 @@ async function testSecretManagement() {
     if ((status === 200 || status === 201) && data.ok && data.data?.id) {
       secretId = data.data.id;
       pass(`Create test secret (id: ${secretId.slice(0, 8)}...)`);
+    } else if (status === 403) {
+      pass("Secret management requires owner/admin session (hardened, 403)");
     } else {
       fail("Create test secret", `status=${status}: ${data.error || JSON.stringify(data)}`);
       return;
     }
   } catch (e: any) {
     fail("Create test secret", e.message);
+    return;
+  }
+
+  // The remaining secret CRUD, credential-route, and rotation steps all require
+  // an admin session under the hardened model. When we only confirmed the 403
+  // gate above (no secret created), skip them rather than reporting failures.
+  if (!secretId) {
+    skip(
+      "Secret CRUD + credential routes + rotation",
+      "owner/admin session required for secret management (hardened model)",
+    );
     return;
   }
 
@@ -509,6 +579,7 @@ async function testSecretManagement() {
       "/secrets/routes",
       {
         secretId,
+        agentId: AGENT_ID,
         hostPattern: "api.openai.com",
         pathPattern: "/*",
         method: "*",
@@ -592,6 +663,7 @@ async function testSecretManagement() {
         "/secrets/routes",
         {
           secretId,
+          agentId: AGENT_ID,
           hostPattern: "api.openai.com",
           pathPattern: "/*",
           method: "*",
@@ -621,6 +693,13 @@ async function testProxyOperations() {
   console.log("\n╔══════════════════════════════════════════════╗");
   console.log("║  4. Proxy Operations                         ║");
   console.log("╚══════════════════════════════════════════════╝\n");
+
+  if (SKIP_PROXY_E2E) {
+    skip("Proxy health check", "SKIP_PROXY_E2E set");
+    skip("Proxy request through gateway", "SKIP_PROXY_E2E set");
+    skip("Proxy audit log verification", "SKIP_PROXY_E2E set");
+    return;
+  }
 
   // 4a. Proxy health check
   try {
@@ -829,16 +908,28 @@ async function testCleanup() {
     }
   }
 
-  // 6c. Delete test agent (cascading — should remove wallets, policies, transactions)
-  try {
-    const { status, data } = await api("DELETE", `/agents/${AGENT_ID}`, undefined, tenantHeaders());
-    if (status === 200 && data.ok) {
-      pass("Delete test agent (cascade)");
-    } else {
-      fail("Delete test agent", `${data.error || JSON.stringify(data)}`);
+  // 6c. Delete test agent (cascading — should remove wallets, policies,
+  // transactions). The hardened model makes tenant-scoped agent deletion
+  // owner/admin-session-only, so platform operators delete via the scoped
+  // platform key (DELETE /platform/tenants/:id/agents/:agentId).
+  if (PLATFORM_KEY) {
+    try {
+      const { status, data } = await api(
+        "DELETE",
+        `/platform/tenants/${TENANT_ID}/agents/${AGENT_ID}`,
+        undefined,
+        platformHeaders(),
+      );
+      if (status === 200 && data.ok) {
+        pass("Delete test agent (cascade)");
+      } else {
+        fail("Delete test agent", `${data.error || JSON.stringify(data)}`);
+      }
+    } catch (e: any) {
+      fail("Delete test agent", e.message);
     }
-  } catch (e: any) {
-    fail("Delete test agent", e.message);
+  } else {
+    skip("Delete test agent", "No platform key — tenant cascade will remove the agent");
   }
 
   // 6d. Verify agent is gone
@@ -854,16 +945,10 @@ async function testCleanup() {
   }
 
   // 6e. Delete test tenant (via platform API if available, otherwise note it)
-  const platformKey = firstNonEmpty(
-    process.env.PLATFORM_KEY,
-    process.env.STEWARD_PLATFORM_KEY,
-    firstPlatformKeyFromList(process.env.STEWARD_PLATFORM_KEYS),
-    resolveStoredPlatformKey(),
-  );
-  if (platformKey) {
+  if (PLATFORM_KEY) {
     try {
       const { status, data } = await api("DELETE", `/platform/tenants/${TENANT_ID}`, undefined, {
-        "X-Steward-Platform-Key": platformKey,
+        "X-Steward-Platform-Key": PLATFORM_KEY,
       });
       if (status === 200 && data.ok) {
         pass("Delete test tenant (via platform API)");

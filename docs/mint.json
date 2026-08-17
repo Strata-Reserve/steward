@@ -1,6 +1,7 @@
 {
   "$schema": "https://mintlify.com/schema.json",
   "name": "Steward",
+  "openapi": "api-reference/openapi.json",
   "logo": {
     "dark": "/favicon.svg",
     "light": "/favicon.svg",
@@ -24,12 +25,6 @@
     "default": "dark"
   },
   "css": "custom.css",
-  "topbarLinks": [
-    {
-      "name": "API Status",
-      "url": "https://api.steward.fi/health"
-    }
-  ],
   "topbarCtaButton": {
     "name": "GitHub",
     "url": "https://github.com/Steward-Fi/steward"
@@ -64,20 +59,11 @@
   "navigation": [
     {
       "group": "Get Started",
-      "pages": [
-        "introduction",
-        "quickstart"
-      ]
+      "pages": ["introduction", "quickstart"]
     },
     {
       "group": "Authentication",
-      "pages": [
-        "auth/overview",
-        "auth/passkeys",
-        "auth/email",
-        "auth/oauth",
-        "auth/cross-tenant"
-      ]
+      "pages": ["auth/overview", "auth/passkeys", "auth/email", "auth/oauth", "auth/cross-tenant"]
     },
     {
       "group": "Concepts",
@@ -95,10 +81,12 @@
       "pages": [
         "guides/agent-setup",
         "guides/policies",
+        "guides/monero-on-solana",
         "guides/secrets",
         "guides/local-mode",
+        "guides/wallet-external-id-migration",
         "guides/eliza-plugin",
-        "guides/milady-cloud",
+        "guides/cloud-deployment",
         "guides/self-hosting",
         "guides/docker"
       ]
@@ -108,11 +96,17 @@
       "pages": [
         "api-reference/overview",
         "api-reference/agents",
+        "api-reference/accounts",
+        "api-reference/user-wallets",
         "api-reference/vault",
+        "api-reference/intents",
+        "api-reference/audits",
         "api-reference/secrets",
         "api-reference/routes",
         "api-reference/policies",
         "api-reference/tenants",
+        "api-reference/platform-apps",
+        "api-reference/platform-users",
         "api-reference/tenant-config",
         "api-reference/proxy",
         "api-reference/approvals",
@@ -125,6 +119,7 @@
       "pages": [
         "sdk/installation",
         "sdk/client",
+        "sdk/provider-actions",
         "sdk/react-components",
         "sdk/proxy-helpers",
         "sdk/eliza-plugin"

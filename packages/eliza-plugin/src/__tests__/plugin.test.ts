@@ -15,12 +15,15 @@ describe("@stwd/eliza-plugin", () => {
     const names = stewardPlugin.actions?.map((a) => a.name);
     expect(names).toContain("STEWARD_SIGN_TRANSACTION");
     expect(names).toContain("STEWARD_TRANSFER");
+    expect(names).toContain("SUBMIT_TRADE");
+    expect(names).toContain("STEWARD_PROVIDER_ACTION");
   });
 
   it("registers expected providers", () => {
     const names = stewardPlugin.providers?.map((p) => p.name);
     expect(names).toContain("stewardWalletStatus");
     expect(names).toContain("stewardBalance");
+    expect(names).toContain("stewardProviderActions");
   });
 
   it("registers expected evaluators", () => {

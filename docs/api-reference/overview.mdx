@@ -9,11 +9,13 @@ The Steward API is a REST API built with [Hono](https://hono.dev) running on [Bu
 
 ## Base URL
 
+Steward is self-hosted. Point the SDK and all requests at your own deployment. The default local Compose profile exposes the API on port 3200:
+
 ```
-https://api.steward.fi
+http://localhost:3200
 ```
 
-For self-hosted instances, replace with your deployment URL.
+Replace this with your deployment's URL when running behind your own domain and TLS.
 
 ## Authentication
 
@@ -24,7 +26,7 @@ Steward supports three authentication methods:
     For tenant-level operations (agent CRUD, policy management, secret management):
 
     ```bash
-    curl https://api.steward.fi/agents \
+    curl http://localhost:3200/agents \
       -H "X-Steward-Key: stwd_your_tenant_api_key"
     ```
 
@@ -34,7 +36,7 @@ Steward supports three authentication methods:
     For agent-scoped operations (signing, balance checks). Preferred for agents:
 
     ```bash
-    curl https://api.steward.fi/vault/my-agent/sign \
+    curl http://localhost:3200/vault/my-agent/sign \
       -H "Authorization: Bearer stwd_jwt_..."
     ```
 
@@ -45,10 +47,10 @@ Steward supports three authentication methods:
 
     ```bash
     # 1. Get nonce
-    curl https://api.steward.fi/auth/nonce
+    curl http://localhost:3200/auth/nonce
 
     # 2. Sign message and verify
-    curl -X POST https://api.steward.fi/auth/verify \
+    curl -X POST http://localhost:3200/auth/verify \
       -H "Content-Type: application/json" \
       -d '{ "message": "...", "signature": "0x..." }'
     ```
@@ -62,7 +64,7 @@ Steward supports three authentication methods:
 For platform-level operations (cross-tenant management), use the platform key:
 
 ```bash
-curl https://api.steward.fi/platform/stats \
+curl http://localhost:3200/platform/stats \
   -H "X-Steward-Platform-Key: your-platform-key"
 ```
 
@@ -97,20 +99,72 @@ All endpoints return a consistent format:
 | 403 | Forbidden (policy denied, wrong scope) |
 | 404 | Not found |
 | 409 | Conflict (duplicate resource) |
+| 429 | Too many requests |
 | 500 | Internal server error |
 | 502 | Bad gateway (RPC error from blockchain) |
 
 ## Rate Limits
 
-The API does not currently enforce global rate limits. Per-agent rate limits are configured via [policies](/guides/policies).
+The Bun API entrypoint enforces a process-local global request limit per client
+IP, and sensitive wallet routes can enforce Redis-backed per-agent limits via
+[policies](/guides/policies). Production multi-instance deployments should
+configure Redis for shared auth and wallet-action throttles.
+
+Rate-limited responses return `429` with `Retry-After`, standard
+`RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers, plus
+legacy `X-RateLimit-*` compatibility headers. Successful wallet-action
+responses that evaluate a rate-limit policy include the same standard remaining
+budget headers without `Retry-After`.
+
+## Request Hardening Inventory
+
+The generated OpenAPI contract marks sensitive mutating operations with
+`x-steward-hardening`. These operations are under the same sensitive-prefix
+inventory used by the request-expiry and authorization-signature middleware.
+
+For these routes:
+
+- `X-Steward-Request-Timestamp` or `X-Steward-Request-Expires-At` is required
+  when request-expiry enforcement is enabled.
+- `X-Steward-Signature` is required when authorization signatures are enabled.
+  The header accepts HMAC `v1=` signatures and P-256 `p256=` signatures.
+- `X-Steward-Signing-Key-Id` can select a managed tenant request-signing key.
+- `Idempotency-Key` is required for signed sensitive requests and recommended
+  for all sensitive mutations.
+
+OpenAPI also lists these headers as optional parameters because enforcement is
+deployment-configurable; the `x-steward-hardening` extension records when they
+become mandatory.
+
+### Idempotency and safe retries
+
+For fund-moving or signing workflows, include a caller-stable `referenceId` in
+the request body when the endpoint supports it, and send an `Idempotency-Key`
+header for sensitive mutations where your deployment accepts or requires one.
+Use the same values when retrying after client timeouts so transaction history,
+audit events, and lifecycle webhooks can be correlated to one business
+operation.
+
+Bitcoin PSBT signing is sign/finalize-only: `POST
+/vault/:agentId/sign-bitcoin-psbt` returns Steward's `transactionId`, may return
+finalized raw transaction metadata when `finalize: true`, and never broadcasts.
+Because the route enforces fee caps and spend/address policies before signing,
+clients should query by `referenceId` before creating replacement PSBT requests.
+If a finalized raw transaction was already handed to a broadcaster, do not retry
+that broadcast blindly; check the Bitcoin `txId` with your broadcaster or
+indexer first.
 
 ## Route Groups
 
 | Prefix | Description | Auth Required |
 |--------|-------------|---------------|
 | `/agents` | Agent CRUD + policy management | Tenant key or agent JWT |
+| `/accounts` | Digital asset account resources grouping tenant wallets | Tenant key |
+| `/user/me/wallet` | Authenticated user-wallet provisioning, indexed wallets, and additional signers | Personal user session |
 | `/vault` | Signing, approvals, history | Agent JWT or tenant key |
+| `/audit` | Tenant audit events and action-history filters | Owner/admin session + recent MFA |
 | `/secrets` | Secret + route CRUD | Tenant key only |
+| `/condition-sets` | Reusable policy allow/block list CRUD and item management | Tenant owner/admin session |
 | `/tenants` | Tenant management | Tenant key |
 | `/auth` | SIWE, passkeys, email login | Varies |
 | `/platform` | Cross-tenant admin | Platform key |

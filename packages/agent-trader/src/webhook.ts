@@ -14,8 +14,15 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { verifyWebhookSignature } from "@stwd/sdk";
 import type { WebhookEvent } from "@stwd/shared";
 import { logError, logInfo, logWebhook } from "./logger.js";
+import {
+  MemoryWebhookDeliveryStore,
+  SINGLE_INSTANCE_REPLAY_ACK_ENV,
+  WEBHOOK_DELIVERY_REPLAY_TTL_MS,
+  type WebhookDeliveryStore,
+} from "./webhook-delivery-store.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -27,6 +34,13 @@ export interface WebhookServer {
   start(): Promise<void>;
   stop(): Promise<void>;
   on(event: WebhookEventType | "*", handler: WebhookHandler): void;
+}
+
+export interface WebhookServerOptions {
+  expectedTenantId?: string;
+  allowedAgentIds?: string[];
+  maxBodyBytes?: number;
+  deliveryStore?: WebhookDeliveryStore;
 }
 
 // ─── Internal state ────────────────────────────────────────────────────────────
@@ -45,6 +59,29 @@ type BunServeRuntime = typeof globalThis & {
     }): BunServeServer;
   };
 };
+
+interface WebhookHeaders {
+  get(name: string): string | null | undefined;
+}
+
+const DEFAULT_MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
+/**
+ * Whether unsigned webhooks are permitted. The escape hatch is for local dev
+ * only and is hard-disabled in production: mirroring the proxy's
+ * `isRedisRequired` production gate, the flag is ignored (with an error logged)
+ * when NODE_ENV === "production" so a stray env var cannot strip signature
+ * verification on a live deployment.
+ */
+function allowUnsignedWebhooks(): boolean {
+  if (process.env.STEWARD_AGENT_TRADER_ALLOW_UNSIGNED_WEBHOOKS !== "true") return false;
+  if (process.env.NODE_ENV === "production") {
+    logError(
+      "STEWARD_AGENT_TRADER_ALLOW_UNSIGNED_WEBHOOKS is set but ignored in production; webhook signature verification stays required.",
+    );
+    return false;
+  }
+  return true;
+}
 
 function buildHandlerMap(): HandlerMap {
   return new Map();
@@ -74,32 +111,142 @@ async function dispatchEvent(map: HandlerMap, event: WebhookEvent): Promise<void
 async function parseBody(body: string): Promise<WebhookEvent | null> {
   try {
     const parsed = JSON.parse(body) as WebhookEvent;
-    if (!parsed.type || !parsed.agentId) return null;
+    if (!parsed.type || !parsed.tenantId || !parsed.agentId) return null;
     return parsed;
   } catch {
     return null;
   }
 }
 
+async function readBunRequestBody(req: Request, maxBytes: number): Promise<string | null> {
+  const contentLength = Number(req.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) return null;
+  if (!req.body) return "";
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
+}
+
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
-export function createWebhookServer(port: number, _secret?: string): WebhookServer {
+export function createWebhookServer(
+  port: number,
+  secret?: string,
+  options: WebhookServerOptions = {},
+): WebhookServer {
+  if (!secret && !allowUnsignedWebhooks()) {
+    throw new Error(
+      "Webhook secret is required. Set STEWARD_AGENT_TRADER_ALLOW_UNSIGNED_WEBHOOKS=true only for local development.",
+    );
+  }
+  if (
+    secret &&
+    process.env.NODE_ENV === "production" &&
+    !options.deliveryStore?.durable &&
+    process.env[SINGLE_INSTANCE_REPLAY_ACK_ENV] !== "true"
+  ) {
+    throw new Error(
+      `Durable webhook replay storage is required in production. Configure REDIS_URL/Upstash, or set ${SINGLE_INSTANCE_REPLAY_ACK_ENV}=true only for a guaranteed single-instance deployment.`,
+    );
+  }
   const handlers = buildHandlerMap();
   let stopFn: (() => Promise<void>) | null = null;
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_WEBHOOK_BODY_BYTES;
+  const allowedAgentIds = new Set(options.allowedAgentIds ?? []);
+  const deliveryStore = options.deliveryStore ?? new MemoryWebhookDeliveryStore();
 
-  const handleRequest = async (body: string): Promise<{ status: number; message: string }> => {
+  const handleRequest = async (
+    body: string,
+    headers: WebhookHeaders,
+  ): Promise<{ status: number; message: string }> => {
     if (!body) {
       return { status: 400, message: "Empty body" };
+    }
+    if (secret) {
+      // Verify the nonce/event-bound v2 signature: pass the delivery id and event
+      // type headers so a captured event cannot be replayed with a tampered type.
+      // Legacy `${ts}.${body}` signatures are now rejected by default (SDK).
+      const verification = await verifyWebhookSignature(
+        body,
+        headers.get("x-steward-signature"),
+        secret,
+        headers.get("x-steward-timestamp"),
+        {
+          eventType: headers.get("x-steward-event") ?? null,
+          deliveryId: headers.get("x-steward-delivery-id") ?? null,
+        },
+      );
+      if (!verification.valid) {
+        return { status: 401, message: "Invalid webhook signature" };
+      }
     }
 
     const event = await parseBody(body);
     if (!event) {
       return { status: 400, message: "Invalid event payload" };
     }
+    const eventAgentId = event.agentId;
+    if (!eventAgentId) {
+      return { status: 400, message: "Invalid event payload" };
+    }
+    const signedEventType = headers.get("x-steward-event");
+    if (secret && signedEventType !== event.type) {
+      return { status: 401, message: "Webhook event type mismatch" };
+    }
+    if (options.expectedTenantId && event.tenantId !== options.expectedTenantId) {
+      return { status: 403, message: "Webhook tenant mismatch" };
+    }
+    if (allowedAgentIds.size > 0 && !allowedAgentIds.has(eventAgentId)) {
+      return { status: 403, message: "Webhook agent is not allowed" };
+    }
+
+    if (secret) {
+      const deliveryId = headers.get("x-steward-delivery-id");
+      if (!deliveryId) return { status: 401, message: "Webhook delivery id is required" };
+      // Length-prefix both attacker-influenced values: a delimiter-only scope
+      // would make (`a:b`, `c`) collide with (`a`, `b:c`) across tenants.
+      const deliveryScope = `${event.tenantId.length}:${event.tenantId}${deliveryId.length}:${deliveryId}`;
+      let claimed: boolean;
+      try {
+        claimed = await deliveryStore.claim(deliveryScope, WEBHOOK_DELIVERY_REPLAY_TTL_MS);
+      } catch (err) {
+        logError("Webhook replay store claim failed", err, { eventType: event.type });
+        return { status: 503, message: "Webhook replay protection unavailable" };
+      }
+      if (!claimed) {
+        // A sender may retry because the original 200 was lost. Acknowledge the
+        // duplicate as success while suppressing dispatch, otherwise well-behaved
+        // webhook senders can retry a safely consumed delivery forever.
+        return { status: 200, message: "Webhook delivery already processed" };
+      }
+    }
 
     logWebhook({
       event: event.type,
-      agentId: event.agentId,
+      agentId: eventAgentId,
       data: event.data,
     });
 
@@ -122,8 +269,17 @@ export function createWebhookServer(port: number, _secret?: string): WebhookServ
             if (req.method !== "POST") {
               return new Response("Method Not Allowed", { status: 405 });
             }
-            const body = await req.text();
-            const result = await handleRequest(body);
+            const body = await readBunRequestBody(req, maxBodyBytes);
+            if (body === null) {
+              return new Response(
+                JSON.stringify({ ok: false, message: "Webhook body too large" }),
+                {
+                  status: 413,
+                  headers: { "Content-Type": "application/json" },
+                },
+              );
+            }
+            const result = await handleRequest(body, req.headers);
             return new Response(
               JSON.stringify({
                 ok: result.status === 200,
@@ -153,12 +309,37 @@ export function createWebhookServer(port: number, _secret?: string): WebhookServ
           return;
         }
 
+        const contentLength = Number(req.headers["content-length"] ?? "0");
+        if (Number.isFinite(contentLength) && contentLength > maxBodyBytes) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, message: "Webhook body too large" }));
+          req.destroy();
+          return;
+        }
+
         let body = "";
+        let bodyBytes = 0;
+        let tooLarge = false;
         req.on("data", (chunk: { toString(): string }) => {
-          body += chunk.toString();
+          const value = chunk.toString();
+          bodyBytes += new TextEncoder().encode(value).byteLength;
+          if (bodyBytes > maxBodyBytes) {
+            tooLarge = true;
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, message: "Webhook body too large" }));
+            req.destroy();
+            return;
+          }
+          body += value;
         });
         req.on("end", async () => {
-          const result = await handleRequest(body);
+          if (tooLarge) return;
+          const result = await handleRequest(body, {
+            get(name: string) {
+              const value = req.headers[name.toLowerCase()];
+              return Array.isArray(value) ? value[0] : value;
+            },
+          });
           res.writeHead(result.status, {
             "Content-Type": "application/json",
           });

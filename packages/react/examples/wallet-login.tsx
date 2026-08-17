@@ -40,7 +40,7 @@ const wagmiConfig = createDefaultWagmiConfig({
 });
 
 const stewardClient = new StewardClient({
-  baseUrl: "https://api.steward.fi",
+  baseUrl: "http://localhost:3200",
   apiKey: "…",
 });
 
@@ -49,14 +49,17 @@ export function PatternA() {
     <StewardProvider
       client={stewardClient}
       agentId="agent_abc"
-      auth={{ baseUrl: "https://api.steward.fi" }}
+      auth={{ baseUrl: "http://localhost:3200" }}
     >
       <EVMWalletProvider config={wagmiConfig}>
         <SolanaWalletProvider endpoint="https://api.mainnet-beta.solana.com">
           <WalletLogin
             chains="both"
             onSuccess={(result, kind) => {
-              console.log("signed in via", kind, result.token);
+              // Do NOT log the session token. Store it securely (e.g. in memory
+              // or an httpOnly cookie set by your backend) instead.
+              console.log("signed in via", kind, "token: <redacted>");
+              void result;
             }}
             onError={(err, kind) => {
               console.error(kind, err);
@@ -93,7 +96,7 @@ export function PatternB() {
                 <StewardProvider
                   client={stewardClient}
                   agentId="agent_abc"
-                  auth={{ baseUrl: "https://api.steward.fi" }}
+                  auth={{ baseUrl: "http://localhost:3200" }}
                 >
                   <WalletLogin chains="both" />
                 </StewardProvider>
@@ -113,7 +116,7 @@ export function EvmOnly() {
     <StewardProvider
       client={stewardClient}
       agentId="agent_abc"
-      auth={{ baseUrl: "https://api.steward.fi" }}
+      auth={{ baseUrl: "http://localhost:3200" }}
     >
       <EVMWalletProvider config={wagmiConfig}>
         <WalletLogin chains="evm" />
