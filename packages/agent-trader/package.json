@@ -1,6 +1,6 @@
 {
   "name": "@stwd/agent-trader",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
   "dependencies": {
     "@stwd/sdk": "workspace:*",
     "@stwd/shared": "workspace:*",
+    "ioredis": "^5.10.1",
     "viem": "^2.30.0"
   },
   "devDependencies": {

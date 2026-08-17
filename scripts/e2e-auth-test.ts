@@ -10,14 +10,14 @@ import path from "node:path";
  * token refresh, cross-tenant auth, and user endpoint protection.
  *
  * Usage:
- *   STEWARD_URL=https://api.steward.fi \
+ *   STEWARD_URL=http://localhost:3200 \
  *   PLATFORM_KEY=stw_plat... \
  *   bun run scripts/e2e-auth-test.ts
  */
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const STEWARD_URL = (process.env.STEWARD_URL || "https://api.steward.fi").replace(/\/$/, "");
+const STEWARD_URL = (process.env.STEWARD_URL || "http://localhost:3200").replace(/\/$/, "");
 
 function firstNonEmpty(...values: Array<string | null | undefined>): string {
   for (const value of values) {
@@ -269,6 +269,13 @@ async function testPasskeyRegistrationOptions() {
       skip("Passkey registration options", "endpoint not deployed on this version");
       return;
     }
+    if (status === 401 || status === 403) {
+      pass(
+        "Passkey registration options",
+        `requires authenticated verified email session (${status})`,
+      );
+      return;
+    }
     if (status !== 200) {
       fail(
         "Passkey registration options",
@@ -375,7 +382,12 @@ async function testOAuthAuthorize(provider: "google" | "discord") {
  */
 async function testSiweNonce() {
   try {
-    const { status, data } = await api("GET", "/auth/nonce");
+    // SIWE nonce requests are bound to an allowed Origin (PR #79 hardening).
+    const { status, data } = await api("GET", "/auth/nonce", {
+      // Exercise the configured deployment origin instead of hard-coding the
+      // hosted domain, which makes local TLS-safe smoke tests fail spuriously.
+      headers: { Origin: new URL(STEWARD_URL).origin },
+    });
 
     if (status === 200 && typeof data?.nonce === "string" && data.nonce.length > 0) {
       pass("SIWE nonce generation", `nonce=${data.nonce.slice(0, 12)}...`);

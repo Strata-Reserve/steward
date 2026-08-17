@@ -1,0 +1,38 @@
+# Cloudflare Workers deploy config for the Steward web app (OpenNext adapter).
+# Account: Shadowverse (a510aa563bac39bd19f16438206e97f2).
+# Build with `bun run cf:build`, then `bun run cf:deploy` (or via CI).
+name = "steward-web"
+main = ".open-next/worker.js"
+compatibility_date = "2025-05-05"
+compatibility_flags = ["nodejs_compat"]
+account_id = "a510aa563bac39bd19f16438206e97f2"
+
+# OpenNext emits a static asset directory the Worker serves directly.
+[assets]
+directory = ".open-next/assets"
+binding = "ASSETS"
+
+# Custom domain routes. steward.fi zone lives on the Shadowverse account.
+# The apex + www are cut over from Vercel to this Worker.
+[[routes]]
+pattern = "steward.fi"
+custom_domain = true
+
+[[routes]]
+pattern = "www.steward.fi"
+custom_domain = true
+
+[observability]
+enabled = true
+
+# Public build-time var: the dashboard API origin. This build targets the
+# elizacloud-hosted Steward instance (eliza.steward.fi), which is elizacloud's
+# own self-hosted deployment, not a shared Steward hosted API. It is build-time
+# only and not rendered in any user-facing UI.
+#
+# NOTE: Steward is self-host-first today; there is no public api.steward.fi
+# hosted API. The in-code fallback default is http://localhost:3200 (the local
+# compose profile). Keep this var pointed at whatever Steward instance this
+# dashboard build should talk to.
+[vars]
+NEXT_PUBLIC_STEWARD_API_URL = "https://eliza.steward.fi"

@@ -1,8 +1,52 @@
+import { randomUUID } from "node:crypto";
+
 import { Resend } from "resend";
+
+/**
+ * Redacted delivery acceptance receipt: proof that the underlying provider
+ * ACCEPTED the message for delivery. Never carries the recipient, subject,
+ * body, or any embedded token/code — safe to log as-is.
+ */
+export interface EmailDeliveryReceipt {
+  /** Which provider accepted the message, e.g. "resend" | "console" | "mock". */
+  provider: string;
+  /** Provider-assigned message id, when the provider returns one. */
+  id?: string;
+}
+
+/**
+ * Typed failure raised when a provider rejects a send (or returns no
+ * acceptance receipt). The message is deliberately generic — never the
+ * recipient, token, code, or raw provider error text — so it can be logged
+ * and surfaced without leaking secrets. The API layer maps this to 502.
+ */
+export class EmailDeliveryError extends Error {
+  constructor(message = "Email delivery failed") {
+    super(message);
+    this.name = "EmailDeliveryError";
+  }
+}
+
+/**
+ * Typed failure raised when no delivery-capable email provider is configured
+ * (e.g. the ConsoleProvider fallback in production). Raised BEFORE any
+ * challenge state is created so a misconfigured deployment can never issue
+ * an unredeemable-by-email challenge. The API layer maps this to 503.
+ */
+export class EmailDeliveryNotConfiguredError extends Error {
+  constructor(message = "Email delivery is not configured") {
+    super(message);
+    this.name = "EmailDeliveryNotConfiguredError";
+  }
+}
 
 /**
  * Pluggable email provider interface.
  * Swap implementations without touching EmailAuth logic.
+ *
+ * `send` must resolve with an acceptance receipt only after the underlying
+ * provider accepted the message, and must THROW when it did not — resolving
+ * without a receipt is treated as delivery failure by EmailAuth (fail closed).
  */
 export interface EmailProvider {
   send(
@@ -11,7 +55,7 @@ export interface EmailProvider {
     text: string,
     html?: string,
     options?: { replyTo?: string },
-  ): Promise<void>;
+  ): Promise<EmailDeliveryReceipt>;
 }
 
 // ---------------------------------------------------------------------------
@@ -41,8 +85,8 @@ export class ResendProvider implements EmailProvider {
     text: string,
     html?: string,
     options?: { replyTo?: string },
-  ): Promise<void> {
-    const { error } = await this.client.emails.send({
+  ): Promise<EmailDeliveryReceipt> {
+    const { data, error } = await this.client.emails.send({
       from: this.from,
       to,
       subject,
@@ -54,11 +98,13 @@ export class ResendProvider implements EmailProvider {
     if (error) {
       throw new Error(`Resend error: ${error.message}`);
     }
+
+    return { provider: "resend", ...(data?.id ? { id: data.id } : {}) };
   }
 }
 
 // ---------------------------------------------------------------------------
-// ConsoleProvider — development / testing provider (logs to stdout)
+// ConsoleProvider — redacted development delivery receipt (never logs credentials)
 // ---------------------------------------------------------------------------
 
 export class ConsoleProvider implements EmailProvider {
@@ -68,18 +114,96 @@ export class ConsoleProvider implements EmailProvider {
     text: string,
     _html?: string,
     options?: { replyTo?: string },
-  ): Promise<void> {
+  ): Promise<EmailDeliveryReceipt> {
     console.log(
       [
         "─────────────────────────────────────────",
         `[ConsoleProvider] Magic link email`,
-        `To:      ${to}`,
-        `Subject: ${subject}`,
-        ...(options?.replyTo ? [`Reply-To: ${options.replyTo}`] : []),
+        `To:      [redacted]`,
         "",
-        text,
         "─────────────────────────────────────────",
       ].join("\n"),
     );
+    return { provider: "console" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MockEmailProvider — in-memory inbox for e2e testing.
+//
+// Stores every sent message in a process-wide registry keyed by recipient.
+// A test harness can read the most recent message (or the embedded magic-link
+// token) via `MockEmailInbox.last(email)` or the static helpers.
+//
+// NEVER enable in production. The wrapper in the API layer gates this behind
+// an explicit `EMAIL_PROVIDER=mock` env var and NODE_ENV !== "production".
+// ---------------------------------------------------------------------------
+
+export interface MockEmailMessage {
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+  replyTo?: string;
+  sentAt: Date;
+  /** Magic-link token extracted from the text body, if present. */
+  token?: string;
+  /** Full magic-link URL extracted from the text body, if present. */
+  magicLink?: string;
+}
+
+const MAGIC_LINK_RE = /https?:\/\/\S*[?&]token=([A-Za-z0-9_-]+)/;
+
+function parseMagicLink(text: string): { magicLink?: string; token?: string } {
+  const match = text.match(MAGIC_LINK_RE);
+  if (!match) return {};
+  return { magicLink: match[0], token: match[1] };
+}
+
+class MockEmailInboxRegistry {
+  private byEmail = new Map<string, MockEmailMessage[]>();
+
+  push(msg: MockEmailMessage): void {
+    const key = msg.to.toLowerCase();
+    const existing = this.byEmail.get(key) ?? [];
+    existing.push(msg);
+    this.byEmail.set(key, existing);
+  }
+
+  last(email: string): MockEmailMessage | undefined {
+    const list = this.byEmail.get(email.toLowerCase());
+    return list?.[list.length - 1];
+  }
+
+  all(email: string): MockEmailMessage[] {
+    return [...(this.byEmail.get(email.toLowerCase()) ?? [])];
+  }
+
+  clear(email?: string): void {
+    if (email) this.byEmail.delete(email.toLowerCase());
+    else this.byEmail.clear();
+  }
+}
+
+export const MockEmailInbox = new MockEmailInboxRegistry();
+
+export class MockEmailProvider implements EmailProvider {
+  async send(
+    to: string,
+    subject: string,
+    text: string,
+    html?: string,
+    options?: { replyTo?: string },
+  ): Promise<EmailDeliveryReceipt> {
+    MockEmailInbox.push({
+      to,
+      subject,
+      text,
+      ...(html ? { html } : {}),
+      ...(options?.replyTo ? { replyTo: options.replyTo } : {}),
+      sentAt: new Date(),
+      ...parseMagicLink(text),
+    });
+    return { provider: "mock", id: randomUUID() };
   }
 }

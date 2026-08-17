@@ -7,7 +7,7 @@
  * wagmi + RainbowKit + Solana provider trees so consumers can mount wallet
  * login with a single component, no manual provider wiring.
  *
- * This is the "Privy parity" surface. It is purely additive over
+ * This is the bundled wallet-login surface. It is purely additive over
  * `<StewardLogin>` + the manual provider wrap path, which still works for
  * consumers who want full control of their wallet provider configuration.
  *
@@ -21,8 +21,9 @@
 import { type ReactNode, useMemo } from "react";
 import type { Chain } from "viem";
 import type { Config as WagmiConfig } from "wagmi";
-import { arbitrum, base, bsc, mainnet, optimism, polygon } from "wagmi/chains";
+import { arbitrum, base, bsc, gnosis, mainnet, optimism, polygon } from "wagmi/chains";
 import {
+  type CreateDefaultWagmiConfigOptions,
   createDefaultWagmiConfig,
   EVMWalletProvider,
   type EVMWalletProviderProps,
@@ -39,7 +40,7 @@ import { StewardLogin } from "./StewardLogin.js";
 const STEWARD_DEFAULT_WALLETCONNECT_PROJECT_ID = "2c7ddf841a48e522748c5e2782d73443";
 
 /** Default chain set for the bundled EVM wagmi config. */
-const DEFAULT_EVM_CHAINS = [mainnet, base, polygon, optimism, arbitrum, bsc] as const;
+const DEFAULT_EVM_CHAINS = [mainnet, base, polygon, gnosis, optimism, arbitrum, bsc] as const;
 
 /** Default Solana JSON-RPC endpoint. Production apps should pass a private RPC
  *  (Helius, QuickNode) via `solana.endpoint`. The public mainnet-beta
@@ -57,6 +58,8 @@ export interface StewardLoginWithWalletsEvmConfig {
   chains?: readonly [Chain, ...Chain[]];
   /** App name shown in the WalletConnect connection prompt. Default: "Steward". */
   appName?: string;
+  /** Extra RainbowKit wallet entries, such as Steward global-wallet connectors. */
+  wallets?: CreateDefaultWagmiConfigOptions<readonly [Chain, ...Chain[]]>["wallets"];
   /** Forwarded to `<EVMWalletProvider>` (theme / modalSize / queryClient / etc). */
   providerProps?: Omit<EVMWalletProviderProps, "config" | "children">;
 }
@@ -150,8 +153,9 @@ export function StewardLoginWithWallets({
       projectId: resolveProjectId(evm?.projectId),
       chains: evm?.chains ?? (DEFAULT_EVM_CHAINS as unknown as readonly [Chain, ...Chain[]]),
       appName: evm?.appName ?? "Steward",
+      wallets: evm?.wallets,
     });
-  }, [evmEnabled, evm?.config, evm?.projectId, evm?.chains, evm?.appName]);
+  }, [evmEnabled, evm?.config, evm?.projectId, evm?.chains, evm?.appName, evm?.wallets]);
 
   const solanaEndpoint = useMemo(
     () => (solanaEnabled ? resolveSolanaEndpoint(solana?.endpoint) : null),

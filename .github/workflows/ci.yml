@@ -4,6 +4,11 @@ on:
   push:
     branches: [develop, main]
 
+# Least-privilege default for all jobs. CI only lints/tests; nothing needs
+# write access. Escalate per-job if that ever changes.
+permissions:
+  contents: read
+
 jobs:
   ci:
     name: Lint + Typecheck
@@ -12,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3"
 
@@ -27,6 +32,53 @@ jobs:
 
       - name: Typecheck
         run: bun run typecheck
+
+  web-build:
+    # Guard for the @stwd/web Worker build. deploy-web-cloudflare.yml only
+    # triggers on main pushes / PRs touching web/**, so a packages/* change
+    # (e.g. the @stwd/shared barrel leaking node:crypto into the client
+    # bundle, issue #231) can break the web build without any check firing.
+    # Build the Worker here — no upload, no secrets — so those regressions
+    # surface immediately. Mirrors build-check in deploy-web-cloudflare.yml.
+    name: Web Build (@stwd/web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3"
+
+      # OpenNext tooling needs Node; pin to 22 (Node 24 breaks its CLI deps).
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # web imports the @stwd/react|sdk|shared workspace packages via their
+      # dist/ outputs, so they must be built before the Next build can
+      # resolve them.
+      - name: Build workspace dependencies
+        run: bunx turbo run build --filter=@stwd/react --filter=@stwd/sdk --filter=@stwd/shared
+
+      - name: Build Worker (OpenNext)
+        working-directory: web
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          NEXT_PUBLIC_STEWARD_API_URL: "https://eliza.steward.fi"
+          NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID: ${{ secrets.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || 'ci-build-check-placeholder' }}
+        run: bun run cf:build
+
+      - name: Validate Worker bundle (dry-run deploy)
+        working-directory: web
+        run: bunx wrangler deploy --dry-run --outdir /tmp/wrangler-dryrun
 
   unit:
     name: Unit Tests (${{ matrix.package }})
@@ -44,13 +96,21 @@ jobs:
           - packages/webhooks
           - packages/db
           - packages/shared
+          - packages/plugin-wxmr
+          - packages/plugin-trading
+          - packages/plugin-capabilities
+          - packages/trade-sessions
+          # packages/signer-frost is intentionally absent: its test harness
+          # builds the Rust sidecar via `cargo build --release` and this job
+          # has no Rust toolchain (and a release build would strain the
+          # 10-minute timeout). Add it alongside a rust-toolchain step.
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3"
 
@@ -63,15 +123,25 @@ jobs:
           bunx turbo run build --filter="${PKG_NAME}..."
 
       - name: Test ${{ matrix.package }}
+        # --isolate gives each test file a fresh global object so module
+        # replacements installed via `mock.module()` in one file don't
+        # leak into the next. Without this, e.g. zz-proxy-spend-limit's
+        # `mock.module("@stwd/db")` stub poisoned every subsequent file
+        # that imported the real `@stwd/db` schema. See issue #59.
         run: |
           if [ "${{ matrix.package }}" = "packages/sdk" ]; then
             mapfile -t sdk_tests < <(find packages/sdk/src -type f \( -name '*.test.ts' -o -name '*.spec.ts' \) | sort)
-            bun test "${sdk_tests[@]}"
+            bun test --isolate "${sdk_tests[@]}"
           else
-            bun test ${{ matrix.package }}
+            bun test --isolate ${{ matrix.package }}
           fi
         env:
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
+          # bunfig.toml [test] preloads only load from bun's cwd, and this job
+          # runs `bun test` from the repo root — so per-package preloads (e.g.
+          # plugin-trading's, which supplies this key) never run. 64-char dummy
+          # matching the preload's "a".repeat(64).
+          STEWARD_AUDIT_HMAC_KEY: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
   unit-redis:
     name: Unit Tests (packages/redis)
@@ -89,10 +159,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3"
 
@@ -100,7 +170,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Test packages/redis
-        run: bun test packages/redis
+        run: bun test --isolate packages/redis
         env:
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
 
@@ -132,10 +202,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3"
 
@@ -159,8 +229,18 @@ jobs:
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
           STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
-          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          STEWARD_EMAIL_CODE_SECRET: "ci-email-code-secret-must-be-at-least-32-chars-long"
+          STEWARD_EXECUTION_AUTH_SECRET: "v2-ci-1:ci-execution-auth-secret-must-be-at-least-32-bytes-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
+          # Include the exact loopback host exercised by the smoke client; SIWE
+          # binding compares URL.host, including non-default ports.
+          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost,127.0.0.1:3200"
+          # The whole api suite drives this one server from a single IP; the
+          # default 100-req/60s per-IP gate 429s the sharded test flood.
+          STEWARD_RATE_LIMIT_MAX_REQUESTS: "1000000"
         run: |
           bun run packages/api/src/index.ts > /tmp/steward-api-integration.log 2>&1 &
           echo $! > /tmp/steward-api-integration.pid
@@ -174,15 +254,34 @@ jobs:
           exit 1
 
       - name: Integration tests (API)
-        run: bun test packages/api
+        # ~57 of the api test files force an in-memory PGLite (a WASM Postgres) in
+        # their own beforeAll even though DATABASE_URL points at real Postgres.
+        # `bun test --isolate` runs every file in ONE process (it only gives each
+        # file a fresh global object, not a fresh process), so those WASM heaps
+        # accumulate and SIGKILL the 7GB runner (exit 137) around file ~140.
+        # run-tests-isolated.ts spawns a fresh `bun test` process PER FILE, so
+        # peak memory is bounded by TEST_JOBS concurrent files (not the suite
+        # size) and each process frees its WASM heap on exit. Reproduced in a
+        # 6GB-capped Linux container: the single `--isolate` process is killed
+        # at exit 137; a 6-way --shard split still OOMs (25 files/shard is too
+        # much). Keep this serial: even two PGLite processes can starve an API
+        # request long enough to hit Bun's per-test timeout. The runner's
+        # 120-second default leaves headroom for migration-heavy files while
+        # the 25-minute job timeout still bounds the complete suite.
+        run: TEST_JOBS=1 TEST_TIMEOUT=120000 bun packages/api/scripts/run-tests-isolated.ts
         env:
           DATABASE_URL: "postgres://steward:steward_ci@localhost:5432/steward_test"
           PORT: "3299"
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
           STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
-          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          STEWARD_EMAIL_CODE_SECRET: "ci-email-code-secret-must-be-at-least-32-chars-long"
+          STEWARD_EXECUTION_AUTH_SECRET: "v2-ci-1:ci-execution-auth-secret-must-be-at-least-32-bytes-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
+          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost,127.0.0.1:3200"
 
       - name: Stop API test server
         if: always()
@@ -209,10 +308,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3"
 
@@ -225,9 +324,15 @@ jobs:
           STEWARD_BIND_HOST: "127.0.0.1"
           STEWARD_PGLITE_PATH: "/tmp/steward-fi-e2e-pglite"
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
+          STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
-          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          STEWARD_EMAIL_CODE_SECRET: "ci-email-code-secret-must-be-at-least-32-chars-long"
+          STEWARD_EXECUTION_AUTH_SECRET: "v2-ci-1:ci-execution-auth-secret-must-be-at-least-32-bytes-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
+          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost,127.0.0.1:3200"
         run: |
           bun run start:local > /tmp/steward-fi-e2e.log 2>&1 &
           echo $! > /tmp/steward-fi-e2e.pid
@@ -264,15 +369,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: "1.3"
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      - name: Validate Monero compose profile contract
+        run: scripts/test-compose-monero.sh
 
       - name: Start compose stack
         env:
@@ -280,13 +388,33 @@ jobs:
           POSTGRES_USER: "steward"
           POSTGRES_PASSWORD: "steward_ci"
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
+          STEWARD_PLATFORM_KEY: "ci-platform-key"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
+          STEWARD_PLATFORM_KEY_SCOPES: '{"ci-platform-key":["platform:*"]}'
+          ALLOW_USER_TENANT_CREATION: "true"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
-          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          STEWARD_EMAIL_CODE_SECRET: "ci-email-code-secret-must-be-at-least-32-chars-long"
+          STEWARD_EXECUTION_AUTH_SECRET: "v2-ci-1:ci-execution-auth-secret-must-be-at-least-32-bytes-long"
+          STEWARD_AUDIT_HMAC_KEY: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+          # Dummy HMAC root so the required compose var interpolates; production
+          # supplies a real value. Does not weaken fail-closed behavior.
+          STEWARD_PROXY_REQUEST_SIGNING_SECRET: "ci-proxy-signing-secret-must-be-at-least-32-bytes"
+          STEWARD_KDF_SALT: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          STEWARD_ALLOW_INSECURE_DB: "true"
+          # Run the stack in non-prod mode for the functional e2e flow: the e2e
+          # script doesn't sign request-expiry / authorization-signature headers,
+          # which are enforced only when NODE_ENV=production (covered by unit tests).
+          NODE_ENV: "test"
+          STEWARD_ALLOW_STALE_SENSITIVE_REQUESTS: "true"
+          SIWE_ALLOWED_DOMAINS: "steward.fi,localhost,127.0.0.1:3200"
           PORT: "3200"
           STEWARD_PROXY_PORT: "8080"
         run: |
-          docker compose up -d --build postgres redis steward-api steward-proxy
+          # API and proxy intentionally share the same image. Build it once;
+          # asking Compose to build both services exports the identical image
+          # twice and can exhaust a hosted runner during the duplicate export.
+          docker compose build steward-api
+          docker compose up -d --no-build postgres redis steward-api steward-proxy
           for url in http://127.0.0.1:3200/health http://127.0.0.1:8080/health; do
             for _ in $(seq 1 90); do
               if curl -sf "$url" >/dev/null; then
@@ -310,6 +438,11 @@ jobs:
           STEWARD_MASTER_PASSWORD: "ci-test-secret"
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
+          STEWARD_EMAIL_CODE_SECRET: "ci-email-code-secret-must-be-at-least-32-chars-long"
+          STEWARD_EXECUTION_AUTH_SECRET: "v2-ci-1:ci-execution-auth-secret-must-be-at-least-32-bytes-long"
+          STEWARD_AUDIT_HMAC_KEY: "ci-audit-hmac-key-must-be-at-least-32-bytes-long"
+          STEWARD_PROXY_REQUEST_SIGNING_SECRET: "ci-proxy-signing-secret-must-be-at-least-32-bytes"
+          STEWARD_KDF_SALT: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           POSTGRES_DB: "steward_test"
           POSTGRES_USER: "steward"
           POSTGRES_PASSWORD: "steward_ci"

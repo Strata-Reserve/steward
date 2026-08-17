@@ -6,6 +6,7 @@ export default defineConfig({
   dts: true,
   clean: true,
   sourcemap: true,
-  external: ["@elizaos/core"],
+  external: ["@elizaos/core", "@stwd/sdk"],
+  noExternal: ["@stwd/shared/sensitive-keys"],
   target: "node22",
 });

@@ -5,7 +5,39 @@
 
 declare module "wagmi" {
   export type Config = unknown;
-  export type CreateConnectorFn = unknown;
+  export interface ConnectorChain {
+    id: number;
+    name?: string;
+    [key: string]: unknown;
+  }
+  export interface CreateConnectorConfig {
+    chains: readonly ConnectorChain[];
+    emitter: { emit(event: string, payload?: unknown): void };
+    storage?: unknown;
+    transports?: Record<number, unknown>;
+  }
+  export type CreateConnectorFn<provider = unknown> = (config: CreateConnectorConfig) => {
+    id: string;
+    name: string;
+    type: string;
+    connect: (parameters?: { chainId?: number }) => Promise<{
+      accounts: readonly `0x${string}`[];
+      chainId: number;
+    }>;
+    disconnect: () => Promise<void>;
+    getAccounts: () => Promise<readonly `0x${string}`[]>;
+    getChainId: () => Promise<number>;
+    getProvider: () => Promise<provider>;
+    isAuthorized: () => Promise<boolean>;
+    switchChain?: (parameters: { chainId: number }) => Promise<ConnectorChain>;
+    onAccountsChanged: (accounts: string[]) => void;
+    onChainChanged: (chainId: string) => void;
+    onConnect?: (connectInfo: { chainId?: string | number }) => void;
+    onDisconnect: (error?: Error) => void;
+    onMessage?: (message: { type: string; data?: unknown }) => void;
+    setup?: () => Promise<void>;
+    [key: string]: unknown;
+  };
   export type Transport = unknown;
   export interface WagmiProviderProps {
     config: Config;
@@ -14,6 +46,9 @@ declare module "wagmi" {
   }
   export const WagmiProvider: import("react").FC<WagmiProviderProps>;
   export function createConfig(config: Record<string, unknown>): Config;
+  export function createConnector<provider = unknown>(
+    connector: CreateConnectorFn<provider>,
+  ): CreateConnectorFn<provider>;
   export function http(url?: string): Transport;
   export function useAccount(): {
     address?: `0x${string}`;
@@ -25,6 +60,30 @@ declare module "wagmi" {
     signMessageAsync: (args: { message: string }) => Promise<`0x${string}`>;
   };
   export function useDisconnect(): { disconnect: () => void };
+}
+
+declare module "wagmi/connectors" {
+  // wagmi v3 ships the MetaMask Connect (EVM) connector built in. We only
+  // surface `metaMask` and keep the param/return types loose so the package
+  // typechecks without the real connector installed. The consumer's install of
+  // wagmi@3 + @metamask/connect-evm shadows these with the precise types.
+  import type { CreateConnectorFn } from "wagmi";
+  export function metaMask(parameters?: unknown): CreateConnectorFn;
+}
+
+declare module "@metamask/connect-evm" {
+  // Optional peer required by wagmi v3's metaMask() connector. We don't import
+  // from it directly; this stub just keeps any transitive reference resolvable
+  // when the real package isn't installed at typecheck time.
+  export interface MetaMaskDappMetadata {
+    name?: string;
+    url?: string;
+    iconUrl?: string;
+  }
+  export interface MetaMaskParameters {
+    dapp?: MetaMaskDappMetadata;
+    [key: string]: unknown;
+  }
 }
 
 declare module "viem" {

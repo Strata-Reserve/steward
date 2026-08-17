@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { users } from "@stwd/db";
-import { buildIdentityClaims } from "../routes/auth";
+import { buildSessionIdentityClaims } from "../routes/auth";
 
 // Pure-unit tests for the identity-claim builder used by every human session
 // token. These run without a database or vault — they exercise the fail-closed
@@ -25,14 +25,14 @@ function makeUser(overrides: Partial<UserRow>): UserRow {
   } as UserRow;
 }
 
-describe("buildIdentityClaims (verified-email-only, fail-closed)", () => {
+describe("buildSessionIdentityClaims (verified-email-only, fail-closed)", () => {
   it("always embeds userId", () => {
-    const claims = buildIdentityClaims(makeUser({ id: "abc" }));
+    const claims = buildSessionIdentityClaims(makeUser({ id: "abc" }));
     expect(claims.userId).toBe("abc");
   });
 
   it("embeds email + emailVerified:true when the email is verified", () => {
-    const claims = buildIdentityClaims(
+    const claims = buildSessionIdentityClaims(
       makeUser({ id: "u1", email: "a@example.com", emailVerified: true }),
     );
     expect(claims.email).toBe("a@example.com");
@@ -40,7 +40,7 @@ describe("buildIdentityClaims (verified-email-only, fail-closed)", () => {
   });
 
   it("OMITS email when the email is present but NOT verified", () => {
-    const claims = buildIdentityClaims(
+    const claims = buildSessionIdentityClaims(
       makeUser({ id: "u2", email: "unverified@example.com", emailVerified: false }),
     );
     expect(claims.email).toBeUndefined();
@@ -49,7 +49,7 @@ describe("buildIdentityClaims (verified-email-only, fail-closed)", () => {
   });
 
   it("OMITS email when emailVerified is null (default)", () => {
-    const claims = buildIdentityClaims(
+    const claims = buildSessionIdentityClaims(
       makeUser({ id: "u3", email: "x@example.com", emailVerified: null as unknown as boolean }),
     );
     expect(claims.email).toBeUndefined();
@@ -57,7 +57,7 @@ describe("buildIdentityClaims (verified-email-only, fail-closed)", () => {
   });
 
   it("OMITS email for a wallet-only user (email null)", () => {
-    const claims = buildIdentityClaims(
+    const claims = buildSessionIdentityClaims(
       makeUser({ id: "wallet-user", email: null, walletAddress: "0xabc" }),
     );
     expect(claims.email).toBeUndefined();
@@ -66,7 +66,9 @@ describe("buildIdentityClaims (verified-email-only, fail-closed)", () => {
   });
 
   it("never invents an email when none is set", () => {
-    const claims = buildIdentityClaims(makeUser({ id: "u4", email: null, emailVerified: true }));
+    const claims = buildSessionIdentityClaims(
+      makeUser({ id: "u4", email: null, emailVerified: true }),
+    );
     expect(claims.email).toBeUndefined();
   });
 });

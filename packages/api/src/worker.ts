@@ -25,6 +25,14 @@
  *   - RESEND_API_KEY                Magic-link email provider
  *   - GOOGLE/DISCORD/GITHUB/TWITTER OAuth client IDs + secrets
  *   - PASSKEY_RP_ID, PASSKEY_ORIGIN, PASSKEY_RP_NAME
+ *
+ * Optional client-IP trust bindings (auth rate limiting):
+ *   - STEWARD_TRUSTED_PROXY_HOPS    Trusted proxies appending to x-forwarded-for
+ *   - STEWARD_TRUST_CLOUDFLARE      "true" only when ingress is locked to
+ *                                   Cloudflare; trusts cf-connecting-ip
+ *   - STEWARD_AUTH_RATE_LIMIT_OUTAGE_VALVE_MAX
+ *                                   Bounded auth admissions/min/isolate while a
+ *                                   configured Redis is unreachable
  */
 
 import { initRedis } from "./middleware/redis";
@@ -53,6 +61,9 @@ export interface Env {
   PASSKEY_RP_ID?: string;
   PASSKEY_ORIGIN?: string;
   PASSKEY_RP_NAME?: string;
+  STEWARD_TRUSTED_PROXY_HOPS?: string;
+  STEWARD_TRUST_CLOUDFLARE?: string;
+  STEWARD_AUTH_RATE_LIMIT_OUTAGE_VALVE_MAX?: string;
   [key: string]: unknown;
 }
 
@@ -90,13 +101,41 @@ async function ensureWorkerInit(env: Env): Promise<void> {
     // Auth stores (passkey challenges, magic-link tokens, SIWE/SIWS nonces)
     // must be initialized too — without this they stay on the lazy memory
     // backend and one-time state is lost across isolates / cold starts.
-    const { initAuthStores } = await import("./routes/auth");
+    const { trackAuditEvent } = await import("./services/audit");
+    const { isHstsEnabled } = await import("./middleware/security-headers");
+    const dbUrl = (env.DATABASE_URL || "").toLowerCase();
+    // Best-effort boot telemetry (a one-time observability breadcrumb of the
+    // TLS/HSTS posture at cold start) — NOT a security mutation or a tamper-
+    // evident control event, and there is no client action to deny. So this
+    // intentionally stays fire-and-forget: a write failure here must not abort
+    // worker init. Security/compliance events use awaited writeAuditEvent.
+    trackAuditEvent({
+      tenantId: "system",
+      actorType: "system",
+      action: "system.tls.config",
+      metadata: {
+        dbTlsEnforced:
+          dbUrl.includes("sslmode=require") ||
+          dbUrl.includes("sslmode=verify-ca") ||
+          dbUrl.includes("sslmode=verify-full"),
+        hstsEnabled: isHstsEnabled(),
+        insecureDbAllowed: process.env.STEWARD_ALLOW_INSECURE_DB === "true",
+        runtime: "workers",
+      },
+    });
+    const { assertAuthStoresAreSafe, initAuthStores } = await import("./routes/auth");
     // usePostgres=false: Workers deployments do not run migrations on startup
     // (SKIP_MIGRATIONS=1 in wrangler.toml) so auth_kv_store may not exist;
     // Redis is the canonical store on Workers.
-    await initAuthStores(false).catch((err) => {
-      console.warn("[steward:workers] initAuthStores failed; auth flows may degrade:", err);
-    });
+    await initAuthStores(false);
+    assertAuthStoresAreSafe();
+    const { getAuthStoreSources } = await import("./routes/auth");
+    const { importSession } = getAuthStoreSources();
+    if (importSession === "memory") {
+      console.warn(
+        "[steward:workers] encrypted import sessions are using memory storage; configure Redis for durable one-time import sessions across isolates",
+      );
+    }
     if (!redisOk) {
       console.warn(
         "[steward:workers] Redis not initialized — passkey/magic-link/SIWE flows will use in-memory backend per isolate",
@@ -106,10 +145,23 @@ async function ensureWorkerInit(env: Env): Promise<void> {
   return workerInit;
 }
 
+// Compose the deployable app once per isolate: lean core + this repo's opt-in
+// plugins (trading). cached so we don't re-register plugins on every request.
+// composeApp() dynamically imports the trading plugin so the lean core graph
+// never statically references the trading stack.
+let composedApp: Awaited<ReturnType<typeof import("./compose").composeApp>> | null = null;
+
+async function getComposedApp() {
+  if (composedApp) return composedApp;
+  const { composeApp } = await import("./compose");
+  composedApp = await composeApp();
+  return composedApp;
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: unknown): Promise<Response> {
     await ensureWorkerInit(env);
-    const { app } = await import("./app");
+    const app = await getComposedApp();
     return app.fetch(request, env, ctx as never);
   },
 };

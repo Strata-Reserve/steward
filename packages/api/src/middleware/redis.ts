@@ -2,8 +2,9 @@
  * Redis middleware — initializes the Redis client and exposes
  * rate-limiting + spend-tracking helpers on the Hono context.
  *
- * When REDIS_URL is not set, the middleware is a no-op and the helpers
- * return permissive defaults so the API still works without Redis.
+ * When Redis is not configured, the middleware is a no-op and the helpers
+ * return documented local-development defaults. If Redis is configured and a
+ * money-path/rate-limit helper cannot read it, the helper fails closed.
  */
 
 import {
@@ -23,8 +24,9 @@ let redisAvailable = false;
 let redisClient: IoredisLike | null = null;
 
 /**
- * Try to connect to Redis on startup. If it fails, we degrade gracefully —
- * rate-limit and spend-tracking are skipped (policy engine still works).
+ * Try to connect to Redis on startup. If it fails, route-level helpers decide
+ * whether to use local-development defaults or fail closed based on whether
+ * Redis was configured for this deployment.
  */
 export async function initRedis(env?: Record<string, unknown>): Promise<boolean> {
   if (redisAvailable && redisClient) return true;
@@ -69,6 +71,17 @@ export function isRedisAvailable(): boolean {
   return redisAvailable;
 }
 
+export function isRedisConfigured(): boolean {
+  const driver = process.env.REDIS_DRIVER?.trim().toLowerCase() || "ioredis";
+  if (driver === "upstash") {
+    return Boolean(
+      (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL) &&
+        (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN),
+    );
+  }
+  return Boolean(process.env.REDIS_URL);
+}
+
 /**
  * Return the active Redis client (real ioredis or upstash adapter), or null
  * if Redis is not available. Call isRedisAvailable() first to check.
@@ -103,17 +116,23 @@ export async function checkAgentRateLimit(
   windowMs: number,
   maxRequests: number,
 ): Promise<RateLimitResult> {
-  if (!redisAvailable) return PERMISSIVE_RATE_LIMIT;
+  // Redis not available: only skip enforcement when Redis was never configured
+  // (documented dev path). If Redis IS configured (production), an unavailable
+  // backend must fail CLOSED — mirroring checkAgentSpendLimit (SEC-016).
+  if (!redisAvailable) {
+    if (!isRedisConfigured()) return PERMISSIVE_RATE_LIMIT;
+    return { allowed: false, remaining: 0, resetMs: 60_000 };
+  }
 
   try {
     const key = `ratelimit:vault:${agentId}:${windowMs}`;
     return await checkRateLimit(key, windowMs, maxRequests);
   } catch (err) {
     console.error(
-      "[steward:redis] Rate limit check failed, allowing request:",
+      "[steward:redis] Rate limit check failed, denying sensitive request:",
       (err as Error).message,
     );
-    return PERMISSIVE_RATE_LIMIT;
+    return { allowed: false, remaining: 0, resetMs: 60_000 };
   }
 }
 
@@ -128,17 +147,22 @@ export async function checkProxyRateLimit(
   windowMs: number,
   maxRequests: number,
 ): Promise<RateLimitResult> {
-  if (!redisAvailable) return PERMISSIVE_RATE_LIMIT;
+  // Same fail-closed posture as checkAgentRateLimit (SEC-016): permissive only
+  // when Redis was never configured; a configured-but-down backend denies.
+  if (!redisAvailable) {
+    if (!isRedisConfigured()) return PERMISSIVE_RATE_LIMIT;
+    return { allowed: false, remaining: 0, resetMs: 60_000 };
+  }
 
   try {
     const key = `ratelimit:proxy:${agentId}:${host}:${windowMs}`;
     return await checkRateLimit(key, windowMs, maxRequests);
   } catch (err) {
     console.error(
-      "[steward:redis] Proxy rate limit check failed, allowing request:",
+      "[steward:redis] Proxy rate limit check failed, denying request:",
       (err as Error).message,
     );
-    return PERMISSIVE_RATE_LIMIT;
+    return { allowed: false, remaining: 0, resetMs: 60_000 };
   }
 }
 
@@ -152,16 +176,23 @@ export async function checkAgentSpendLimit(
   limitUsd: number,
   period: SpendPeriod,
 ): Promise<{ allowed: boolean; spent: number; remaining: number }> {
-  if (!redisAvailable) return { allowed: true, spent: 0, remaining: limitUsd };
+  // Redis not available: only skip enforcement when Redis was never configured
+  // (documented dev path). If Redis IS configured (production), an unavailable
+  // backend must fail CLOSED rather than silently allow unlimited spend.
+  if (!redisAvailable) {
+    if (!isRedisConfigured()) return { allowed: true, spent: 0, remaining: limitUsd };
+    return { allowed: false, spent: 0, remaining: 0 };
+  }
 
   try {
     return await checkSpendLimit(agentId, limitUsd, period);
   } catch (err) {
+    // Configured backend threw: fail CLOSED — we cannot prove the spend is within limit.
     console.error(
-      "[steward:redis] Spend limit check failed, allowing request:",
+      "[steward:redis] Spend limit check failed, denying request (fail-closed):",
       (err as Error).message,
     );
-    return { allowed: true, spent: 0, remaining: limitUsd };
+    return { allowed: false, spent: 0, remaining: 0 };
   }
 }
 

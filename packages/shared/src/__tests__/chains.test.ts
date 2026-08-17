@@ -1,5 +1,17 @@
 import { describe, expect, it } from "bun:test";
-import { CHAINS, chainFromCaip2, chainFromNumeric, fromCaip2, toCaip2 } from "../index";
+import {
+  CHAIN_PROVIDERS,
+  CHAINS,
+  chainFromCaip2,
+  chainFromNumeric,
+  fromCaip2,
+  getChainMeta,
+  getChainProviderByCaip2,
+  getChainProviderByNumeric,
+  getExplorerTxLink,
+  SUPPORTED_CHAINS,
+  toCaip2,
+} from "../index";
 
 // ─── CHAINS registry ─────────────────────────────────────────────────────────
 
@@ -8,15 +20,51 @@ describe("CHAINS registry", () => {
     expect(CHAINS["eip155:1"]).toBeDefined();
     expect(CHAINS["eip155:56"]).toBeDefined();
     expect(CHAINS["eip155:97"]).toBeDefined();
+    expect(CHAINS["eip155:100"]).toBeDefined();
     expect(CHAINS["eip155:137"]).toBeDefined();
     expect(CHAINS["eip155:8453"]).toBeDefined();
     expect(CHAINS["eip155:42161"]).toBeDefined();
     expect(CHAINS["eip155:84532"]).toBeDefined();
   });
 
+  it("has correct metadata for Gnosis", () => {
+    const chain = CHAINS["eip155:100"];
+    expect(chain.numericId).toBe(100);
+    expect(chain.family).toBe("evm");
+    expect(chain.name).toBe("Gnosis");
+    expect(chain.symbol).toBe("xDAI");
+    expect(chain.testnet).toBe(false);
+  });
+
+  it("exposes Gnosis through legacy metadata helpers", () => {
+    expect(SUPPORTED_CHAINS.gnosis).toBe(100);
+    expect(getChainMeta(100)).toEqual({
+      id: 100,
+      name: "Gnosis",
+      symbol: "xDAI",
+      explorerUrl: "https://gnosisscan.io",
+      explorerTxUrl: "https://gnosisscan.io/tx/",
+    });
+    expect(getExplorerTxLink(100, "0xabc")).toBe("https://gnosisscan.io/tx/0xabc");
+  });
+
+  it("has correct metadata for Polygon", () => {
+    const chain = CHAINS["eip155:137"];
+    expect(chain.numericId).toBe(137);
+    expect(chain.family).toBe("evm");
+    expect(chain.name).toBe("Polygon");
+    expect(chain.symbol).toBe("POL");
+    expect(chain.testnet).toBe(false);
+  });
+
   it("contains Solana mainnet and devnet", () => {
     expect(CHAINS["solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"]).toBeDefined();
     expect(CHAINS["solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"]).toBeDefined();
+  });
+
+  it("contains Bitcoin mainnet and testnet", () => {
+    expect(CHAINS["bip122:000000000019d6689c085ae165831e93"]).toBeDefined();
+    expect(CHAINS["bip122:000000000933ea01ad0ee984209779ba"]).toBeDefined();
   });
 
   it("has correct metadata for Base", () => {
@@ -49,6 +97,19 @@ describe("CHAINS registry", () => {
     expect(chain.numericId).toBe(102);
     expect(chain.family).toBe("solana");
     expect(chain.testnet).toBe(true);
+  });
+
+  it("has correct metadata for Bitcoin mainnet and testnet", () => {
+    const mainnet = CHAINS["bip122:000000000019d6689c085ae165831e93"];
+    expect(mainnet.numericId).toBe(201);
+    expect(mainnet.family).toBe("bitcoin");
+    expect(mainnet.symbol).toBe("BTC");
+    expect(mainnet.testnet).toBe(false);
+
+    const testnet = CHAINS["bip122:000000000933ea01ad0ee984209779ba"];
+    expect(testnet.numericId).toBe(202);
+    expect(testnet.family).toBe("bitcoin");
+    expect(testnet.testnet).toBe(true);
   });
 
   it("each entry has its caip2 field matching the registry key", () => {
@@ -85,6 +146,10 @@ describe("toCaip2", () => {
     expect(toCaip2(137)).toBe("eip155:137");
   });
 
+  it("converts Gnosis chainId to CAIP-2", () => {
+    expect(toCaip2(100)).toBe("eip155:100");
+  });
+
   it("converts Arbitrum chainId to CAIP-2", () => {
     expect(toCaip2(42161)).toBe("eip155:42161");
   });
@@ -95,6 +160,11 @@ describe("toCaip2", () => {
 
   it("converts Solana devnet convention ID (102) to CAIP-2", () => {
     expect(toCaip2(102)).toBe("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1");
+  });
+
+  it("converts Bitcoin convention IDs to CAIP-2", () => {
+    expect(toCaip2(201)).toBe("bip122:000000000019d6689c085ae165831e93");
+    expect(toCaip2(202)).toBe("bip122:000000000933ea01ad0ee984209779ba");
   });
 
   it("returns undefined for an unknown chain ID", () => {
@@ -121,12 +191,70 @@ describe("fromCaip2", () => {
     expect(fromCaip2("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1")).toBe(102);
   });
 
+  it("converts Bitcoin CAIP-2 IDs to numeric convention IDs", () => {
+    expect(fromCaip2("bip122:000000000019d6689c085ae165831e93")).toBe(201);
+    expect(fromCaip2("bip122:000000000933ea01ad0ee984209779ba")).toBe(202);
+  });
+
   it("returns undefined for an unknown CAIP-2 string", () => {
     expect(fromCaip2("eip155:99999")).toBeUndefined();
   });
 
   it("returns undefined for a malformed CAIP-2 string", () => {
     expect(fromCaip2("not-a-caip2")).toBeUndefined();
+  });
+
+  it("converts eip155:100 to numeric 100 (Gnosis)", () => {
+    expect(fromCaip2("eip155:100")).toBe(100);
+  });
+});
+
+// ─── ChainProvider registry (extensible) ─────────────────────────────────────
+
+describe("CHAIN_PROVIDERS registry", () => {
+  it("exposes Gnosis and Polygon as providers with explorer/color metadata", () => {
+    const gnosis = getChainProviderByNumeric(100);
+    expect(gnosis).toBeDefined();
+    expect(gnosis?.name).toBe("Gnosis");
+    expect(gnosis?.explorerUrl).toBe("https://gnosisscan.io");
+    expect(gnosis?.explorerTxUrl("0xabc")).toBe("https://gnosisscan.io/tx/0xabc");
+    expect(gnosis?.explorerAddressUrl("0xdef")).toBe("https://gnosisscan.io/address/0xdef");
+    expect(gnosis?.color).toBeTruthy();
+
+    const polygon = getChainProviderByCaip2("eip155:137");
+    expect(polygon).toBeDefined();
+    expect(polygon?.name).toBe("Polygon");
+    expect(polygon?.explorerTxUrl("0x123")).toBe("https://polygonscan.com/tx/0x123");
+  });
+
+  it("every provider entry round-trips through both lookup helpers", () => {
+    for (const p of CHAIN_PROVIDERS) {
+      expect(getChainProviderByCaip2(p.caip2)).toBe(p);
+      expect(getChainProviderByNumeric(p.numericId)).toBe(p);
+    }
+  });
+
+  it("every provider entry has a matching CHAINS entry", () => {
+    for (const p of CHAIN_PROVIDERS) {
+      const ci = CHAINS[p.caip2];
+      expect(ci).toBeDefined();
+      expect(ci.numericId).toBe(p.numericId);
+      expect(ci.family).toBe(p.family);
+      expect(ci.name).toBe(p.name);
+      expect(ci.symbol).toBe(p.symbol);
+      expect(ci.testnet).toBe(p.testnet);
+    }
+  });
+
+  it("Solana devnet provider URLs include cluster=devnet", () => {
+    const devnet = getChainProviderByNumeric(102);
+    expect(devnet?.explorerTxUrl("sig")).toContain("?cluster=devnet");
+    expect(devnet?.explorerAddressUrl("addr")).toContain("?cluster=devnet");
+  });
+
+  it("returns undefined for unknown chain provider lookups", () => {
+    expect(getChainProviderByNumeric(999999)).toBeUndefined();
+    expect(getChainProviderByCaip2("eip155:999999")).toBeUndefined();
   });
 });
 
@@ -164,6 +292,13 @@ describe("chainFromCaip2", () => {
 
   it("returns undefined for an unknown CAIP-2 string", () => {
     expect(chainFromCaip2("eip155:123456789")).toBeUndefined();
+  });
+
+  it("does not treat Object.prototype members as chains (SEC-116)", () => {
+    expect(chainFromCaip2("constructor")).toBeUndefined();
+    expect(fromCaip2("constructor")).toBeUndefined();
+    expect(getChainProviderByCaip2("constructor")).toBeUndefined();
+    expect(chainFromCaip2("toString")).toBeUndefined();
   });
 
   it("finds Solana devnet by CAIP-2", () => {

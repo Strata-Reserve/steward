@@ -1,11 +1,13 @@
 "use client";
 
-import { StewardAuthGuard, StewardUserButton } from "@stwd/react";
+import { PasskeyEnrollmentPrompt, StewardAuthGuard, StewardUserButton } from "@stwd/react";
 import { AnimatePresence, motion } from "framer-motion";
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { SelfHostPrompt } from "@/components/self-host-prompt";
+import { useApiReachability } from "@/lib/api-reachability";
 
 function RedirectToLogin() {
   const router = useRouter();
@@ -23,9 +25,15 @@ const links = [
   { href: "/dashboard", label: "Overview", exact: true },
   { href: "/dashboard/agents", label: "Agents" },
   { href: "/dashboard/approvals", label: "Approvals" },
+  { href: "/dashboard/intents", label: "Intents" },
+  { href: "/dashboard/actions", label: "Actions" },
   { href: "/dashboard/transactions", label: "Transactions" },
+  { href: "/dashboard/account", label: "Account" },
+  { href: "/dashboard/accounts", label: "Asset Accounts" },
+  { href: "/dashboard/users", label: "Users" },
   { href: "/dashboard/secrets", label: "Secrets" },
   { href: "/dashboard/policies", label: "Policies" },
+  { href: "/dashboard/webhooks", label: "Webhooks" },
   { href: "/dashboard/audit", label: "Audit" },
   { href: "/dashboard/settings", label: "Settings" },
   { href: "/dashboard/tenants", label: "Tenants" },
@@ -178,9 +186,42 @@ function LoadingSpinner() {
 }
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
+  // The public steward.fi deployment does not run a control plane. If the
+  // configured API origin is unreachable, render the self-host CTA instead
+  // of letting users bounce off auth-guard → login → "Failed to fetch" toast.
+  // Self-hosted dashboards have NEXT_PUBLIC_STEWARD_API_URL pointed at their
+  // own API and will pass this probe.
+  const api = useApiReachability();
+
+  if (api.status === "checking") {
+    return <LoadingSpinner />;
+  }
+
+  if (api.status === "unreachable") {
+    return (
+      <div className="min-h-screen bg-bg">
+        <SelfHostPrompt detail={api.detail} onRetry={api.refresh} />
+      </div>
+    );
+  }
+
   return (
+    // SEC-154: StewardAuthGuard is a CLIENT-only check — unauthenticated
+    // visitors still receive the full dashboard HTML/JS and are bounced only
+    // after hydration. That is safe ONLY because every dashboard page is
+    // "use client" and renders no data server-side (all fetches are
+    // Bearer-authenticated API calls that 401). Do not introduce
+    // server-rendered data under this route tree without adding a server-side
+    // session check first; dashboard-client-only.test.ts guards the invariant.
     <StewardAuthGuard fallback={<RedirectToLogin />} loadingFallback={<LoadingSpinner />}>
       <div className="min-h-screen bg-bg">
+        {/*
+          Shown only when the user just signed in via magic-link fallback after
+          a failed passkey attempt on this origin (e.g. their existing passkey
+          is bound to another relying party). The component self-hides when
+          no fallback flag is present.
+        */}
+        <PasskeyEnrollmentPrompt variant="banner" />
         <DashboardNav />
         <main className="max-w-[1400px] mx-auto px-4 md:px-6 lg:px-10 py-6 md:py-8 lg:py-12">
           {children}

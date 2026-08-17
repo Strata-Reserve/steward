@@ -12,25 +12,41 @@ services:
   steward:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile
+      dockerfile: Dockerfile
     image: steward:latest
     container_name: steward
     restart: unless-stopped
     networks:
       - milady-isolated
     ports:
-      - "3200:3200"
+      # Loopback-only: tenant keys / platform key / agent JWTs must never cross
+      # the network on plain HTTP. External access goes through the TLS
+      # terminator (deploy/nginx.conf) or an SSH tunnel — never http://<ip>:3200.
+      - "127.0.0.1:3200:3200"
     environment:
       PORT: "3200"
       STEWARD_BIND_HOST: "0.0.0.0"
-      DATABASE_URL: "${DATABASE_URL:-postgresql://steward:steward@steward-db:5432/steward}"
+      DATABASE_URL: "${DATABASE_URL:-postgresql://steward:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@steward-db:5432/steward}"
       STEWARD_MASTER_PASSWORD: "${STEWARD_MASTER_PASSWORD:?Set STEWARD_MASTER_PASSWORD in .env}"
       STEWARD_JWT_SECRET: "${STEWARD_JWT_SECRET:-}"
+      STEWARD_EXECUTION_AUTH_SECRET: "${STEWARD_EXECUTION_AUTH_SECRET:?Set STEWARD_EXECUTION_AUTH_SECRET in .env - PR4 governed provider actions fail closed if unset - generate: printf 'v1:%s' \"$(openssl rand -hex 32)\"}"
+      # The API writes required audit-chain events (approval / vault / policy
+      # routes via writeAuditEvent / withTenantAuditedTransaction), so it needs
+      # the same audit HMAC key as the proxy. Provisioned into .env by
+      # deploy/provision-steward-node.sh.
+      STEWARD_AUDIT_HMAC_KEY: "${STEWARD_AUDIT_HMAC_KEY:?Set STEWARD_AUDIT_HMAC_KEY in .env - generate with: openssl rand -hex 32}"
       STEWARD_PLATFORM_KEYS: "${STEWARD_PLATFORM_KEYS:-}"
       RPC_URL: "${RPC_URL:-https://mainnet.base.org}"
       CHAIN_ID: "${CHAIN_ID:-8453}"
       STEWARD_PLATFORM_KEY: "${STEWARD_PLATFORM_KEY:-}"
       SOLANA_RPC_URL: "${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}"
+      # SEC-079: the production image (ENV NODE_ENV=production) makes KeyStore
+      # throw without STEWARD_KDF_SALT, and email-code flows need the secret —
+      # the provisioner writes both into deploy/.env, so pass them through.
+      STEWARD_KDF_SALT: "${STEWARD_KDF_SALT:?Set STEWARD_KDF_SALT in .env - generate with: openssl rand -hex 32}"
+      STEWARD_EMAIL_CODE_SECRET: "${STEWARD_EMAIL_CODE_SECRET:-}"
+      STEWARD_PLUGINS: "${STEWARD_PLUGINS:-}"
+      WXMR_SOLANA_RPC_URL: "${WXMR_SOLANA_RPC_URL:-}"
     volumes:
       - steward-data:/app/data
     depends_on:
@@ -47,23 +63,37 @@ services:
   steward-proxy:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile
+      dockerfile: Dockerfile
     image: steward:latest
     container_name: steward-proxy
     restart: unless-stopped
     networks:
       - milady-isolated
     ports:
-      - "8080:8080"
+      # Loopback-only (see steward service above): front with TLS or SSH tunnel.
+      - "127.0.0.1:8080:8080"
     environment:
       STEWARD_PROXY_PORT: "8080"
-      DATABASE_URL: "${DATABASE_URL:-postgresql://steward:steward@steward-db:5432/steward}"
+      DATABASE_URL: "${DATABASE_URL:-postgresql://steward:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@steward-db:5432/steward}"
       STEWARD_MASTER_PASSWORD: "${STEWARD_MASTER_PASSWORD:?Set STEWARD_MASTER_PASSWORD in .env}"
-      STEWARD_JWT_SECRET: "${STEWARD_JWT_SECRET:-}"
+      # JWT secret is required in production (auth verifyToken refuses dev fallback).
+      STEWARD_JWT_SECRET: "${STEWARD_JWT_SECRET:?Set STEWARD_JWT_SECRET in .env}"
+      STEWARD_EXECUTION_AUTH_SECRET: "${STEWARD_EXECUTION_AUTH_SECRET:?Set STEWARD_EXECUTION_AUTH_SECRET in .env}"
+      # Proxy-side approval expiry extends the tamper-evident audit chain
+      # (release.ts -> withTenantAuditedTransaction); the audit HMAC key is
+      # required here or expired-approval polls fail closed in production.
+      STEWARD_AUDIT_HMAC_KEY: "${STEWARD_AUDIT_HMAC_KEY:?Set STEWARD_AUDIT_HMAC_KEY in .env - generate with: openssl rand -hex 32}"
+      # NODE_ENV=production makes request signing + Redis enforcement fail CLOSED,
+      # so both REDIS_URL and a request-signing secret are REQUIRED here. Without
+      # them the proxy returns 500/429 on 100% of traffic. See deploy/DEPLOYMENT.md.
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379}"
+      STEWARD_PROXY_REQUEST_SIGNING_SECRETS: "${STEWARD_PROXY_REQUEST_SIGNING_SECRETS:?Set STEWARD_PROXY_REQUEST_SIGNING_SECRETS in .env (proxy signs/verifies every request in production)}"
       NODE_ENV: production
     command: ["bun", "run", "packages/proxy/src/index.ts"]
     depends_on:
       steward:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "bun", "-e", "const r=await fetch('http://localhost:8080/health');process.exit(r.ok?0:1)"]
@@ -72,16 +102,49 @@ services:
       start_period: 10s
       retries: 3
 
+  # ── Redis (rate-limit + spend enforcement) ───────────────────────────────────
+  # Required by steward-proxy in production: with NODE_ENV=production and no
+  # STEWARD_ALLOW_PROXY_REDIS_SOFT_FAIL=true, the proxy fails CLOSED without Redis.
+  redis:
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    container_name: steward-redis
+    restart: unless-stopped
+    networks:
+      - milady-isolated
+    # AOF persistence + bounded memory: this Redis holds the spend-limit and
+    # rate-limit enforcement counters. Without persistence any restart
+    # (redeploy, OOM, crash) silently zeroes them and agent financial policies
+    # go unenforced until counters rebuild (SEC-021). Mirrors the root
+    # docker-compose.yml settings.
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    volumes:
+      - steward-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # ── PostgreSQL (managed) ─────────────────────────────────────────────────────
   steward-db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     container_name: steward-db
     restart: unless-stopped
     networks:
       - milady-isolated
     environment:
       POSTGRES_USER: steward
-      POSTGRES_PASSWORD: steward
+      # Required: no insecure default. Set POSTGRES_PASSWORD in deploy/.env.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
       POSTGRES_DB: steward
     volumes:
       - steward-pgdata:/var/lib/postgresql/data
@@ -96,6 +159,8 @@ volumes:
   steward-data:
     driver: local
   steward-pgdata:
+    driver: local
+  steward-redis-data:
     driver: local
 
 # ── Networks ─────────────────────────────────────────────────────────────────

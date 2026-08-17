@@ -11,6 +11,42 @@ export interface TokenInfo {
   symbol: string;
   decimals: number;
   chainId: number;
+  /** Human-readable asset name when the registry knows it. */
+  name?: string;
+  /** Canonical project URL supplied by the asset issuer/operator. */
+  website?: string;
+}
+
+// ─── Known Tokens ───────────────────────────────────────────────────────────
+
+/**
+ * Monero on Solana. The token's on-chain Metaplex metadata uses the public
+ * symbol `XMR`; `MONERO_ON_SOLANA` is the unambiguous product name used in
+ * Steward surfaces so it is not confused with native-chain Monero.
+ */
+export const MONERO_ON_SOLANA: TokenInfo = Object.freeze({
+  address: "WXMRyRZhsa19ety5erZhHg4N3xj3EVN92u94422teJp",
+  symbol: "XMR",
+  decimals: 12,
+  chainId: 101,
+  name: "Monero on Solana",
+  website: "https://wxmr.io",
+});
+
+export const KNOWN_TOKENS: readonly TokenInfo[] = Object.freeze([MONERO_ON_SOLANA]);
+
+/**
+ * Return exact token metadata when Steward knows the asset. Solana addresses
+ * are case-sensitive, while EVM addresses are conventionally case-insensitive.
+ */
+export function getKnownToken(chainId: number, tokenAddress: string): TokenInfo | undefined {
+  return KNOWN_TOKENS.find(
+    (token) =>
+      token.chainId === chainId &&
+      (chainId === 101 || chainId === 102
+        ? token.address === tokenAddress
+        : token.address.toLowerCase() === tokenAddress.toLowerCase()),
+  );
 }
 
 // ─── Native Tokens ────────────────────────────────────────────────────────────
@@ -19,6 +55,7 @@ export const NATIVE_TOKENS: Record<number, TokenInfo> = {
   1: { address: "native", symbol: "ETH", decimals: 18, chainId: 1 },
   56: { address: "native", symbol: "BNB", decimals: 18, chainId: 56 },
   97: { address: "native", symbol: "tBNB", decimals: 18, chainId: 97 },
+  100: { address: "native", symbol: "xDAI", decimals: 18, chainId: 100 },
   137: { address: "native", symbol: "POL", decimals: 18, chainId: 137 },
   8453: { address: "native", symbol: "ETH", decimals: 18, chainId: 8453 },
   42161: { address: "native", symbol: "ETH", decimals: 18, chainId: 42161 },
@@ -27,6 +64,8 @@ export const NATIVE_TOKENS: Record<number, TokenInfo> = {
   84532: { address: "native", symbol: "ETH", decimals: 18, chainId: 84532 },
   101: { address: "native", symbol: "SOL", decimals: 9, chainId: 101 },
   102: { address: "native", symbol: "SOL", decimals: 9, chainId: 102 },
+  301: { address: "native", symbol: "XMR", decimals: 12, chainId: 301 },
+  302: { address: "native", symbol: "XMR", decimals: 12, chainId: 302 },
 };
 
 // ─── Wrapped Native Tokens (for price lookups) ───────────────────────────────
@@ -34,6 +73,7 @@ export const NATIVE_TOKENS: Record<number, TokenInfo> = {
 export const WRAPPED_NATIVE: Record<number, string> = {
   1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
   56: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", // WBNB
+  100: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d", // WXDAI
   137: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", // WPOL (WMATIC)
   8453: "0x4200000000000000000000000000000000000006", // WETH (Base)
   42161: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", // WETH (Arbitrum)
@@ -49,6 +89,15 @@ export const WRAPPED_NATIVE: Record<number, string> = {
  */
 export function getNativeDecimals(chainId: number): number {
   return NATIVE_TOKENS[chainId]?.decimals ?? 18;
+}
+
+/**
+ * Strict variant of {@link getNativeDecimals} for money-conversion paths:
+ * returns null for unknown chains instead of guessing 18 decimals, so callers
+ * fail closed rather than misprice by orders of magnitude (SEC-190).
+ */
+export function getNativeDecimalsStrict(chainId: number): number | null {
+  return NATIVE_TOKENS[chainId]?.decimals ?? null;
 }
 
 /**
@@ -69,8 +118,25 @@ export function getTokenDecimals(chainId: number, tokenAddress?: string): number
   if (!tokenAddress || tokenAddress === "native" || tokenAddress === "") {
     return getNativeDecimals(chainId);
   }
+  const knownToken = getKnownToken(chainId, tokenAddress);
+  if (knownToken) return knownToken.decimals;
   const key = `${chainId}:${tokenAddress.toLowerCase()}`;
   return KNOWN_TOKEN_DECIMALS[key] ?? 18;
+}
+
+/**
+ * Strict variant of {@link getTokenDecimals} for money-conversion paths:
+ * returns null for unknown chains/tokens instead of guessing 18 decimals, so
+ * callers fail closed rather than misprice by orders of magnitude (SEC-190).
+ */
+export function getTokenDecimalsStrict(chainId: number, tokenAddress?: string): number | null {
+  if (!tokenAddress || tokenAddress === "native" || tokenAddress === "") {
+    return getNativeDecimalsStrict(chainId);
+  }
+  const knownToken = getKnownToken(chainId, tokenAddress);
+  if (knownToken) return knownToken.decimals;
+  const key = `${chainId}:${tokenAddress.toLowerCase()}`;
+  return KNOWN_TOKEN_DECIMALS[key] ?? null;
 }
 
 /**
@@ -91,6 +157,10 @@ const KNOWN_TOKEN_DECIMALS: Record<string, number> = {
   // BSC
   "56:0x55d398326f99059ff775485246999027b3197955": 18, // USDT (BSC)
   "56:0xe9e7cea3dedca5984780bafc599bd69add087d56": 18, // BUSD
+  // Gnosis
+  "100:0xddafbb505ad214d7b80b1f830fccc89b60fb7a83": 6, // USDC (Gnosis)
+  "100:0x4ecaba5870353805a9f068101a40e0f32ed605c6": 6, // USDT (Gnosis)
+  "100:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d": 18, // WXDAI
   // Base
   "8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": 6, // USDC (Base)
   "8453:0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": 6, // USDbC

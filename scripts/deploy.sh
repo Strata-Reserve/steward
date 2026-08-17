@@ -69,7 +69,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REMOTE_DIR="/opt/steward"
 BUN="/root/.bun/bin/bun"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+# Host-key checking: TOFU (accept-new) at minimum — never "no" (SEC-019).
+# Set STRICT_HOST_KEY=yes to require a pre-pinned known_hosts entry instead.
+if [[ "${STRICT_HOST_KEY:-}" == "yes" ]]; then
+  SSH_OPTS="-o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o BatchMode=yes"
+else
+  SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes"
+fi
 
 remote() {
   ssh $SSH_OPTS "root@${NODE_IP}" "$@"
@@ -109,46 +115,17 @@ fi
 # 3. Migrations
 # ---------------------------------------------------------------------------
 if $DO_MIGRATE; then
-  log "Running migrations on $NODE_IP ..."
+  log "Running migrations on $NODE_IP via drizzle migrator ..."
 
-  MIGRATION_DIR="$REMOTE_DIR/packages/db/drizzle"
-  SQL_FILES=$(remote "find $MIGRATION_DIR -maxdepth 1 -name '[0-9][0-9][0-9][0-9]_*.sql' | sort")
-
-  if [[ -z "$SQL_FILES" ]]; then
-    warn "No migration files found on remote"
-  else
-    # Read DATABASE_URL from remote .env
-    REMOTE_DB_URL=$(remote "grep -E '^DATABASE_URL=' $REMOTE_DIR/.env | head -1 | cut -d'=' -f2-" 2>/dev/null || true)
-    REMOTE_DB_URL="${REMOTE_DB_URL#\"}"
-    REMOTE_DB_URL="${REMOTE_DB_URL%\"}"
-    REMOTE_DB_URL="${REMOTE_DB_URL#\'}"
-    REMOTE_DB_URL="${REMOTE_DB_URL%\'}"
-
-    if [[ -z "$REMOTE_DB_URL" ]]; then
-      fail "Could not read DATABASE_URL from $REMOTE_DIR/.env on $NODE_IP"
-      exit 1
-    fi
-
-    MIGRATE_FAILED=false
-    while IFS= read -r sql_file; do
-      [[ -z "$sql_file" ]] && continue
-      name="$(basename "$sql_file")"
-      echo -n "  $name ... "
-
-      if remote "psql '$REMOTE_DB_URL' -v ON_ERROR_STOP=1 -f '$sql_file'" > /dev/null 2>&1; then
-        echo -e "${GREEN}OK${RESET}"
-      else
-        echo -e "${RED}FAILED${RESET}"
-        MIGRATE_FAILED=true
-        break
-      fi
-    done <<< "$SQL_FILES"
-
-    if $MIGRATE_FAILED; then
-      fail "Migration failed, aborting"
-      exit 1
-    fi
+  # Source DATABASE_URL from remote .env and run the in-app migrator. This uses
+  # drizzle's __drizzle_migrations tracking table, acquires an advisory lock
+  # for multi-replica safety, and backfills the tracking table on first run
+  # against a DB that was previously migrated by the old psql loop.
+  if remote "cd $REMOTE_DIR && set -a && . ./.env && set +a && $BUN packages/db/src/migrate.ts"; then
     ok "Migrations complete"
+  else
+    fail "Migration failed, aborting"
+    exit 1
   fi
 fi
 

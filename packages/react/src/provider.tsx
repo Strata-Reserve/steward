@@ -1,6 +1,14 @@
 import type { StewardSession } from "@stwd/sdk";
 import { StewardAuth } from "@stwd/sdk";
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type {
   StewardAuthConfig,
   StewardAuthContextValue,
@@ -47,7 +55,7 @@ export interface StewardProviderWithAuthProps extends StewardProviderProps {
    * <StewardProvider
    *   client={client}
    *   agentId="abc"
-   *   auth={{ baseUrl: "https://api.steward.fi" }}
+   *   auth={{ baseUrl: "http://localhost:3200" }}
    *   tenantId="my-app"
    * >
    *   <App />
@@ -85,17 +93,26 @@ export function StewardProvider({
     return new StewardAuth({
       baseUrl: authConfig.baseUrl,
       storage: authConfig.storage,
+      tenantId: authConfig.tenantId ?? tenantIdProp,
+      authProxyUrl: authConfig.authProxyUrl,
     });
-  }, [authConfig?.baseUrl, authConfig?.storage, authConfig]);
+  }, [
+    authConfig?.baseUrl,
+    authConfig?.storage,
+    authConfig?.tenantId,
+    authConfig?.authProxyUrl,
+    tenantIdProp,
+  ]);
 
   const [authSession, setAuthSession] = useState<StewardSession | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authInitialized, setAuthInitialized] = useState(false);
+  const lastBootstrapKeyRef = useRef<string | null>(null);
 
   // Subscribe to session changes from the StewardAuth instance
   useEffect(() => {
     if (!authInstance) return;
-    // Sync initial session (must run client-side where localStorage exists)
+    // Sync initial session from the configured SDK storage.
     setAuthSession(authInstance.getSession());
     setAuthInitialized(true);
     // Subscribe to future changes
@@ -107,6 +124,52 @@ export function StewardProvider({
 
   const signOut = useCallback(() => {
     authInstance?.signOut();
+  }, [authInstance]);
+
+  const guestState = useMemo(
+    () =>
+      authInstance?.getGuestState() ?? {
+        isGuest: false,
+        isExpired: false,
+        expiryMessage: null,
+      },
+    [authInstance, authSession],
+  );
+
+  const signInAsGuest = useCallback(
+    async (options?: import("@stwd/sdk").StewardGuestSignInOptions) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.signInAsGuest(options);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const upgradeGuestWithEmail = useCallback(
+    async (input: import("@stwd/sdk").StewardGuestUpgradeEmailInput) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.upgradeGuestWithEmail(input);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const deleteGuest = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    setAuthLoading(true);
+    try {
+      return await authInstance.deleteGuest();
+    } finally {
+      setAuthLoading(false);
+    }
   }, [authInstance]);
 
   const getToken = useCallback((): string | null => {
@@ -126,10 +189,65 @@ export function StewardProvider({
     [authInstance],
   );
 
-  const signInWithEmail = useCallback(
+  const addPasskey = useCallback(
     async (email: string) => {
       if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
-      return authInstance.signInWithEmail(email);
+      setAuthLoading(true);
+      try {
+        return await authInstance.addPasskey(email);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const signInWithEmail = useCallback(
+    async (email: string, captchaToken?: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.signInWithEmail(email, captchaToken);
+    },
+    [authInstance],
+  );
+
+  const sendSmsOtp = useCallback(
+    async (phone: string, captchaToken?: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.sendSmsOtp(phone, captchaToken);
+    },
+    [authInstance],
+  );
+
+  const verifySmsOtp = useCallback(
+    async (phone: string, code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.verifySmsOtp(phone, code);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const sendWhatsAppOtp = useCallback(
+    async (phone: string, captchaToken?: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.sendWhatsAppOtp(phone, captchaToken);
+    },
+    [authInstance],
+  );
+
+  const verifyWhatsAppOtp = useCallback(
+    async (phone: string, code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.verifyWhatsAppOtp(phone, code);
+      } finally {
+        setAuthLoading(false);
+      }
     },
     [authInstance],
   );
@@ -169,7 +287,9 @@ export function StewardProvider({
         signInWithSolana?: (
           publicKey: string,
           signMessage: (msg: Uint8Array) => Promise<Uint8Array>,
-        ) => Promise<import("@stwd/sdk").StewardAuthResult>;
+        ) => Promise<
+          import("@stwd/sdk").StewardAuthResult | import("@stwd/sdk").StewardMfaRequiredResult
+        >;
       }
     ).signInWithSolana;
     if (typeof impl !== "function") return undefined;
@@ -192,6 +312,204 @@ export function StewardProvider({
       } finally {
         setAuthLoading(false);
       }
+    },
+    [authInstance],
+  );
+
+  const signInWithTelegram = useCallback(
+    async (
+      payload: import("@stwd/sdk").StewardTelegramLoginPayload,
+      config?: import("@stwd/sdk").StewardTelegramLoginConfig,
+    ) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.signInWithTelegram(payload, config);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const signInWithFarcaster = useCallback(
+    async (
+      payload: import("@stwd/sdk").StewardFarcasterLoginPayload,
+      config?: import("@stwd/sdk").StewardFarcasterLoginConfig,
+    ) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.signInWithFarcaster(payload, config);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const getIdentityToken = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    return authInstance.getIdentityToken();
+  }, [authInstance]);
+
+  const getTotpStatus = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    return authInstance.getTotpStatus();
+  }, [authInstance]);
+
+  const enrollTotp = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    return authInstance.enrollTotp();
+  }, [authInstance]);
+
+  const verifyTotp = useCallback(
+    async (code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.verifyTotp(code);
+    },
+    [authInstance],
+  );
+
+  const completeTotpMfa = useCallback(
+    async (challengeId: string, code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.completeTotpMfa(challengeId, code);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const completeRecoveryCodeMfa = useCallback(
+    async (challengeId: string, recoveryCode: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.completeRecoveryCodeMfa(challengeId, recoveryCode);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const stepUpWithTotp = useCallback(
+    async (code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.stepUpWithTotp(code);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const stepUpWithRecoveryCode = useCallback(
+    async (recoveryCode: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.stepUpWithRecoveryCode(recoveryCode);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const getRecoveryCodeStatus = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    return authInstance.getRecoveryCodeStatus();
+  }, [authInstance]);
+
+  const regenerateRecoveryCodes = useCallback(
+    async (code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.regenerateRecoveryCodes(code);
+    },
+    [authInstance],
+  );
+
+  const unenrollTotp = useCallback(
+    async (code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.unenrollTotp(code);
+    },
+    [authInstance],
+  );
+
+  const getSmsMfaStatus = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    return authInstance.getSmsMfaStatus();
+  }, [authInstance]);
+
+  const enrollSmsMfa = useCallback(
+    async (phone: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.enrollSmsMfa(phone);
+    },
+    [authInstance],
+  );
+
+  const verifySmsMfa = useCallback(
+    async (code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.verifySmsMfa(code);
+    },
+    [authInstance],
+  );
+
+  const sendSmsMfaCode = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    return authInstance.sendSmsMfaCode();
+  }, [authInstance]);
+
+  const completeSmsMfa = useCallback(
+    async (challengeId: string, code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.completeSmsMfa(challengeId, code);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const stepUpWithSms = useCallback(
+    async (code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      setAuthLoading(true);
+      try {
+        return await authInstance.stepUpWithSms(code);
+      } finally {
+        setAuthLoading(false);
+      }
+    },
+    [authInstance],
+  );
+
+  const completePasskeyMfa = useCallback(async () => {
+    if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+    setAuthLoading(true);
+    try {
+      return await authInstance.completePasskeyMfa();
+    } finally {
+      setAuthLoading(false);
+    }
+  }, [authInstance]);
+
+  const unenrollSmsMfa = useCallback(
+    async (code: string) => {
+      if (!authInstance) throw new Error("StewardProvider: auth prop not configured");
+      return authInstance.unenrollSmsMfa(code);
     },
     [authInstance],
   );
@@ -323,6 +641,18 @@ export function StewardProvider({
     };
   }, [authInstance, authSession]);
 
+  useEffect(() => {
+    if (!authInstance || !authSession) return;
+    const tenantId = authInstance.getTenantId() ?? activeTenantId ?? undefined;
+    const bootstrapKey = `${authSession.token}:${tenantId ?? ""}`;
+    if (lastBootstrapKeyRef.current === bootstrapKey) return;
+    lastBootstrapKeyRef.current = bootstrapKey;
+    authInstance.getCurrentUser({ tenantId }).catch(() => {
+      // Bootstrap is best effort: auth remains valid even if user metadata or
+      // create-on-login wallet provisioning is temporarily unavailable.
+    });
+  }, [activeTenantId, authInstance, authSession]);
+
   const authContextValue = useMemo<StewardAuthContextValue | null>(() => {
     if (!authInstance) return null;
     return {
@@ -332,14 +662,44 @@ export function StewardProvider({
       session: authSession,
       providers,
       isProvidersLoading,
+      guestState,
       signOut,
+      signInAsGuest,
+      upgradeGuestWithEmail,
+      deleteGuest,
       getToken,
       signInWithPasskey,
+      addPasskey,
       signInWithEmail,
+      sendSmsOtp,
+      verifySmsOtp,
+      sendWhatsAppOtp,
+      verifyWhatsAppOtp,
       verifyEmailCallback,
       signInWithSIWE,
       signInWithSolana,
       signInWithOAuth,
+      signInWithTelegram,
+      signInWithFarcaster,
+      getIdentityToken,
+      getTotpStatus,
+      enrollTotp,
+      verifyTotp,
+      completeTotpMfa,
+      completeRecoveryCodeMfa,
+      stepUpWithTotp,
+      stepUpWithRecoveryCode,
+      getRecoveryCodeStatus,
+      regenerateRecoveryCodes,
+      unenrollTotp,
+      getSmsMfaStatus,
+      enrollSmsMfa,
+      verifySmsMfa,
+      sendSmsMfaCode,
+      completeSmsMfa,
+      stepUpWithSms,
+      completePasskeyMfa,
+      unenrollSmsMfa,
       // Multi-tenant
       activeTenantId,
       tenants,
@@ -356,14 +716,44 @@ export function StewardProvider({
     authInitialized,
     providers,
     isProvidersLoading,
+    guestState,
     signOut,
+    signInAsGuest,
+    upgradeGuestWithEmail,
+    deleteGuest,
     getToken,
     signInWithPasskey,
+    addPasskey,
     signInWithEmail,
+    sendSmsOtp,
+    verifySmsOtp,
+    sendWhatsAppOtp,
+    verifyWhatsAppOtp,
     verifyEmailCallback,
     signInWithSIWE,
     signInWithSolana,
     signInWithOAuth,
+    signInWithTelegram,
+    signInWithFarcaster,
+    getIdentityToken,
+    getTotpStatus,
+    enrollTotp,
+    verifyTotp,
+    completeTotpMfa,
+    completeRecoveryCodeMfa,
+    stepUpWithTotp,
+    stepUpWithRecoveryCode,
+    getRecoveryCodeStatus,
+    regenerateRecoveryCodes,
+    unenrollTotp,
+    getSmsMfaStatus,
+    enrollSmsMfa,
+    verifySmsMfa,
+    sendSmsMfaCode,
+    completeSmsMfa,
+    stepUpWithSms,
+    completePasskeyMfa,
+    unenrollSmsMfa,
     activeTenantId,
     tenants,
     isTenantsLoading,

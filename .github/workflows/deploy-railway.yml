@@ -1,9 +1,21 @@
-# Deploy to Railway
+# Deploy to Railway PRODUCTION (gated)
+#
+# Branch strategy:
+#   develop ──(deploy-staging.yml, auto)──▶ STAGING
+#   main    ──(THIS workflow, manual/gated)──▶ PRODUCTION
+#
+# Production is promoted DELIBERATELY, never auto-deployed. Promotion = merge
+# develop -> main (reviewed), then a maintainer dispatches this workflow with
+# the image tag to ship (`main` or a `v*` release tag). The `production` GitHub
+# environment can carry required-reviewer protection for a second gate. Prod
+# should rarely change.
+#
 # Triggers:
 #   1. Manual dispatch (workflow_dispatch) with image tag input
-#   2. Reusable workflow (workflow_call) from other repos (e.g. milady)
-#   3. Automatically after Docker workflow completes on develop/tags
-name: Deploy Railway
+#   2. Reusable workflow (workflow_call) for downstream consumers that embed
+#      Steward as a dependency (Steward is a standalone, self-hostable OSS
+#      product; consumers integrate via its API, they do not own it).
+name: Deploy Railway (Production)
 
 on:
   # Manual trigger from Actions tab
@@ -19,7 +31,7 @@ on:
         type: boolean
         default: false
 
-  # Reusable workflow (callable from milady or other repos)
+  # Reusable workflow (callable by downstream consumers embedding Steward)
   workflow_call:
     inputs:
       image_tag:
@@ -42,28 +54,40 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Bind to the `production` GitHub environment so required-reviewer / wait
+    # timer protection rules (configured in repo Settings → Environments) gate
+    # the prod deploy. This is the second gate on top of "only from main".
+    environment:
+      name: Production
+      url: ${{ vars.PRODUCTION_RAILWAY_HEALTH_URL }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Resolve the image tag based on trigger type
       - name: Resolve image tag
         id: resolve
+        # image_tag is a caller-supplied input; pass it via env (never inline
+        # into the script) to avoid shell expression-injection.
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          TAG="${{ inputs.image_tag }}"
+          TAG="$IMAGE_TAG"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Image tag resolved: ${TAG}"
 
       - name: Resolve dry-run flag
         id: flags
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
 
       # Create GitHub deployment (shows in repo's Deployments tab)
       - name: Create GitHub deployment
         id: deployment
-        uses: chrnorm/deployment-action@v2
+        uses: chrnorm/deployment-action@500aa6a23c81ffa1acf71072aee3cfa2cc2e556a # v2
         with:
           token: ${{ github.token }}
           environment: production
@@ -75,28 +99,38 @@ jobs:
         id: deploy
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          # Instance-specific deploy target comes from the DEPLOYER's own repo
+          # config (a self-hoster sets PRODUCTION_RAILWAY_* vars for their own
+          # Railway). Nothing about any specific instance is baked into source.
+          RAILWAY_SERVICE_ID: ${{ vars.PRODUCTION_RAILWAY_SERVICE_ID }}
+          RAILWAY_ENV_ID: ${{ vars.PRODUCTION_RAILWAY_ENV_ID }}
+          RAILWAY_HEALTH_URL: ${{ vars.PRODUCTION_RAILWAY_HEALTH_URL }}
+          # Step outputs derive from the caller-supplied image_tag input, so they
+          # are still tainted — pass via env instead of inlining into the script.
+          RESOLVED_TAG: ${{ steps.resolve.outputs.tag }}
+          DRY_RUN: ${{ steps.flags.outputs.dry_run }}
         run: |
-          ARGS="${{ steps.resolve.outputs.tag }}"
-          if [[ "${{ steps.flags.outputs.dry_run }}" == "true" ]]; then
-            ARGS="${ARGS} --dry-run"
+          ARGS=("$RESOLVED_TAG")
+          if [[ "$DRY_RUN" == "true" ]]; then
+            ARGS+=(--dry-run)
           fi
           chmod +x scripts/railway-deploy.sh
-          ./scripts/railway-deploy.sh $ARGS
+          ./scripts/railway-deploy.sh "${ARGS[@]}"
 
       # Update deployment status on success
       - name: Update deployment status (success)
         if: success()
-        uses: chrnorm/deployment-status@v2
+        uses: chrnorm/deployment-status@6df8d036fd2fee9eb82936733953da1f8382b41e # v2
         with:
           token: ${{ github.token }}
           deployment-id: ${{ steps.deployment.outputs.deployment_id }}
           state: success
-          environment-url: https://steward-api-production-115d.up.railway.app
+          environment-url: ${{ vars.PRODUCTION_RAILWAY_HEALTH_URL }}
 
       # Update deployment status on failure
       - name: Update deployment status (failure)
         if: failure()
-        uses: chrnorm/deployment-status@v2
+        uses: chrnorm/deployment-status@6df8d036fd2fee9eb82936733953da1f8382b41e # v2
         with:
           token: ${{ github.token }}
           deployment-id: ${{ steps.deployment.outputs.deployment_id }}
