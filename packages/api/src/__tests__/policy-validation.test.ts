@@ -119,6 +119,31 @@ describe("policy rule validation", () => {
     ).toBeNull();
   });
 
+  it("accepts an exact action-aware manual-approval policy and rejects wildcards/empty actions", () => {
+    expect(
+      getPolicyRulesValidationError([
+        {
+          id: "manual-transfer-review",
+          type: "manual-approval",
+          enabled: true,
+          config: { actions: ["wallet_action_transfer"] },
+        },
+      ]),
+    ).toBeNull();
+    for (const actions of [
+      [],
+      ["*"],
+      ["wallet_action_*"],
+      ["wallet_action_transfer", "wallet_action_transfer"],
+    ]) {
+      expect(
+        getPolicyRulesValidationError([
+          { id: "bad-manual", type: "manual-approval", enabled: true, config: { actions } },
+        ]),
+      ).toContain("exact action names");
+    }
+  });
+
   it("accepts valid contract-allowlist configs", () => {
     expect(
       getPolicyRulesValidationError([

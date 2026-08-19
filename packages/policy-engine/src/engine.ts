@@ -37,6 +37,8 @@ export type PolicySimulationRequest = TransactionSimulationRequest | ProxySimula
 
 export interface PolicyEvaluationContext {
   request: SignRequest;
+  /** Exact wallet/application action being evaluated, when one exists. */
+  action?: string;
   recentTxCount24h: number;
   recentTxCount1h: number;
   /**
@@ -193,6 +195,7 @@ export class PolicyEngine {
 
     const evaluatorCtx: EvaluatorContext = {
       request: ctx.request,
+      ...(ctx.action === undefined ? {} : { action: ctx.action }),
       recentTxCount24h: ctx.recentTxCount24h,
       recentTxCount1h: ctx.recentTxCount1h,
       spentToday: ctx.spentToday,
@@ -223,7 +226,10 @@ export class PolicyEngine {
       return evaluationResult;
     }
 
-    const hardPolicies = results.filter((r) => r.type !== "auto-approve-threshold");
+    const hardPolicies = results.filter(
+      (r) => r.type !== "auto-approve-threshold" && r.type !== "manual-approval",
+    );
+    const manualApprovalResults = results.filter((r) => r.type === "manual-approval");
     const autoApproveResults = results.filter((r) => r.type === "auto-approve-threshold");
 
     // A hard policy either passed, failed-soft (explicitly requesting manual
@@ -238,19 +244,29 @@ export class PolicyEngine {
     const hardFailed = hardPolicies.some((r) => !r.passed && !resultRequiresManualApproval(r));
     const allHardPass = hardPolicies.every((r) => r.passed);
 
+    const manualApprovalRequested = manualApprovalResults.some(resultRequiresManualApproval);
     const autoApprovePass =
       autoApproveResults.length === 0 || autoApproveResults.every((r) => r.passed);
 
     let evaluationResult: EvaluationResult;
     if (hardFailed) {
-      // A hard policy failed without requesting manual review - reject.
+      // HARD RULES WIN. A matching manual-approval policy can never rescue a
+      // chain/token/selector/recipient/amount/rate failure into an approvable
+      // request.
       evaluationResult = { approved: false, results, requiresManualApproval: false };
-    } else if (allHardPass && autoApprovePass) {
+    } else if (!allHardPass) {
+      // An existing hard policy explicitly requested manual review (e.g.
+      // reputation require-approval); preserved for compatibility.
+      evaluationResult = { approved: false, results, requiresManualApproval: true };
+    } else if (manualApprovalRequested) {
+      // Every hard rule passed. The first-class action-aware policy now
+      // independently requires an explicit tenant-human approve/deny.
+      evaluationResult = { approved: false, results, requiresManualApproval: true };
+    } else if (autoApprovePass) {
       evaluationResult = { approved: true, results, requiresManualApproval: false };
     } else {
-      // No hard failure, but either a hard policy requested manual review
-      // (e.g. reputation-threshold `require-approval`) and/or the value exceeds
-      // the auto-approve threshold. Queue for manual approval rather than deny.
+      // Legacy threshold-based manual review remains supported but is no longer
+      // abused to represent action-level human approval.
       evaluationResult = { approved: false, results, requiresManualApproval: true };
     }
 

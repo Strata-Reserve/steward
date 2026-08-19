@@ -205,6 +205,23 @@ function validatePolicyConfig(policy: PolicyRule): string | null {
       }
       return null;
 
+    case "manual-approval":
+      if (
+        !hasOnlyKeys(config, new Set(["actions"])) ||
+        !Array.isArray(config.actions) ||
+        config.actions.length === 0 ||
+        !config.actions.every(
+          (action) =>
+            typeof action === "string" &&
+            /^[a-z][a-z0-9_:-]{0,127}$/.test(action) &&
+            !action.includes("*"),
+        ) ||
+        new Set(config.actions).size !== config.actions.length
+      ) {
+        return "manual-approval.actions must be a non-empty unique array of exact action names (no wildcards)";
+      }
+      return null;
+
     case "contract-allowlist":
       if (
         !Array.isArray(config.contracts) ||
