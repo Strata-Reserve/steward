@@ -1,5 +1,15 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { agents, closeDb, getDb, policies, tenants, transactions } from "@stwd/db";
+import {
+  agents,
+  approvalQueue,
+  closeDb,
+  getDb,
+  policies,
+  tenants,
+  transactions,
+  users,
+  userTenants,
+} from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -9,6 +19,9 @@ const TENANT_ID = `wallet-actions-tenant-${Date.now()}`;
 const OTHER_TENANT_ID = `wallet-actions-other-tenant-${Date.now()}`;
 const AGENT_ID = `wallet-actions-agent-${Date.now()}`;
 const AGENT_WITHOUT_ALLOWLIST_ID = `wallet-actions-no-allowlist-${Date.now()}`;
+const MANUAL_AGENT_ID = `wallet-actions-manual-${Date.now()}`;
+const REQUESTER_USER_ID = crypto.randomUUID();
+const APPROVER_USER_ID = crypto.randomUUID();
 const SOLANA_AGENT_ID = `wallet-actions-solana-agent-${Date.now()}`;
 const SOLANA_AGENT_WITHOUT_MINT_ID = `wallet-actions-solana-no-mint-${Date.now()}`;
 const ALLOWED = "0x1234567890123456789012345678901234567890";
@@ -22,15 +35,29 @@ function expectedErc20TransferCalldata(recipient: string, amount: string) {
   return `0xa9059cbb${recipient.toLowerCase().replace(/^0x/, "").padStart(64, "0")}${BigInt(amount).toString(16).padStart(64, "0")}`;
 }
 
-async function makeApp(tenantId = TENANT_ID) {
+async function makeApp(tenantId = TENANT_ID, userId = REQUESTER_USER_ID) {
   const { vaultRoutes } = await import("../routes/vault");
   const app = new Hono<{ Variables: AppVariables }>();
   app.use("*", async (c, next) => {
     c.set("tenantId", tenantId);
     c.set("authType", "session-jwt");
     c.set("tenantRole", "admin");
-    c.set("userId", "wallet-actions-admin");
+    c.set("userId", userId);
     c.set("sessionMfaVerifiedAt", Date.now());
+    await next();
+  });
+  app.route("/vault", vaultRoutes);
+  return app;
+}
+
+async function makeAgentCredentialApp() {
+  const { vaultRoutes } = await import("../routes/vault");
+  const app = new Hono<{ Variables: AppVariables }>();
+  app.use("*", async (c, next) => {
+    c.set("tenantId", TENANT_ID);
+    c.set("authType", "agent-jwt");
+    c.set("agentId", MANUAL_AGENT_ID);
+    c.set("tenantRole", undefined);
     await next();
   });
   app.route("/vault", vaultRoutes);
@@ -74,6 +101,32 @@ describe("wallet transfer actions", () => {
       name: "Wallet Actions Agent Without Allowlist",
       walletAddress: "0x0000000000000000000000000000000000000002",
     });
+    await getDb().insert(agents).values({
+      id: MANUAL_AGENT_ID,
+      tenantId: TENANT_ID,
+      name: "Manual Approval Wallet Actions Agent",
+      walletAddress: "0x0000000000000000000000000000000000000003",
+    });
+    await getDb()
+      .insert(users)
+      .values([
+        {
+          id: REQUESTER_USER_ID,
+          email: `requester-${Date.now()}@example.com`,
+          walletAddress: "0x0000000000000000000000000000000000000011",
+        },
+        {
+          id: APPROVER_USER_ID,
+          email: `approver-${Date.now()}@example.com`,
+          walletAddress: "0x0000000000000000000000000000000000000012",
+        },
+      ]);
+    await getDb()
+      .insert(userTenants)
+      .values([
+        { userId: REQUESTER_USER_ID, tenantId: TENANT_ID, role: "admin" },
+        { userId: APPROVER_USER_ID, tenantId: TENANT_ID, role: "admin" },
+      ]);
     await getDb().insert(agents).values({
       id: SOLANA_AGENT_ID,
       tenantId: TENANT_ID,
@@ -126,6 +179,59 @@ describe("wallet transfer actions", () => {
         enabled: true,
         config: { threshold: "999" },
       });
+    await getDb()
+      .insert(policies)
+      .values([
+        {
+          id: "manual-agent-chain",
+          agentId: MANUAL_AGENT_ID,
+          type: "allowed-chains",
+          enabled: true,
+          config: { chains: ["eip155:84532"] },
+        },
+        {
+          id: "manual-agent-addresses",
+          agentId: MANUAL_AGENT_ID,
+          type: "approved-addresses",
+          enabled: true,
+          config: { addresses: [TOKEN], mode: "whitelist" },
+        },
+        {
+          id: "manual-agent-contract",
+          agentId: MANUAL_AGENT_ID,
+          type: "contract-allowlist",
+          enabled: true,
+          config: {
+            contracts: [
+              {
+                address: TOKEN,
+                selectors: ["0xa9059cbb"],
+                constraints: {
+                  "0xa9059cbb": {
+                    recipientAllowlist: [ALLOWED],
+                    maxNativeValueWei: "0",
+                    maxAmount: "1000000",
+                  },
+                },
+              },
+            ],
+          },
+        },
+        {
+          id: "manual-agent-rate",
+          agentId: MANUAL_AGENT_ID,
+          type: "rate-limit",
+          enabled: true,
+          config: { maxTxPerHour: 100, maxTxPerDay: 100 },
+        },
+        {
+          id: "manual-agent-review",
+          agentId: MANUAL_AGENT_ID,
+          type: "manual-approval",
+          enabled: true,
+          config: { actions: ["wallet_action_transfer"] },
+        },
+      ]);
     await getDb()
       .insert(policies)
       .values({
@@ -776,6 +882,237 @@ describe("wallet transfer actions", () => {
     } finally {
       context.vault.buildSolanaSplTransferTransaction = originalBuildSplTransfer;
       context.vault.signSolanaTransaction = originalSignSolanaTransaction;
+    }
+  });
+
+  it("STRATA-1097: permitted ERC20 transfer stays pending until a different tenant human explicitly approves", async () => {
+    const context = await import("../services/context");
+    const originalSign = context.vault.signTransaction.bind(context.vault);
+    const previousRequiredActions = process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS;
+    process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS = "wallet_action_transfer";
+    let signCalls = 0;
+    context.vault.signTransaction = async (request) => {
+      signCalls += 1;
+      expect(request.agentId).toBe(MANUAL_AGENT_ID);
+      expect(request.chainId).toBe(84532);
+      expect(request.to).toBe(TOKEN);
+      expect(request.value).toBe("0");
+      expect(request.data).toBe(expectedErc20TransferCalldata(ALLOWED, "1"));
+      expect(request.broadcast).toBe(true);
+      return "0xmanualapprovaltx";
+    };
+
+    try {
+      const requesterApp = await makeApp(TENANT_ID, REQUESTER_USER_ID);
+      const pending = await requesterApp.request(`/vault/${MANUAL_AGENT_ID}/actions/transfer`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "manual-pending-1" },
+        body: JSON.stringify({
+          to: ALLOWED,
+          token: TOKEN,
+          value: "1",
+          chainId: 84532,
+          broadcast: true,
+          referenceId: "manual-pending-1",
+        }),
+      });
+      expect(pending.status).toBe(202);
+      const pendingBody = (await pending.json()) as {
+        ok: boolean;
+        data: { id: string; status: string };
+      };
+      expect(pendingBody.ok).toBe(true);
+      expect(pendingBody.data.status).toBe("pending_approval");
+      expect(signCalls).toBe(0); // no sign/broadcast before approval
+
+      const [queued] = await getDb()
+        .select()
+        .from(approvalQueue)
+        .where(eq(approvalQueue.txId, pendingBody.data.id));
+      expect(queued.status).toBe("pending");
+      expect(queued.requestedByType).toBe("user");
+      expect(queued.requestedById).toBe(REQUESTER_USER_ID);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const [stillPending] = await getDb()
+        .select()
+        .from(approvalQueue)
+        .where(eq(approvalQueue.txId, pendingBody.data.id));
+      expect(stillPending.status).toBe("pending");
+      expect(stillPending.resolvedAt).toBeNull();
+
+      // An agent/API credential cannot self-approve.
+      const agentApp = await makeAgentCredentialApp();
+      const agentApprove = await agentApp.request(
+        `/vault/${MANUAL_AGENT_ID}/approve/${pendingBody.data.id}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "Idempotency-Key": "agent-self-approve" },
+        },
+      );
+      expect(agentApprove.status).toBe(403);
+      expect(signCalls).toBe(0);
+
+      const approverApp = await makeApp(TENANT_ID, APPROVER_USER_ID);
+      const approved = await approverApp.request(
+        `/vault/${MANUAL_AGENT_ID}/approve/${pendingBody.data.id}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "Idempotency-Key": "human-approve-1" },
+        },
+      );
+      expect(approved.status).toBe(200);
+      expect(signCalls).toBe(1);
+
+      const [evidence] = await getDb()
+        .select()
+        .from(approvalQueue)
+        .where(eq(approvalQueue.txId, pendingBody.data.id));
+      expect(evidence.status).toBe("approved");
+      expect(evidence.resolvedByType).toBe("user");
+      expect(evidence.resolvedById).toBe(APPROVER_USER_ID);
+      expect(evidence.resolvedAt).not.toBeNull();
+      const [tx] = await getDb()
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, pendingBody.data.id));
+      expect(tx.status).toBe("broadcast");
+      expect(tx.txHash).toBe("0xmanualapprovaltx");
+      expect(tx.policyResults).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            policyId: "manual-agent-review",
+            passed: false,
+            requiresManualApproval: true,
+          }),
+        ]),
+      );
+    } finally {
+      context.vault.signTransaction = originalSign;
+      if (previousRequiredActions === undefined) {
+        delete process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS;
+      } else {
+        process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS = previousRequiredActions;
+      }
+    }
+  });
+
+  it("STRATA-1097: explicit human deny is terminal and never reaches signing", async () => {
+    const context = await import("../services/context");
+    const originalSign = context.vault.signTransaction.bind(context.vault);
+    let signCalls = 0;
+    context.vault.signTransaction = async () => {
+      signCalls += 1;
+      return "0xshould-not-sign";
+    };
+    try {
+      const requesterApp = await makeApp(TENANT_ID, REQUESTER_USER_ID);
+      const pending = await requesterApp.request(`/vault/${MANUAL_AGENT_ID}/actions/transfer`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "Idempotency-Key": "manual-deny-1" },
+        body: JSON.stringify({
+          to: ALLOWED,
+          token: TOKEN,
+          value: "1",
+          chainId: 84532,
+          broadcast: true,
+          referenceId: "manual-deny-1",
+        }),
+      });
+      expect(pending.status).toBe(202);
+      const id = ((await pending.json()) as { data: { id: string } }).data.id;
+
+      const approverApp = await makeApp(TENANT_ID, APPROVER_USER_ID);
+      const denied = await approverApp.request(`/vault/${MANUAL_AGENT_ID}/reject/${id}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: "Rehearsal cancelled" }),
+      });
+      expect(denied.status).toBe(200);
+      expect(signCalls).toBe(0);
+      const [tx] = await getDb().select().from(transactions).where(eq(transactions.id, id));
+      expect(tx.status).toBe("rejected");
+      const [evidence] = await getDb()
+        .select()
+        .from(approvalQueue)
+        .where(eq(approvalQueue.txId, id));
+      expect(evidence.status).toBe("rejected");
+      expect(evidence.resolvedByType).toBe("user");
+      expect(evidence.resolvedById).toBe(APPROVER_USER_ID);
+    } finally {
+      context.vault.signTransaction = originalSign;
+    }
+  });
+
+  it("STRATA-1097: hard chain/token/recipient/amount failures are terminal and create no approval row", async () => {
+    const cases = [
+      {
+        key: "wrong-chain",
+        body: { to: ALLOWED, token: TOKEN, value: "1", chainId: 1, broadcast: false },
+      },
+      {
+        key: "wrong-token",
+        body: { to: ALLOWED, token: BLOCKED, value: "1", chainId: 84532, broadcast: false },
+      },
+      {
+        key: "wrong-recipient",
+        body: { to: BLOCKED, token: TOKEN, value: "1", chainId: 84532, broadcast: false },
+      },
+      {
+        key: "over-amount",
+        body: { to: ALLOWED, token: TOKEN, value: "1000001", chainId: 84532, broadcast: false },
+      },
+    ];
+    const requesterApp = await makeApp(TENANT_ID, REQUESTER_USER_ID);
+    for (const item of cases) {
+      const response = await requesterApp.request(`/vault/${MANUAL_AGENT_ID}/actions/transfer`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...item.body, referenceId: `manual-${item.key}` }),
+      });
+      expect(response.status).toBe(403);
+      const body = (await response.json()) as { data?: { id?: string; status?: string } };
+      expect(body.data?.status).toBe("rejected");
+      if (body.data?.id) {
+        const approvals = await getDb()
+          .select()
+          .from(approvalQueue)
+          .where(eq(approvalQueue.txId, body.data.id));
+        expect(approvals).toHaveLength(0);
+      }
+    }
+  });
+
+  it("STRATA-1097 activation guard refuses required action when explicit manual policy is absent", async () => {
+    const previous = process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS;
+    process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS = "wallet_action_transfer";
+    try {
+      const response = await app.request(`/vault/${AGENT_WITHOUT_ALLOWLIST_ID}/actions/transfer`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          to: ALLOWED,
+          value: "1",
+          chainId: 84532,
+          broadcast: false,
+          referenceId: "manual-rule-required",
+        }),
+      });
+      expect(response.status).toBe(503);
+      expect((await response.json()).error).toContain("requires an enabled manual-approval policy");
+      const rows = await getDb()
+        .select()
+        .from(transactions)
+        .where(eq(transactions.agentId, AGENT_WITHOUT_ALLOWLIST_ID));
+      expect(
+        rows.some(
+          (row) =>
+            (row.actionPayload as { referenceId?: string } | null)?.referenceId ===
+            "manual-rule-required",
+        ),
+      ).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS;
+      else process.env.STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS = previous;
     }
   });
 });

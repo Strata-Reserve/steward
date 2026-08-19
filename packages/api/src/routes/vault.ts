@@ -20,6 +20,7 @@ import { recordAggregationEvent } from "@stwd/redis";
 import {
   ExecutionPayloadNormalizationError,
   type PolicyResult,
+  type PolicyRule,
   rawSigningChainSupport,
   type TenantAuthAbuseConfig,
   toCaip2,
@@ -2851,6 +2852,32 @@ vaultRoutes.post("/:agentId/actions/send-calls", async (c) => {
   });
 });
 
+const REQUIRED_MANUAL_APPROVAL_ACTIONS_ENV = "STEWARD_REQUIRED_MANUAL_APPROVAL_ACTIONS";
+
+function requiredManualApprovalActions(): {
+  configured: boolean;
+  valid: boolean;
+  actions: ReadonlySet<string>;
+} {
+  const raw = process.env[REQUIRED_MANUAL_APPROVAL_ACTIONS_ENV];
+  if (!raw || raw.trim() === "") return { configured: false, valid: true, actions: new Set() };
+  const values = raw.split(",").map((value) => value.trim());
+  const valid = values.every(
+    (value) => /^[a-z][a-z0-9_:-]{0,127}$/.test(value) && !value.includes("*"),
+  );
+  return { configured: true, valid, actions: new Set(values) };
+}
+
+function hasExplicitManualApprovalPolicy(policies: readonly PolicyRule[], action: string): boolean {
+  return policies.some(
+    (policy) =>
+      policy.enabled === true &&
+      policy.type === "manual-approval" &&
+      Array.isArray(policy.config.actions) &&
+      policy.config.actions.includes(action),
+  );
+}
+
 vaultRoutes.post("/:agentId/actions/transfer", async (c) => {
   if (!requireAgentAccess(c)) {
     return c.json<ApiResponse>(
@@ -2983,6 +3010,27 @@ vaultRoutes.post("/:agentId/actions/transfer", async (c) => {
     broadcast: transfer.broadcast,
   };
   const policySet = await getScopedPolicySet(tenantId, agentId, c.get("agentPolicyIds"));
+  const actionName = "wallet_action_transfer";
+  const manualApprovalRequirement = requiredManualApprovalActions();
+  if (
+    !manualApprovalRequirement.valid ||
+    (manualApprovalRequirement.actions.has(actionName) &&
+      !hasExplicitManualApprovalPolicy(policySet, actionName))
+  ) {
+    // Deployment posture guard (STRATA-1097). Zero-policy behavior remains the
+    // engine's concern unless this environment explicitly requires a manual
+    // rule for the action. When required, absence refuses BEFORE an action or
+    // approval row exists — never an implicit auto-sign fallback.
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: manualApprovalRequirement.valid
+          ? `Execution configuration requires an enabled manual-approval policy for ${actionName}`
+          : `${REQUIRED_MANUAL_APPROVAL_ACTIONS_ENV} contains an invalid action name`,
+      },
+      503,
+    );
+  }
   const conditionSets = await loadConditionSetsForPolicies(tenantId, policySet);
 
   const rateLimitResult = await enforceRateLimit(agentId, policySet);
@@ -3036,6 +3084,7 @@ vaultRoutes.post("/:agentId/actions/transfer", async (c) => {
         }
       : await policyEngine.evaluate(policySet, {
           request: signRequest,
+          action: actionName,
           recentTxCount1h: stats.recentTxCount1h,
           recentTxCount24h: stats.recentTxCount24h,
           spentToday: stats.spentToday,
@@ -3840,6 +3889,7 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
           }
         : await policyEngine.evaluate(currentPolicySet, {
             request: approvalSignRequest,
+            ...(transferPayload === null ? {} : { action: "wallet_action_transfer" }),
             recentTxCount1h: stats.recentTxCount1h,
             recentTxCount24h: stats.recentTxCount24h,
             spentToday: stats.spentToday,

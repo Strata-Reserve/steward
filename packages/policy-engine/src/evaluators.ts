@@ -33,6 +33,8 @@ const MAX_UINT256_DECIMAL_DIGITS = 78;
 
 export interface EvaluatorContext {
   request: SignRequest;
+  /** Exact caller-supplied action vocabulary; absent on generic sign paths. */
+  action?: string;
   recentTxCount24h: number;
   recentTxCount1h: number;
   /**
@@ -182,6 +184,8 @@ export async function evaluatePolicy(
       });
     case "contract-allowlist":
       return evaluateContractAllowlist(rule, ctx);
+    case "manual-approval":
+      return evaluateManualApproval(rule, ctx);
     case "typed-data":
       return evaluateTypedData(rule, ctx);
     case "raw-signing-chain":
@@ -575,6 +579,36 @@ function getApprovedAddressTarget(request: SignRequest): string | undefined {
   // whitelisted `destination` past the whitelist while signing to an arbitrary
   // `to` (SEC-001).
   return request.to;
+}
+
+function evaluateManualApproval(
+  rule: PolicyRule,
+  ctx: EvaluatorContext,
+): PolicyResult & ManualApprovalSignal {
+  const actions = Array.isArray(rule.config.actions)
+    ? rule.config.actions.filter((value): value is string => typeof value === "string")
+    : [];
+  if (ctx.action === undefined || !actions.includes(ctx.action)) {
+    return {
+      policyId: rule.id,
+      type: rule.type,
+      passed: true,
+      reason:
+        ctx.action === undefined
+          ? "No action context; manual-approval policy not applicable"
+          : `Action ${ctx.action} does not require manual approval under this policy`,
+    };
+  }
+  // This is NOT a failed hard rule. It is an explicit independent policy
+  // verdict consumed only after every hard rule passes. The engine never lets
+  // this signal rescue a chain/token/recipient/amount/rate failure.
+  return {
+    policyId: rule.id,
+    type: rule.type,
+    passed: false,
+    requiresManualApproval: true,
+    reason: `Action ${ctx.action} requires explicit tenant-human approval`,
+  };
 }
 
 async function evaluateAutoApprove(rule: PolicyRule, ctx: EvaluatorContext): Promise<PolicyResult> {

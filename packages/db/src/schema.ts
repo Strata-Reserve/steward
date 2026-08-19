@@ -109,6 +109,7 @@ export const policyTypeEnum = pgEnum("policy_type", [
   "condition-set",
   "aggregation",
   "contract-allowlist",
+  "manual-approval",
   "typed-data",
   "raw-signing-chain",
   "reputation-threshold",

@@ -323,6 +323,7 @@ export type PolicyType =
   | "condition-set"
   | "aggregation"
   | "contract-allowlist"
+  | "manual-approval"
   | "typed-data"
   | "raw-signing-chain"
   | "reputation-threshold"
@@ -356,6 +357,16 @@ export interface ApprovedAddressesConfig {
 export interface AutoApproveConfig {
   threshold?: string; // wei — below this, auto-approve (legacy)
   thresholdUsd?: number; // USD — below this, auto-approve (preferred)
+}
+
+/**
+ * First-class action-aware human approval policy. Matching actions can never
+ * auto-sign: after every hard policy passes, the engine queues them for an
+ * explicit tenant-human approve/deny decision.
+ */
+export interface ManualApprovalConfig {
+  /** Exact action vocabulary, e.g. `wallet_action_transfer`. No wildcards. */
+  actions: string[];
 }
 
 export interface TimeWindowConfig {
