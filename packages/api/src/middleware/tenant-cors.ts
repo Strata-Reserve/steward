@@ -1,16 +1,63 @@
 /**
  * tenant-cors.ts — Per-tenant dynamic CORS middleware
  *
- * Replaces the global `cors({ origin: "*" })` setup with a middleware that:
- *  - Reads the tenant from the X-Steward-Tenant header
- *  - Looks up that tenant's allowed_origins from tenant_configs
- *  - Validates the request Origin against the list
- *  - Falls back to wildcard (*) for tenants with no configured origins (dev mode)
- *  - Caches origin lists in memory with a 60 s TTL to avoid per-request DB hits
+ * Reads the tenant from the X-Steward-Tenant header, looks up that tenant's
+ * allowed_origins from tenant_configs, and validates the request Origin against
+ * the list. Origin lists are cached in memory with a 60 s TTL to avoid
+ * per-request DB hits.
  *
- * Usage in index.ts:
- *   import { tenantCors } from "./middleware/tenant-cors";
- *   app.use("*", tenantCors);
+ * ─── STRATA-1115: THIS MIDDLEWARE USED TO FAIL OPEN ──────────────────────────
+ *
+ * `allowOrigin` was initialised to `"*"` and TWO separate paths fell through to
+ * that initial value rather than denying:
+ *
+ *   1. A tenant with an EMPTY `allowed_origins` list ("no config yet → dev
+ *      mode") returned `Access-Control-Allow-Origin: *` to every origin.
+ *   2. A THROWN error from the config lookup — a transient database blip, a
+ *      pool exhaustion, a migration window — was caught, logged as a warning,
+ *      and then also produced `*`.
+ *
+ * The second is the sharper one: an infrastructure failure silently downgraded
+ * a security control. A tenant that HAD correctly configured its allowlist lost
+ * that allowlist for the duration of a database wobble, and got a wildcard
+ * instead of an error. Availability pressure must never quietly relax an
+ * authorization boundary — if we cannot READ the policy, we cannot claim the
+ * request satisfies it.
+ *
+ * Compounding it, `Vary: Origin` was only set on the selective path, so the
+ * wildcard response was the cacheable one.
+ *
+ * Both paths now DENY. Denial here means: emit no CORS headers at all (so the
+ * browser enforces the block) and, for preflight specifically, answer 403 so
+ * the failure is loud and immediate rather than surfacing as a confusing opaque
+ * response later.
+ *
+ * ─── WHAT IS DELIBERATELY UNCHANGED ──────────────────────────────────────────
+ *
+ * AUTHENTICATION SEMANTICS ARE NOT TOUCHED. CORS governs which browser ORIGINS
+ * may read a response; it never decides who is authenticated. No route's auth
+ * requirements, credential handling or status codes change here. In particular
+ * a denied CORS request is not a 401 and must not be mistaken for one.
+ *
+ * REQUESTS WITH NO `Origin` HEADER ARE NOT AFFECTED. Server-to-server callers
+ * (the Strata API, CI, curl) send no `Origin`, are not subject to the same-origin
+ * policy, and are left exactly as they were. Tightening that path would break
+ * every non-browser integration while adding no security: CORS is enforced by
+ * the browser, not by us, so a header-less client was never constrained by it.
+ *
+ * REQUESTS WITH AN `Origin` BUT NO `X-Steward-Tenant` KEEP THE PERMISSIVE
+ * RESPONSE, and this is a deliberate, narrow exception rather than an oversight.
+ * Un-tenanted browser surfaces exist today — `/health` (used by the dashboard's
+ * reachability probe) and the `/user/me/tenants` session routes are called
+ * without a tenant header. There is no tenant, hence no allowlist to consult,
+ * so there is nothing to fail closed AGAINST; denying would break those
+ * surfaces without consulting any policy. The exposure is bounded because these
+ * responses carry no ambient authority: the dashboard authenticates with an
+ * `Authorization: Bearer` token from localStorage, never with cookies, and
+ * `credentials: "include"` appears nowhere in the web client — so a wildcard
+ * cannot be combined with credentials by a hostile page. Closing this path is
+ * tracked separately; it needs a platform-origin allowlist, which is a
+ * different change from honouring a tenant's configured policy.
  */
 
 import { getDb, tenantConfigs as tenantConfigsTable } from "@stwd/db";
@@ -27,6 +74,18 @@ interface CacheEntry {
 const CACHE_TTL_MS = 60_000; // 60 seconds
 const originsCache = new Map<string, CacheEntry>();
 
+/**
+ * Load a tenant's configured origins.
+ *
+ * THROWS on lookup failure. It deliberately does NOT catch and return `[]`:
+ * "this tenant allows nothing" and "we could not find out what this tenant
+ * allows" are different facts and the caller must be able to tell them apart.
+ * Collapsing them here would reintroduce the STRATA-1115 failure mode one layer
+ * down, where it would be much harder to see.
+ *
+ * Failures are NOT cached — a transient error must not pin a tenant into a
+ * degraded state for the rest of the TTL.
+ */
 async function getTenantOrigins(tenantId: string): Promise<string[]> {
   const now = Date.now();
   const cached = originsCache.get(tenantId);
@@ -58,36 +117,66 @@ const MAX_AGE = "86400";
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
+/**
+ * Deny a cross-origin request.
+ *
+ * No `Access-Control-Allow-Origin` is emitted, so the browser blocks the read.
+ * Preflight gets an explicit 403 rather than a silent 204-without-headers,
+ * because a 403 names the refusal instead of leaving the caller to infer it.
+ * Non-preflight requests still run the handler (the request already reached us;
+ * refusing to answer would change API behaviour for non-browser clients) but
+ * carry no CORS headers, so a browser cannot read the response.
+ */
+async function denyCors(c: Context, next: Next): Promise<Response | undefined> {
+  if (c.req.method === "OPTIONS") {
+    return c.newResponse(null, 403);
+  }
+  await next();
+  return;
+}
+
 export async function tenantCors(c: Context, next: Next): Promise<Response | undefined> {
   const origin = c.req.header("origin") ?? "";
   const tenantId = c.req.header("X-Steward-Tenant");
 
+  // Default stays `*` ONLY for the paths documented in the file header (no
+  // Origin at all, or an un-tenanted browser surface). Every path that DOES
+  // have a tenant policy to consult now resolves explicitly below.
   let allowOrigin = "*";
 
   if (tenantId && origin) {
+    let origins: string[];
     try {
-      const origins = await getTenantOrigins(tenantId);
-      if (origins.length > 0) {
-        if (origins.includes("*") || origins.includes(origin)) {
-          // Exact match or explicit wildcard — echo back the request origin
-          allowOrigin = origin;
-        } else {
-          // Origin not in the allowlist — block preflight, let main requests through
-          // without CORS headers so the browser enforces the deny.
-          if (c.req.method === "OPTIONS") {
-            return c.newResponse(null, 403);
-          }
-          await next();
-          return;
-        }
-      }
-      // origins.length === 0 → no config yet → fall through to wildcard
+      origins = await getTenantOrigins(tenantId);
     } catch (err) {
-      console.warn("[tenant-cors] Failed to load origins for tenant, falling back to *:", err);
+      // STRATA-1115: was `fall back to *`. A failed policy READ is not evidence
+      // that the request is permitted. Deny, and log at error level — this is a
+      // security-relevant failure, not a warning.
+      console.error(
+        "[tenant-cors] Failed to load allowed origins; denying cross-origin request:",
+        err,
+      );
+      return denyCors(c, next);
+    }
+
+    if (origins.length === 0) {
+      // STRATA-1115: was `no config yet → fall through to wildcard`. An empty
+      // allowlist is a real, readable policy that permits no cross-origin
+      // reader. It is not an invitation to permit everyone.
+      return denyCors(c, next);
+    }
+
+    if (origins.includes("*") || origins.includes(origin)) {
+      // Exact match, or an EXPLICIT wildcard the tenant deliberately configured.
+      // Preserved intentionally: an operator who writes "*" into their own
+      // allowlist has made a decision. The defect was inferring that decision
+      // from absence or from an error.
+      allowOrigin = origin;
+    } else {
+      return denyCors(c, next);
     }
   }
 
-  // Set CORS headers on the response context
   c.header("Access-Control-Allow-Origin", allowOrigin);
   c.header("Access-Control-Allow-Methods", ALLOW_METHODS);
   c.header("Access-Control-Allow-Headers", ALLOW_HEADERS);
@@ -95,7 +184,8 @@ export async function tenantCors(c: Context, next: Next): Promise<Response | und
   c.header("Access-Control-Max-Age", MAX_AGE);
 
   if (allowOrigin !== "*") {
-    // Let caches vary on Origin when we're doing selective allow
+    // Selective allow is Origin-dependent, so shared caches must key on it.
+    // Without this a cache could serve one origin's allowed response to another.
     c.header("Vary", "Origin");
   }
 
@@ -104,4 +194,5 @@ export async function tenantCors(c: Context, next: Next): Promise<Response | und
   }
 
   await next();
+  return;
 }
