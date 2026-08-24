@@ -17,6 +17,7 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+  AWS_PROVIDER_ACTION_PROFILE,
   assertRegisteredProfile,
   buildGenericHttpAction,
   CanonError,
@@ -30,10 +31,12 @@ import {
   GenericDescriptorError,
   GITHUB_PROVIDER_ACTION_PROFILE,
   GOLDEN_VECTORS,
+  GOOGLE_PROVIDER_ACTION_PROFILE,
   genericDescriptorAllowsExactPath,
   genericHttpCanonicalActionBytes,
   isRegisteredProfile,
   REGISTERED_PROFILES,
+  SLACK_PROVIDER_ACTION_PROFILE,
   UnregisteredProfileError,
   validateGenericHttpDescriptor,
   X_GOLDEN_VECTORS,
@@ -130,19 +133,25 @@ describe("generic-http golden corpus", () => {
 // ─── Registry (fail-closed at every consumption entry) ─────────────────────────
 
 describe("profile registry", () => {
-  it("registers exactly github, x, generic-http", () => {
+  it("registers exactly AWS, github, x, Slack, Google, generic-http", () => {
     expect([...REGISTERED_PROFILES].sort()).toEqual(
       [
+        AWS_PROVIDER_ACTION_PROFILE,
         GITHUB_PROVIDER_ACTION_PROFILE,
         X_PROVIDER_ACTION_PROFILE,
+        SLACK_PROVIDER_ACTION_PROFILE,
+        GOOGLE_PROVIDER_ACTION_PROFILE,
         GENERIC_HTTP_PROVIDER_ACTION_PROFILE,
       ].sort(),
     );
   });
 
   it("isRegisteredProfile accepts registered, rejects unknown / non-string", () => {
+    expect(isRegisteredProfile(AWS_PROVIDER_ACTION_PROFILE)).toBe(true);
     expect(isRegisteredProfile(GITHUB_PROVIDER_ACTION_PROFILE)).toBe(true);
     expect(isRegisteredProfile(X_PROVIDER_ACTION_PROFILE)).toBe(true);
+    expect(isRegisteredProfile(SLACK_PROVIDER_ACTION_PROFILE)).toBe(true);
+    expect(isRegisteredProfile(GOOGLE_PROVIDER_ACTION_PROFILE)).toBe(true);
     expect(isRegisteredProfile(GENERIC_HTTP_PROVIDER_ACTION_PROFILE)).toBe(true);
     expect(isRegisteredProfile("evil.provider-action.v1")).toBe(false);
     expect(isRegisteredProfile("")).toBe(false);

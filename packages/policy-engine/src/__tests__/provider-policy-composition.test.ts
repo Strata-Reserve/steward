@@ -100,6 +100,66 @@ describe("composeProviderActionPolicyDecision precedence", () => {
     }
   });
 
+  it("enforces Google recipient-domain array allowlists element by element", () => {
+    const operationKey = "google.gmail.send";
+    const domainRule: ProviderPolicyRule = {
+      id: "google-domain-allowlist",
+      type: "capability-intent",
+      enabled: true,
+      config: {
+        capabilities: [operationKey],
+        effect: "allow",
+        constraints: {
+          argArraySubset: { toDomainSet: ["example.com", "partner.test"] },
+        },
+      },
+    };
+    const googleContext = (toDomainSet: unknown): ProviderPolicyContext => ({
+      ...ctx,
+      operationKey,
+      args: { toDomainSet },
+      host: "gmail.googleapis.com",
+      path: "/gmail/v1/users/me/messages/send",
+    });
+
+    expect(
+      composeProviderActionPolicyDecision([domainRule], googleContext(["example.com"])).effect,
+    ).toBe("allow");
+    expect(
+      composeProviderActionPolicyDecision([domainRule], googleContext(["attacker.test"])).effect,
+    ).toBe("hard_deny");
+    expect(
+      composeProviderActionPolicyDecision(
+        [domainRule],
+        googleContext(["example.com", "attacker.test"]),
+      ).effect,
+    ).toBe("hard_deny");
+  });
+
+  it("fails closed when an array-subset arg is absent, scalar, empty, or mixed-type", () => {
+    const operationKey = "google.gmail.send";
+    const domainRule: ProviderPolicyRule = {
+      id: "google-domain-allowlist",
+      type: "capability-intent",
+      enabled: true,
+      config: {
+        capabilities: [operationKey],
+        effect: "allow",
+        constraints: { argArraySubset: { toDomainSet: ["example.com"] } },
+      },
+    };
+    for (const args of [
+      {},
+      { toDomainSet: "example.com" },
+      { toDomainSet: [] },
+      { toDomainSet: ["example.com", 7] },
+    ]) {
+      expect(
+        composeProviderActionPolicyDecision([domainRule], { ...ctx, operationKey, args }).effect,
+      ).toBe("hard_deny");
+    }
+  });
+
   it("malformed config => hard_deny / configuration invalid", () => {
     const bad: ProviderPolicyRule = {
       id: "bad",
@@ -108,6 +168,31 @@ describe("composeProviderActionPolicyDecision precedence", () => {
       config: { capabilities: [OP], effect: "allow", bogusKey: 1 },
     };
     const d = composeProviderActionPolicyDecision([bad], ctx);
+    expect(d.effect).toBe("hard_deny");
+    expect(d.reasonCodes).toContain(PROVIDER_POLICY_REASON.CONFIGURATION_INVALID);
+  });
+
+  it("malformed rule provably scoped to a DIFFERENT operation stays inert (SEC-181)", () => {
+    // Same malformed-config semantics as the legacy-plane composer: a broken
+    // rule must not brick operations it does not govern.
+    const scopedElsewhere: ProviderPolicyRule = {
+      id: "bad-elsewhere",
+      type: "capability-intent",
+      enabled: true,
+      config: { capabilities: ["x.tweet.create"], effect: "allow", bogusKey: 1 },
+    };
+    const d = composeProviderActionPolicyDecision([scopedElsewhere, rule("a", "allow")], ctx);
+    expect(d.effect).toBe("allow");
+  });
+
+  it("malformed rule with an unrecoverable selector still hard-denies (SEC-181)", () => {
+    const ambiguous: ProviderPolicyRule = {
+      id: "bad-ambiguous",
+      type: "capability-intent",
+      enabled: true,
+      config: { capabilities: "not-an-array", effect: "allow" },
+    };
+    const d = composeProviderActionPolicyDecision([ambiguous, rule("a", "allow")], ctx);
     expect(d.effect).toBe("hard_deny");
     expect(d.reasonCodes).toContain(PROVIDER_POLICY_REASON.CONFIGURATION_INVALID);
   });

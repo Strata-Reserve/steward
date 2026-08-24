@@ -6,16 +6,15 @@ import { DEFAULT_STEWARD_API_URL } from "@/lib/steward-api-url";
  *
  * SEC-077: `connect-src` is an explicit allowlist instead of the previous
  * blanket `https: wss:`, which let any injected script exfiltrate data to any
- * origin — undermining the CSP's role as the primary XSS mitigation for the
- * tokens the dashboard handles. The list covers exactly what the wallet dapp
- * needs:
+ * origin via fetch/XHR/WebSocket — the channels that carry structured request
+ * bodies. The list covers exactly what the wallet dapp needs:
  *   - 'self' (same-origin API proxy routes, Next data fetches, dev HMR)
  *   - the configured Steward API origin
  *   - the configured Solana RPC origin (https + its websocket form)
  *   - the default public RPC endpoints of the EVM chains wired in lib/wagmi.ts
  *   - WalletConnect relay/verify/push origins (wildcards cover relay., echo.,
  *     pulse., keys., verify. on both .com and .org)
- *   - Coinbase Wallet's popup origin
+ *   - Coinbase Wallet's fixed popup, RPC, and legacy relay origins
  * Self-hosters overriding RPC endpoints via NEXT_PUBLIC_SOLANA_RPC_URL stay
  * allowlisted automatically; a custom EVM RPC must be added here when wired.
  */
@@ -42,7 +41,14 @@ const WALLETCONNECT_ORIGINS = [
   "wss://*.walletconnect.org",
 ] as const;
 
-const WALLET_SDK_ORIGINS = ["https://www.coinbase.com"] as const;
+// Locked @coinbase/wallet-sdk runtime endpoints. RainbowKit disables the
+// SDK's optional cca-lite telemetry, so that analytics origin is deliberately
+// not allowlisted.
+const WALLET_SDK_ORIGINS = [
+  "https://keys.coinbase.com",
+  "https://rpc.wallet.coinbase.com",
+  "https://www.walletlink.org",
+] as const;
 
 // Resolve the Steward API origin the client will actually call. This uses the
 // SAME resolved base URL as `lib/api.ts` / providers (env override or the
@@ -105,6 +111,15 @@ export function buildCsp(nonce: string, allowInsecureHttp: boolean): string {
     "default-src 'self'",
     `script-src 'self' 'nonce-${nonce}' 'wasm-unsafe-eval'`,
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    // https: is a deliberate, documented exception to the connect-src
+    // allowlist model: tenant theme logos/favicons (dashboard settings →
+    // appearance) are operator-supplied URLs hosted on arbitrary origins, so
+    // no fixed allowlist can cover them. This leaves a residual GET-only
+    // beacon channel (an injected script could leak via `new Image().src`) —
+    // accepted because image loads cannot read responses, the nonce-gated
+    // script-src is the barrier for script execution in the first place, and
+    // breaking tenant branding is not a trade we can make silently. Never add
+    // a plain `http:` or `*` here.
     "img-src 'self' data: blob: https:",
     "font-src 'self' data: https://fonts.gstatic.com",
     `connect-src ${connectSrc.join(" ")}`,

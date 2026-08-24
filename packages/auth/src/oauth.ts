@@ -334,6 +334,15 @@ function getCustomProviderConfigs(): CustomOAuthProviderInput[] {
     if (!/^[a-zA-Z0-9_.:-]{1,64}$/.test(id)) {
       throw new Error(`Custom OAuth provider at index ${index} has an invalid id`);
     }
+    // SEC-137: custom providers win over built-ins in getProviderConfig, so an
+    // id matching a built-in would silently shadow it. Reject the collision —
+    // built-in endpoint overrides already have a supported mechanism
+    // (<PROVIDER>_AUTHORIZATION_URL / _TOKEN_URL / _USERINFO_URL env vars).
+    if ((BUILT_IN_PROVIDERS as readonly string[]).includes(id)) {
+      throw new Error(
+        `Custom OAuth provider "${id}" shadows a built-in provider; use a distinct id or the ${envPrefix(id)}_*_URL overrides`,
+      );
+    }
     for (const [name, url] of [
       ["authorizationUrl", authorizationUrl],
       ["tokenUrl", tokenUrl],
@@ -800,8 +809,12 @@ export class OAuthClient {
       verified_email: Boolean(verifiedEmail ?? false),
     } satisfies OAuthUserInfo;
 
-    if (!userInfo.email && this.provider.emailUrl) {
-      const emailInfo = await this.getPrimaryEmail(accessToken);
+    // GitHub's /user profile may include a public email but never includes a
+    // verification bit. Resolve both the address and its verification status
+    // through /user/emails in that case. An explicit false from a provider is
+    // authoritative and must remain fail-closed.
+    if (this.provider.emailUrl && (!userInfo.email || verifiedEmail === undefined)) {
+      const emailInfo = await this.getPrimaryEmail(accessToken, userInfo.email || undefined);
       if (emailInfo) {
         userInfo.email = emailInfo.email;
         userInfo.verified_email = emailInfo.verified ?? userInfo.verified_email;
@@ -849,7 +862,10 @@ export class OAuthClient {
     throw new Error("Unsupported OIDC provider configuration");
   }
 
-  private async getPrimaryEmail(accessToken: string): Promise<OAuthEmailAddress | null> {
+  private async getPrimaryEmail(
+    accessToken: string,
+    preferredEmail?: string,
+  ): Promise<OAuthEmailAddress | null> {
     if (!this.provider.emailUrl) return null;
 
     const res = await fetch(this.provider.emailUrl, {
@@ -872,6 +888,14 @@ export class OAuthClient {
       (entry): entry is OAuthEmailAddress =>
         entry != null && typeof entry === "object" && typeof entry.email === "string",
     );
+
+    const normalizedPreferredEmail = preferredEmail?.trim().toLowerCase();
+    if (normalizedPreferredEmail) {
+      const matchingEmail = emails.find(
+        (entry) => entry.email.trim().toLowerCase() === normalizedPreferredEmail,
+      );
+      if (matchingEmail) return matchingEmail;
+    }
 
     return (
       emails.find((entry) => entry.primary && entry.verified) ??

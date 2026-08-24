@@ -35,6 +35,7 @@ import {
   sanitizeErrorMessage,
   setNoStoreHeaders,
 } from "../services/context";
+import { isRecentMfaTimestamp } from "../services/recent-mfa";
 import {
   assertGovernedRouteUpdateIsSafe,
   assertNoOppositeAuthorityOverlap,
@@ -84,6 +85,8 @@ const SECRET_ROUTE_UPDATE_KEYS = new Set([
   "injectAs",
   "injectKey",
   "injectFormat",
+  "injectionStrategy",
+  "injectionConfig",
   "priority",
   "enabled",
   "requiresApproval",
@@ -98,6 +101,8 @@ type SecretRouteUpdate = Partial<{
   injectAs: string;
   injectKey: string;
   injectFormat: string;
+  injectionStrategy: "header" | "sigv4";
+  injectionConfig: { service?: string; region?: string };
   priority: number;
   enabled: boolean;
   requiresApproval: boolean;
@@ -113,6 +118,8 @@ type SecretRouteCreate = {
   injectAs: string;
   injectKey: string;
   injectFormat?: string;
+  injectionStrategy?: "header" | "sigv4";
+  injectionConfig?: { service?: string; region?: string };
   priority?: number;
   enabled?: boolean;
   requiresApproval?: boolean;
@@ -143,6 +150,7 @@ function parseSecretRouteUpdate(body: Record<string, unknown>):
     "injectAs",
     "injectKey",
     "injectFormat",
+    "injectionStrategy",
   ] as const;
 
   for (const field of stringFields) {
@@ -151,7 +159,17 @@ function parseSecretRouteUpdate(body: Record<string, unknown>):
     if (typeof value !== "string") {
       return { ok: false, error: `'${field}' must be a string` };
     }
-    update[field] = value;
+    update[field] = value as never;
+  }
+  if (body.injectionConfig !== undefined) {
+    if (
+      typeof body.injectionConfig !== "object" ||
+      body.injectionConfig === null ||
+      Array.isArray(body.injectionConfig)
+    ) {
+      return { ok: false, error: "'injectionConfig' must be an object" };
+    }
+    update.injectionConfig = body.injectionConfig as { service?: string; region?: string };
   }
 
   if (body.priority !== undefined) {
@@ -218,6 +236,21 @@ function parseSecretRouteCreate(
   if (body.injectFormat !== undefined && typeof body.injectFormat !== "string") {
     return { ok: false, error: "'injectFormat' must be a string" };
   }
+  if (
+    body.injectionStrategy !== undefined &&
+    body.injectionStrategy !== "header" &&
+    body.injectionStrategy !== "sigv4"
+  ) {
+    return { ok: false, error: "'injectionStrategy' must be header or sigv4" };
+  }
+  if (
+    body.injectionConfig !== undefined &&
+    (typeof body.injectionConfig !== "object" ||
+      body.injectionConfig === null ||
+      Array.isArray(body.injectionConfig))
+  ) {
+    return { ok: false, error: "'injectionConfig' must be an object" };
+  }
   if (body.priority !== undefined) {
     if (
       typeof body.priority !== "number" ||
@@ -256,6 +289,9 @@ function parseSecretRouteCreate(
       injectAs: body.injectAs as string,
       injectKey: body.injectKey as string,
       injectFormat: body.injectFormat as string | undefined,
+      injectionStrategy: (body.injectionStrategy as "header" | "sigv4" | undefined) ?? "header",
+      injectionConfig:
+        (body.injectionConfig as { service?: string; region?: string } | undefined) ?? {},
       priority: body.priority as number | undefined,
       enabled: body.enabled as boolean | undefined,
       requiresApproval: body.requiresApproval as boolean | undefined,
@@ -277,12 +313,7 @@ function requireTenantAdminSession(c: Context<{ Variables: AppVariables }>): boo
 }
 
 function hasRecentSessionMfa(c: Context<{ Variables: AppVariables }>, maxAgeMs = 5 * 60_000) {
-  const verifiedAt = c.get("sessionMfaVerifiedAt");
-  return (
-    typeof verifiedAt === "number" &&
-    Number.isFinite(verifiedAt) &&
-    Date.now() - verifiedAt <= maxAgeMs
-  );
+  return isRecentMfaTimestamp(c.get("sessionMfaVerifiedAt"), maxAgeMs);
 }
 
 type TenantMfaPolicyConfig = {
@@ -442,6 +473,8 @@ secretsRoutes.post("/routes", async (c) => {
     injectAs: string;
     injectKey: string;
     injectFormat?: string;
+    injectionStrategy?: "header" | "sigv4";
+    injectionConfig?: { service?: string; region?: string };
     priority?: number;
     enabled?: boolean;
     requiresApproval?: boolean;
@@ -501,6 +534,8 @@ secretsRoutes.post("/routes", async (c) => {
         injectAs: routeInput.injectAs,
         injectKey: routeInput.injectKey,
         injectFormat: routeInput.injectFormat,
+        injectionStrategy: routeInput.injectionStrategy,
+        injectionConfig: routeInput.injectionConfig,
         priority: routeInput.priority,
         enabled: routeInput.enabled,
         requiresApproval: routeInput.requiresApproval,

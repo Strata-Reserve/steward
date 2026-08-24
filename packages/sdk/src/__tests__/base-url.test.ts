@@ -12,7 +12,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { AgentClient } from "../agent-client";
 import { AgentKeypair } from "../agent-keypair";
 import { StewardAuth } from "../auth";
-import { assertSecureBaseUrl } from "../base-url";
+import { assertSecureBaseUrl, stripTrailingSlashes } from "../base-url";
 import { StewardClient } from "../client";
 import { generateMockKeyPair } from "./agent-client-mock-server";
 
@@ -27,8 +27,21 @@ describe("assertSecureBaseUrl", () => {
   test("rejects plaintext non-loopback baseUrls", () => {
     expect(() => assertSecureBaseUrl("http://api.steward.example")).toThrow(/must use HTTPS/);
     expect(() => assertSecureBaseUrl("http://192.168.1.10:3200")).toThrow(/must use HTTPS/);
-    expect(() => assertSecureBaseUrl("ftp://api.steward.example")).toThrow(/must use HTTPS/);
+    expect(() => assertSecureBaseUrl("ftp://api.steward.example")).toThrow(/must use HTTP\(S\)/);
     expect(() => assertSecureBaseUrl("not-a-url")).toThrow(/valid absolute URL/);
+  });
+
+  test("rejects credential-bearing and ambiguous base URLs before any opt-out", () => {
+    expect(() => assertSecureBaseUrl("https://user:secret@api.steward.example")).toThrow(
+      /must not embed credentials/,
+    );
+    expect(() => assertSecureBaseUrl("http://user:secret@localhost:3200", true)).toThrow(
+      /must not embed credentials/,
+    );
+    expect(() => assertSecureBaseUrl("https://api.steward.example?token=secret")).toThrow(
+      /query or fragment/,
+    );
+    expect(() => assertSecureBaseUrl("file:///tmp/steward", true)).toThrow(/must use HTTP\(S\)/);
   });
 
   test("allowInsecureBaseUrl opts out but warns loudly", () => {
@@ -41,6 +54,18 @@ describe("assertSecureBaseUrl", () => {
       warn.mockRestore();
     }
   });
+
+  test("the insecure opt-out permits HTTP only, never arbitrary URL schemes", () => {
+    expect(() => assertSecureBaseUrl("ftp://api.steward.example", true)).toThrow(/HTTP\(S\)/);
+  });
+});
+
+test("trailing slash normalization stays linear on adversarial input", () => {
+  const suffix = "/".repeat(200_000);
+  expect(stripTrailingSlashes(`https://api.steward.example${suffix}`)).toBe(
+    "https://api.steward.example",
+  );
+  expect(stripTrailingSlashes(`${suffix}x`)).toBe(`${suffix}x`);
 });
 
 describe("SDK constructors enforce HTTPS baseUrl", () => {

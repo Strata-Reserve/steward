@@ -1,4 +1,9 @@
 import {
+  AWS_PROVIDER_ACTION_PROFILE,
+  type AwsCanonicalActionV1,
+  serializeAwsEc2QueryBody,
+} from "./aws-provider-action.js";
+import {
   buildGenericHttpAction,
   GENERIC_HTTP_PROVIDER_ACTION_PROFILE,
   type GenericHttpOperationDescriptorV1,
@@ -6,6 +11,7 @@ import {
   genericDescriptorAllowsExactPath,
   validateGenericHttpDescriptor,
 } from "./generic-http-provider-action.js";
+import { GOOGLE_PROVIDER_ACTION_PROFILE } from "./google-provider-action.js";
 import {
   CanonError,
   decodeUtf8Strict,
@@ -15,6 +21,7 @@ import {
 } from "./provider-action.js";
 import { assertRegisteredProfile } from "./provider-profile-registry.js";
 import { containsSensitiveCredentialKey, isSensitiveCredentialKey } from "./sensitive-keys.js";
+import { SLACK_PROVIDER_ACTION_PROFILE } from "./slack-provider-action.js";
 import { X_PROVIDER_ACTION_PROFILE } from "./x-provider-action.js";
 
 export interface ConformanceCanonicalAction {
@@ -121,6 +128,208 @@ function validTweetBody(value: unknown): boolean {
   return true;
 }
 
+function validAwsEc2Action(action: ConformanceCanonicalAction, operationKey: string): boolean {
+  if (
+    action.profile !== AWS_PROVIDER_ACTION_PROFILE ||
+    action.method !== "POST" ||
+    action.normalizedPath !== "/" ||
+    action.orderedQueryPairs.length !== 0 ||
+    !pairsEqual(action.selectedHeaders, [
+      ["content-type", "application/x-www-form-urlencoded; charset=UTF-8"],
+    ]) ||
+    !/^https:\/\/ec2\.[a-z]{2}(?:-[a-z0-9]+){1,3}-[1-9][0-9]?\.amazonaws\.com$/.test(action.origin)
+  ) {
+    return false;
+  }
+  try {
+    const body = action.canonicalBody as Record<string, unknown>;
+    if (operationKey === "aws.ec2.DescribeInstances" && body?.Action !== "DescribeInstances") {
+      return false;
+    }
+    if (operationKey === "aws.ec2.StopInstances" && body?.Action !== "StopInstances") {
+      return false;
+    }
+    if (!operationKey.startsWith("aws.ec2.")) return false;
+    const ids = body?.InstanceIds;
+    if (
+      ids !== undefined &&
+      (!Array.isArray(ids) ||
+        ids.length > 100 ||
+        ids.some((id) => typeof id !== "string" || !/^i-[0-9a-f]{8,17}$/.test(id)) ||
+        new Set(ids).size !== ids.length)
+    ) {
+      return false;
+    }
+    if (operationKey === "aws.ec2.StopInstances" && (!Array.isArray(ids) || ids.length === 0)) {
+      return false;
+    }
+    serializeAwsEc2QueryBody(action as AwsCanonicalActionV1);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const SLACK_CHANNEL_RE = /^[CGD][A-Z0-9]{8,19}$/;
+const SLACK_USER_RE = /^[UW][A-Z0-9]{8,19}$/;
+const SLACK_THREAD_TS_RE = /^[0-9]{10,16}\.[0-9]{6}$/;
+const SLACK_CONVERSATION_TYPES = new Set(["public_channel", "private_channel", "mpim", "im"]);
+
+function validSlackPostMessageBody(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const body = value as Record<string, unknown>;
+  const keys = Object.keys(body).sort();
+  const allowed = new Set(["blocks", "channel", "text", "thread_ts"]);
+  if (keys.some((key) => !allowed.has(key))) return false;
+  if (!SLACK_CHANNEL_RE.test(typeof body.channel === "string" ? body.channel : "")) return false;
+  if (!("text" in body) && !("blocks" in body)) return false;
+  if ("text" in body) {
+    if (
+      typeof body.text !== "string" ||
+      [...body.text].length < 1 ||
+      [...body.text].length > 40000
+    ) {
+      return false;
+    }
+  }
+  if (
+    "blocks" in body &&
+    (!Array.isArray(body.blocks) || body.blocks.length < 1 || body.blocks.length > 50)
+  ) {
+    return false;
+  }
+  if (
+    "thread_ts" in body &&
+    !SLACK_THREAD_TS_RE.test(typeof body.thread_ts === "string" ? body.thread_ts : "")
+  ) {
+    return false;
+  }
+  return new TextEncoder().encode(JSON.stringify(body)).byteLength <= 200_000;
+}
+
+function validSlackConversationsQuery(pairs: Array<[string, string]>): boolean {
+  const values = new Map(pairs);
+  if (values.size !== pairs.length || !values.has("limit") || !values.has("types")) return false;
+  if ([...values.keys()].some((key) => !["cursor", "limit", "types"].includes(key))) return false;
+  if (!/^(?:[1-9]|[1-9][0-9]|1[0-9]{2}|200)$/.test(values.get("limit") ?? "")) return false;
+  const types = (values.get("types") ?? "").split(",");
+  if (
+    types.length < 1 ||
+    types.some((type) => !SLACK_CONVERSATION_TYPES.has(type)) ||
+    jcsStringify(types) !== jcsStringify([...new Set(types)].sort())
+  ) {
+    return false;
+  }
+  const cursor = values.get("cursor");
+  if (cursor !== undefined && !/^[A-Za-z0-9=_-]{1,512}$/.test(cursor)) return false;
+  return pairsEqual(
+    pairs,
+    [...values.entries()].sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+function googleInstant(value: string): number | null {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/.exec(
+      value,
+    );
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, zone] = match;
+  const instant = Date.parse(value);
+  if (
+    !Number.isFinite(instant) ||
+    Number(hour) > 23 ||
+    Number(minute) > 59 ||
+    Number(second) > 59
+  ) {
+    return null;
+  }
+  const offsetMinutes =
+    zone === "Z"
+      ? 0
+      : (zone.startsWith("-") ? -1 : 1) *
+        (Number(zone.slice(1, 3)) * 60 + Number(zone.slice(4, 6)));
+  if (Math.abs(offsetMinutes) > 14 * 60) return null;
+  const local = new Date(instant + offsetMinutes * 60_000);
+  return local.getUTCFullYear() === Number(year) &&
+    local.getUTCMonth() + 1 === Number(month) &&
+    local.getUTCDate() === Number(day) &&
+    local.getUTCHours() === Number(hour) &&
+    local.getUTCMinutes() === Number(minute) &&
+    local.getUTCSeconds() === Number(second)
+    ? instant
+    : null;
+}
+
+function validGoogleCalendarQuery(pairs: Array<[string, string]>): boolean {
+  const allowed = new Set(["maxResults", "pageToken", "timeMax", "timeMin"]);
+  let previous = "";
+  let hasMaxResults = false;
+  for (const [name, value] of pairs) {
+    if (!allowed.has(name) || name <= previous) return false;
+    previous = name;
+    if (name === "maxResults") {
+      hasMaxResults = /^(?:[1-9][0-9]{0,2}|1[0-9]{3}|2[0-4][0-9]{2}|2500)$/.test(value);
+      if (!hasMaxResults) return false;
+    } else if (name === "pageToken") {
+      if (value.length < 1 || value.length > 2048 || /[\r\n]/.test(value)) return false;
+    } else if (googleInstant(value) === null) {
+      return false;
+    }
+  }
+  return hasMaxResults;
+}
+
+function validGoogleEventBody(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  if (
+    !exactObject(
+      value,
+      Object.hasOwn(value, "attendees")
+        ? ["attendees", "end", "start", "summary"]
+        : ["end", "start", "summary"],
+    )
+  )
+    return false;
+  if (
+    typeof value.summary !== "string" ||
+    value.summary.length < 1 ||
+    value.summary.length > 1024
+  ) {
+    return false;
+  }
+  if (/[\r\n]/.test(value.summary)) return false;
+  const instants: number[] = [];
+  for (const key of ["start", "end"] as const) {
+    const endpoint = value[key];
+    if (!exactObject(endpoint, ["dateTime"]) || typeof endpoint.dateTime !== "string") return false;
+    const instant = googleInstant(endpoint.dateTime);
+    if (instant === null) return false;
+    instants.push(instant);
+  }
+  if (instants[1] <= instants[0]) return false;
+  if (Object.hasOwn(value, "attendees")) {
+    if (
+      !Array.isArray(value.attendees) ||
+      value.attendees.length < 1 ||
+      value.attendees.length > 100
+    ) {
+      return false;
+    }
+    if (
+      !value.attendees.every(
+        (entry) =>
+          exactObject(entry, ["email"]) &&
+          typeof entry.email === "string" &&
+          entry.email.length <= 320 &&
+          /^[^@\s]+@[^@\s]+$/.test(entry.email),
+      )
+    )
+      return false;
+  }
+  return true;
+}
+
 /** Exact adapter-fixed reconstruction contract for every registered operation. */
 function fixedActionMatchesOperation(
   action: ConformanceCanonicalAction,
@@ -131,6 +340,9 @@ function fixedActionMatchesOperation(
     ["x-github-api-version", "2022-11-28"],
   ];
   switch (operationKey) {
+    case "aws.ec2.DescribeInstances":
+    case "aws.ec2.StopInstances":
+      return validAwsEc2Action(action, operationKey);
     case "github.issue.list":
       return (
         action.profile === GITHUB_PROVIDER_ACTION_PROFILE &&
@@ -195,6 +407,71 @@ function fixedActionMatchesOperation(
         action.selectedHeaders.length === 0 &&
         action.canonicalBody === null
       );
+    case "slack.chat.postMessage":
+      return (
+        action.profile === SLACK_PROVIDER_ACTION_PROFILE &&
+        action.origin === "https://slack.com" &&
+        action.method === "POST" &&
+        action.normalizedPath === "/api/chat.postMessage" &&
+        action.orderedQueryPairs.length === 0 &&
+        pairsEqual(action.selectedHeaders, [["content-type", "application/json"]]) &&
+        validSlackPostMessageBody(action.canonicalBody)
+      );
+    case "slack.conversations.list":
+      return (
+        action.profile === SLACK_PROVIDER_ACTION_PROFILE &&
+        action.origin === "https://slack.com" &&
+        action.method === "GET" &&
+        action.normalizedPath === "/api/conversations.list" &&
+        validSlackConversationsQuery(action.orderedQueryPairs) &&
+        action.selectedHeaders.length === 0 &&
+        action.canonicalBody === null
+      );
+    case "slack.users.info":
+      return (
+        action.profile === SLACK_PROVIDER_ACTION_PROFILE &&
+        action.origin === "https://slack.com" &&
+        action.method === "GET" &&
+        action.normalizedPath === "/api/users.info" &&
+        pairsEqual(action.orderedQueryPairs, [["user", action.orderedQueryPairs[0]?.[1] ?? ""]]) &&
+        SLACK_USER_RE.test(action.orderedQueryPairs[0]?.[1] ?? "") &&
+        action.selectedHeaders.length === 0 &&
+        action.canonicalBody === null
+      );
+    case "google.gmail.messages.send":
+      return (
+        action.profile === GOOGLE_PROVIDER_ACTION_PROFILE &&
+        action.origin === "https://gmail.googleapis.com" &&
+        action.method === "POST" &&
+        action.normalizedPath === "/gmail/v1/users/me/messages/send" &&
+        action.orderedQueryPairs.length === 0 &&
+        pairsEqual(action.selectedHeaders, [["content-type", "application/json"]]) &&
+        exactObject(action.canonicalBody, ["raw"]) &&
+        typeof action.canonicalBody.raw === "string" &&
+        action.canonicalBody.raw.length > 0 &&
+        action.canonicalBody.raw.length <= 200_000 &&
+        /^[A-Za-z0-9_-]+$/.test(action.canonicalBody.raw)
+      );
+    case "google.calendar.events.list":
+      return (
+        action.profile === GOOGLE_PROVIDER_ACTION_PROFILE &&
+        action.origin === "https://www.googleapis.com" &&
+        action.method === "GET" &&
+        action.normalizedPath === "/calendar/v3/calendars/primary/events" &&
+        validGoogleCalendarQuery(action.orderedQueryPairs) &&
+        action.selectedHeaders.length === 0 &&
+        action.canonicalBody === null
+      );
+    case "google.calendar.events.insert":
+      return (
+        action.profile === GOOGLE_PROVIDER_ACTION_PROFILE &&
+        action.origin === "https://www.googleapis.com" &&
+        action.method === "POST" &&
+        action.normalizedPath === "/calendar/v3/calendars/primary/events" &&
+        action.orderedQueryPairs.length === 0 &&
+        pairsEqual(action.selectedHeaders, [["content-type", "application/json"]]) &&
+        validGoogleEventBody(action.canonicalBody)
+      );
     default:
       return false;
   }
@@ -216,7 +493,17 @@ export function inspectProviderOperationTargetConformance(
     }
   };
 
-  if (action.profile === GITHUB_PROVIDER_ACTION_PROFILE) {
+  if (action.profile === AWS_PROVIDER_ACTION_PROFILE) {
+    if (
+      context.operationKey !== "aws.ec2.DescribeInstances" &&
+      context.operationKey !== "aws.ec2.StopInstances"
+    ) {
+      violations.push("operation-key-unsupported");
+    }
+    if (!fixedActionMatchesOperation(action, context.operationKey)) {
+      violations.push("operation-action-mismatch");
+    }
+  } else if (action.profile === GITHUB_PROVIDER_ACTION_PROFILE) {
     if (context.operationKey === "github.issue.list") {
       exact("https://api.github.com", "GET", /^\/repos\/[^/]+\/[^/]+\/issues$/);
     } else if (context.operationKey === "github.pr.comment.create") {
@@ -238,6 +525,32 @@ export function inspectProviderOperationTargetConformance(
       exact("https://api.x.com", "DELETE", /^\/2\/tweets\/[0-9]{1,25}$/);
     } else if (context.operationKey === "x.user.me.read") {
       exact("https://api.x.com", "GET", "/2/users/me");
+    } else {
+      violations.push("operation-key-unsupported");
+    }
+    if (!fixedActionMatchesOperation(action, context.operationKey)) {
+      violations.push("operation-action-mismatch");
+    }
+  } else if (action.profile === SLACK_PROVIDER_ACTION_PROFILE) {
+    if (context.operationKey === "slack.chat.postMessage") {
+      exact("https://slack.com", "POST", "/api/chat.postMessage");
+    } else if (context.operationKey === "slack.conversations.list") {
+      exact("https://slack.com", "GET", "/api/conversations.list");
+    } else if (context.operationKey === "slack.users.info") {
+      exact("https://slack.com", "GET", "/api/users.info");
+    } else {
+      violations.push("operation-key-unsupported");
+    }
+    if (!fixedActionMatchesOperation(action, context.operationKey)) {
+      violations.push("operation-action-mismatch");
+    }
+  } else if (action.profile === GOOGLE_PROVIDER_ACTION_PROFILE) {
+    if (context.operationKey === "google.gmail.messages.send") {
+      exact("https://gmail.googleapis.com", "POST", "/gmail/v1/users/me/messages/send");
+    } else if (context.operationKey === "google.calendar.events.list") {
+      exact("https://www.googleapis.com", "GET", "/calendar/v3/calendars/primary/events");
+    } else if (context.operationKey === "google.calendar.events.insert") {
+      exact("https://www.googleapis.com", "POST", "/calendar/v3/calendars/primary/events");
     } else {
       violations.push("operation-key-unsupported");
     }
@@ -451,10 +764,17 @@ export function inspectProviderProfileConformance(
   if (action.canonicalBody !== null && headerNames.has("content-type") === false) {
     violations.push("body-content-type-missing");
   }
+  const contentTypes = action.selectedHeaders
+    .filter(([name]) => name.toLowerCase() === "content-type")
+    .map(([, value]) => value);
   if (
-    headerNames.has("content-type") &&
-    !action.selectedHeaders.some(
-      ([name, value]) => name.toLowerCase() === "content-type" && value === "application/json",
+    contentTypes.some(
+      (value) =>
+        value !== "application/json" &&
+        !(
+          action.profile === AWS_PROVIDER_ACTION_PROFILE &&
+          value === "application/x-www-form-urlencoded; charset=UTF-8"
+        ),
     )
   ) {
     violations.push("content-type-unsupported");

@@ -46,11 +46,48 @@ export interface ExternalKeySignTransactionRequest {
   nonce?: number;
   broadcast: boolean;
   rpcUrl?: string;
+  /**
+   * Durable pre-broadcast checkpoint. Providers that can derive the final
+   * transaction hash MUST await this before the first mutating RPC call.
+   */
+  onPreparedBroadcast?: (transactionHash: string) => Promise<void>;
 }
 
 export interface ExternalKeySignTransactionResult {
   result: string;
   broadcast: boolean;
+}
+
+/**
+ * Signed EVM bytes have reached a mutating RPC boundary, but Steward could not
+ * prove whether the RPC accepted them. The locally-derived transaction hash is
+ * safe to expose and is the only identifier callers may reconcile; provider
+ * errors and signed bytes deliberately remain private.
+ *
+ * The historical class and wire-code names are retained for compatibility,
+ * but this fail-closed envelope now covers both external and local EVM custody.
+ */
+export class ExternalBroadcastOutcomeUnknownError extends Error {
+  readonly code = "external_broadcast_outcome_unknown" as const;
+
+  constructor(
+    readonly transactionHash: string,
+    options?: { cause?: unknown },
+  ) {
+    super("EVM broadcast outcome is unknown", options);
+    this.name = "ExternalBroadcastOutcomeUnknownError";
+  }
+}
+
+/** A Solana RPC preflight rejection proves the signed bytes were not submitted. */
+export class SolanaBroadcastNotSubmittedError extends Error {
+  readonly transactionHash: string;
+
+  constructor(transactionHash: string, options?: { cause?: unknown }) {
+    super("Solana transaction was rejected before submission", options);
+    this.name = "SolanaBroadcastNotSubmittedError";
+    this.transactionHash = transactionHash;
+  }
 }
 
 export interface ExternalKeyHandleRegistration {

@@ -1,6 +1,6 @@
 /**
- * agent-enroll.ts — the PUBLIC keypair-only agent enrollment surface (lane A1,
- * scope 1). Mounted BEFORE the tenant gate: an enrolling agent holds only its
+ * agent-enroll.ts — the public keypair-only agent enrollment surface. Mounted
+ * before the tenant gate: an enrolling agent holds only its
  * identity keypair, not a token or an API key.
  *
  *   POST /agent-enroll/challenge  { agentId }
@@ -28,16 +28,18 @@
 import {
   type AgentSignerResolver,
   issueEnrollChallenge,
+  parseDurationSeconds,
   type ResolvedAgentSigner,
-  signAgentToken,
   verifyEnrollResponse,
 } from "@stwd/auth";
 import { agentSigners, eq } from "@stwd/db";
+import { redactedThrownDiagnostics } from "@stwd/shared";
 import { Hono } from "hono";
 import { writeAuditEvent } from "../services/audit";
 import {
   type ApiResponse,
   type AppVariables,
+  createAgentTokenForExistingAgent,
   db,
   isValidAgentId,
   safeJsonParse,
@@ -47,9 +49,40 @@ import { checkAuthRateLimit, getAuthChallengeStore } from "./auth";
 /** Short-lived enrollment token TTL. Minute-scale: the agent immediately renews
  * (or exchanges for scoped capabilities), and a revoked signer stops enrolling
  * within one cycle. Overridable via env for operators who want a different bound. */
-const ENROLL_TOKEN_TTL = process.env.STEWARD_AGENT_ENROLL_TOKEN_TTL?.trim() || "5m";
+
+/** Hard upper bound for the enrollment token TTL: one hour. Enrollment tokens
+ * exist only to bootstrap renewal/capability exchange, so a longer value would
+ * blunt signer-revocation response (SEC-134-style bound for this env). */
+export const ENROLL_TOKEN_TTL_MAX_SECONDS = 3600;
+
+/** Validate STEWARD_AGENT_ENROLL_TOKEN_TTL at module load (startup), the same
+ * posture SEC-134 applied to AGENT_TOKEN_EXPIRY: a malformed value otherwise
+ * surfaces as a 500 at token-mint time, and an unbounded value mints
+ * long-lived tokens that defeat the minute-scale revocation story. */
+function resolveEnrollTokenTtl(): string {
+  const raw = process.env.STEWARD_AGENT_ENROLL_TOKEN_TTL?.trim();
+  if (!raw) return "5m";
+  const seconds = parseDurationSeconds(raw);
+  if (seconds === null) {
+    throw new Error(
+      `⛔ STEWARD_AGENT_ENROLL_TOKEN_TTL "${raw}" is not a valid positive duration (examples: "5m", "15m", "1h").`,
+    );
+  }
+  if (seconds > ENROLL_TOKEN_TTL_MAX_SECONDS) {
+    throw new Error(
+      `⛔ STEWARD_AGENT_ENROLL_TOKEN_TTL "${raw}" exceeds the one-hour maximum; enrollment tokens must stay minute-scale so signer revocation lands quickly.`,
+    );
+  }
+  return raw;
+}
+
+const ENROLL_TOKEN_TTL = resolveEnrollTokenTtl();
 
 export const agentEnrollRoutes = new Hono<{ Variables: AppVariables }>();
+
+function reportEnrollmentFailure(message: string, error: unknown): void {
+  console.error(`[agent-enroll] ${message}`, redactedThrownDiagnostics(error));
+}
 
 /** Resolve an agent's ACTIVE p256 signer rows (+ its tenant) from agent_signers.
  * Returns the signers for the enrollment core AND the resolved tenantId (set as a
@@ -168,8 +201,10 @@ agentEnrollRoutes.post("/verify", async (c) => {
       action: "capability.enroll",
       resourceType: "agent",
       resourceId: agentId,
-      metadata: { decision: "deny", code: result.code },
-    }).catch(() => {});
+      metadata: { stage: "authorization", decision: "deny", code: result.code },
+    }).catch((error) => {
+      reportEnrollmentFailure("denial audit unavailable", error);
+    });
     return c.json<ApiResponse>({ ok: false, error: "enrollment denied" }, 401);
   }
 
@@ -179,20 +214,52 @@ agentEnrollRoutes.post("/verify", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "enrollment denied" }, 401);
   }
 
-  const token = await signAgentToken(
-    { agentId, tenantId: resolvedTenant, scopes: ["agent"] },
-    ENROLL_TOKEN_TTL,
-  );
+  try {
+    await writeAuditEvent({
+      tenantId: resolvedTenant,
+      actorType: "agent",
+      actorId: agentId,
+      action: "capability.enroll",
+      resourceType: "agent",
+      resourceId: agentId,
+      metadata: { stage: "authorization", decision: "allow", ttl: ENROLL_TOKEN_TTL },
+    });
+  } catch (error) {
+    reportEnrollmentFailure("authorization audit unavailable", error);
+    return c.json<ApiResponse>({ ok: false, error: "enrollment unavailable" }, 503);
+  }
 
-  await writeAuditEvent({
-    tenantId: resolvedTenant,
-    actorType: "agent",
-    actorId: agentId,
-    action: "capability.enroll",
-    resourceType: "agent",
-    resourceId: agentId,
-    metadata: { decision: "allow", ttl: ENROLL_TOKEN_TTL },
-  }).catch(() => {});
+  let token: string;
+  try {
+    const minted = await createAgentTokenForExistingAgent(
+      agentId,
+      resolvedTenant,
+      ENROLL_TOKEN_TTL,
+      ["agent"],
+    );
+    if (!minted) {
+      return c.json<ApiResponse>({ ok: false, error: "enrollment denied" }, 401);
+    }
+    token = minted;
+  } catch (error) {
+    reportEnrollmentFailure("token signing failed", error);
+    return c.json<ApiResponse>({ ok: false, error: "enrollment unavailable" }, 503);
+  }
+
+  try {
+    await writeAuditEvent({
+      tenantId: resolvedTenant,
+      actorType: "agent",
+      actorId: agentId,
+      action: "capability.enroll",
+      resourceType: "agent",
+      resourceId: agentId,
+      metadata: { stage: "issuance", decision: "issued", ttl: ENROLL_TOKEN_TTL },
+    });
+  } catch (error) {
+    reportEnrollmentFailure("issuance audit unavailable", error);
+    return c.json<ApiResponse>({ ok: false, error: "enrollment unavailable" }, 503);
+  }
 
   c.header("Cache-Control", "no-store, max-age=0");
   c.header("Pragma", "no-cache");

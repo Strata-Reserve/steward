@@ -5,8 +5,10 @@ import { createHash } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  fchmodSync,
   constants as fsConstants,
   fstatSync,
+  ftruncateSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -17,7 +19,12 @@ import { join } from "node:path";
 import { StewardApiClient } from "./api";
 import { boolFlag, intFlag, parseArgs, parseJsonFlag, required, stringFlag } from "./args";
 import { runDoctor } from "./doctor";
-import { type OutputFormat, printResult } from "./format";
+import {
+  type OutputFormat,
+  printResult,
+  redactSensitiveText,
+  sanitizeTerminalText,
+} from "./format";
 import { runInit } from "./init";
 
 type CommandContext = {
@@ -36,6 +43,50 @@ type ArchiveChunkReference = {
 const MAX_ARCHIVE_CHUNKS = 2_048;
 const MAX_ARCHIVE_MANIFEST_BYTES = 768 * 1024;
 const MAX_ARCHIVE_ENVELOPE_BYTES = 1024 * 1024;
+
+/** Write sensitive output without following symlinks and make an existing
+ * permissive file owner-only before any secret bytes are written. */
+export function writeOwnerOnlyFile(path: string, contents: string): void {
+  const fd = openOwnerOnlyFile(path);
+  try {
+    writeOwnerOnlyFileDescriptor(fd, contents);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function openOwnerOnlyFile(path: string): number {
+  const fd = openSync(
+    path,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    0o600,
+  );
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new Error(`Sensitive output is not a regular file: ${path}`);
+    }
+    if (stat.nlink !== 1) {
+      throw new Error(`Sensitive output must not be hard-linked: ${path}`);
+    }
+    if (typeof process.geteuid === "function" && stat.uid !== process.geteuid()) {
+      throw new Error(`Sensitive output is not owned by the current user: ${path}`);
+    }
+    // The open() mode is creation-only. Tighten reused output before writing.
+    fchmodSync(fd, 0o600);
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function writeOwnerOnlyFileDescriptor(fd: number, contents: string): void {
+  // Truncate only after all inode checks and the permission change. O_TRUNC
+  // would destroy a special/hard-linked target before it could be rejected.
+  ftruncateSync(fd, 0);
+  writeFileSync(fd, contents, { encoding: "utf8" });
+}
 
 /** Read an untrusted archive file without following symlinks, blocking on
  * special files, or allocating beyond its validated size. */
@@ -159,7 +210,8 @@ Usage:
   steward tenant create --id ID --name NAME [--api-key-file F] [--api-key-env VAR]
                         (key via stdin/--api-key-file/--api-key-env preferred; --api-key warns)
   steward agent create --name NAME [--id ID]
-  steward agent token --agent-id ID [--expires-in 24h] [--scopes agent,api:proxy]
+  steward agent token --agent-id ID --out token.json [--expires-in 24h] [--scopes agent,api:proxy]
+                      [--show-token]  # explicit unsafe terminal compatibility mode
   steward secret add --name NAME [--file F] [--description TEXT]   (value via stdin or --file preferred; --value warns)
   steward secret rotate --id ID [--file F]                          (value via stdin or --file preferred; --value warns)
   steward route add --secret-id ID --agent-id ID --host HOST --path PATH --method METHOD --inject-as header --inject-key KEY
@@ -177,7 +229,7 @@ Usage:
   steward provider-action execute --id ID [--idempotency-key KEY]
   steward provider-action evidence --id ID [--out bundle.json] [--verify --fp HEX]
 
-provider-action commands are thin wrappers over the PR2-PR5 governed routes
+provider-action commands are thin wrappers over the governed routes
 (convenience only; the authoritative proof is
 scripts/provider-authority-golden-path.mjs). No new authority is introduced.
 
@@ -233,14 +285,45 @@ async function agentCommand(action: string | undefined, ctx: CommandContext) {
   if (action === "list") return ctx.api.request("GET", "/agents");
   if (action === "token") {
     const agentId = required(stringFlag(ctx.flags, "agent-id"), "agent-id");
+    const out = stringFlag(ctx.flags, "out");
+    const showToken = boolFlag(ctx.flags, "show-token");
+    if (!out && !showToken) {
+      throw new Error(
+        "agent token output requires --out <owner-only-file>; use --show-token only when terminal/log capture is disabled",
+      );
+    }
+    // Open, validate, and permission the destination before minting, then keep
+    // this exact inode open across the request. That closes the path-swap race
+    // that could otherwise orphan a live token after a successful response.
+    const outFd = out ? openOwnerOnlyFile(out) : undefined;
     const scopes = stringFlag(ctx.flags, "scopes")
       ?.split(",")
       .map((scope) => scope.trim())
       .filter(Boolean);
-    return ctx.api.request("POST", `/agents/${encodeURIComponent(agentId)}/token`, {
-      expiresIn: stringFlag(ctx.flags, "expires-in"),
-      scopes,
-    });
+    try {
+      const result = await ctx.api.request<Record<string, unknown> & { token: string }>(
+        "POST",
+        `/agents/${encodeURIComponent(agentId)}/token`,
+        {
+          expiresIn: stringFlag(ctx.flags, "expires-in"),
+          scopes,
+        },
+      );
+      if (typeof result.token !== "string" || result.token.length === 0) {
+        throw new Error("Steward returned an invalid agent token response");
+      }
+      if (outFd !== undefined && out) {
+        writeOwnerOnlyFileDescriptor(outFd, `${JSON.stringify(result, null, 2)}\n`);
+        const { token: _token, ...receipt } = result;
+        return { ...receipt, token: "[REDACTED]", wrote: out };
+      }
+      console.error(
+        "[steward] WARNING: --show-token writes a bearer credential to stdout; disable terminal and CI log capture",
+      );
+      return result;
+    } finally {
+      if (outFd !== undefined) closeSync(outFd);
+    }
   }
   throw new Error("Supported agent commands: agent create|list|token");
 }
@@ -249,7 +332,7 @@ async function agentCommand(action: string | undefined, ctx: CommandContext) {
  * Read a secret value for onboarding/rotation. Preferred sources are --file or
  * stdin so the plaintext never lands in shell history or `ps` output. --value
  * remains for backward compatibility but warns loudly (salvaged from the
- * sovereign-custody A2 lane: zero-plaintext-transit onboarding).
+ * sovereign-custody path: zero-plaintext-transit onboarding).
  */
 export function readSecretValue(flags: Record<string, string | boolean>): string {
   const file = stringFlag(flags, "file");
@@ -561,7 +644,7 @@ async function auditCommand(action: string | undefined, ctx: CommandContext) {
   if (to !== undefined) params.set("to", String(to));
   const bundle = await ctx.api.request("GET", `/audit/bundle?${params}`);
   const out = stringFlag(ctx.flags, "out");
-  if (out) writeFileSync(out, JSON.stringify(bundle, null, 2), { mode: 0o600 });
+  if (out) writeOwnerOnlyFile(out, JSON.stringify(bundle, null, 2));
   if (boolFlag(ctx.flags, "verify")) {
     if (!out) throw new Error("--verify requires --out so the offline verifier has a file");
     const result = spawnSync(process.execPath, [evidenceBundleVerifierScript(), out], {
@@ -573,16 +656,15 @@ async function auditCommand(action: string | undefined, ctx: CommandContext) {
 }
 
 /**
- * PR6 provider-action command group — thin convenience wrappers over the
- * pre-existing PR2-PR5 governed-provider routes. Distribution is unsettled
- * (§5.4), so these are convenience only: the AUTHORITATIVE proof is
+ * Provider-action command group: thin convenience wrappers over the
+ * governed-provider routes. These are convenience only; the authoritative proof is
  * `scripts/provider-authority-golden-path.mjs`. No new route or authority is
  * introduced; each subcommand maps 1:1 to an existing route. Consequential
  * writes are gated by the SAME approval/execute lifecycle regardless of caller.
  */
 async function providerActionCommand(action: string | undefined, ctx: CommandContext) {
   if (action === "create") {
-    // Create a provider action (PR2). The route's strict top-level schema accepts
+    // Create a provider action. The route's strict top-level schema accepts
     // exactly {workspaceId, providerAccountId, operationKey, arguments,
     // idempotencyKey}; the API canonicalizes + digests the arguments and hashes
     // the idempotency key server-side. `--arguments` is the adapter argument JSON
@@ -600,11 +682,11 @@ async function providerActionCommand(action: string | undefined, ctx: CommandCon
     return ctx.api.request("GET", `/v2/provider-actions/${id()}`);
   }
   if (action === "approval") {
-    // The approval DETAIL (PR3) — requires a human session + recent MFA.
+    // Approval detail requires a human session and recent MFA.
     return ctx.api.request("GET", `/v2/provider-actions/${id()}/approval`);
   }
   if (action === "approve" || action === "deny") {
-    // A typed reason is REQUIRED for BOTH decisions (equal-weight, U4/PR3 §9.2).
+    // A typed reason is required for both decisions.
     // The route ALSO requires an idempotencyKey (rejects with
     // APPROVAL_FIELD_INVALID otherwise) so a retried decision cannot double-apply.
     const reason = required(stringFlag(ctx.flags, "reason"), "reason");
@@ -629,7 +711,7 @@ async function providerActionCommand(action: string | undefined, ctx: CommandCon
     return ctx.api.request("POST", `/v2/provider-actions/${id()}/approval`, decideBody);
   }
   if (action === "execute") {
-    // Typed system resume (PR3). Body carries ONLY idempotencyKey; actor/action
+    // Typed system resume. The body carries only idempotencyKey; actor/action
     // substitution is rejected server-side (RESUME_ACTOR_SUBSTITUTION_FORBIDDEN).
     const idempotencyKey = stringFlag(ctx.flags, "idempotency-key");
     return ctx.api.request(
@@ -639,15 +721,15 @@ async function providerActionCommand(action: string | undefined, ctx: CommandCon
     );
   }
   if (action === "case") {
-    // The case manifest (PR5) — owner/admin + recent MFA.
+    // The case manifest requires owner or admin authorization and recent MFA.
     return ctx.api.request("GET", `/v2/provider-actions/${id()}/case`);
   }
   if (action === "evidence") {
-    // The signed evidence bundle (PR5). Optionally write + offline-verify with a
+    // The signed evidence bundle can be written and verified offline with a
     // trusted key fingerprint (E7): --out bundle.json [--verify --fp <hex>].
     const bundle = await ctx.api.request("GET", `/v2/provider-actions/${id()}/evidence`);
     const out = stringFlag(ctx.flags, "out");
-    if (out) writeFileSync(out, JSON.stringify(bundle, null, 2), { mode: 0o600 });
+    if (out) writeOwnerOnlyFile(out, JSON.stringify(bundle, null, 2));
     if (boolFlag(ctx.flags, "verify")) {
       if (!out) throw new Error("--verify requires --out so the offline verifier has a file");
       const fp = stringFlag(ctx.flags, "fp") ?? stringFlag(ctx.flags, "expected-key-fingerprint");
@@ -658,7 +740,7 @@ async function providerActionCommand(action: string | undefined, ctx: CommandCon
       else
         console.error(
           "WARNING: no --fp supplied; verifying against the EMBEDDED key proves " +
-            "self-consistency only, NOT trust to a known signing root (PR5 E7).",
+            "self-consistency only, NOT trust to a known signing root.",
         );
       const result = spawnSync(process.execPath, args, { stdio: "inherit" });
       if (result.status !== 0) throw new Error("Offline evidence bundle verification failed");
@@ -719,12 +801,30 @@ async function main(argv: string[]) {
   };
   const handler = handlers[command];
   if (!handler) throw new Error(`Unknown command '${command}'. Run steward help.`);
-  printResult(await handler(action, ctx), ctx.format);
+  printResult(
+    await handler(action, ctx),
+    ctx.format,
+    command === "agent" && action === "token" && boolFlag(parsed.flags, "show-token"),
+  );
 }
 
 if (import.meta.main) {
-  main(Bun.argv.slice(2)).catch((error) => {
-    console.error(`steward: ${(error as Error).message}`);
+  const cliArgv = Bun.argv.slice(2);
+  main(cliArgv).catch((error) => {
+    const parsed = parseArgs(cliArgv);
+    const sensitiveFlagNames = ["token", "tenant-key", "platform-key", "api-key", "value"];
+    const knownSecrets = [
+      ...sensitiveFlagNames.map((name) => stringFlag(parsed.flags, name)),
+      process.env.STEWARD_TOKEN,
+      process.env.STEWARD_API_TOKEN,
+      process.env.STEWARD_TENANT_KEY,
+      process.env.STEWARD_PLATFORM_KEY,
+    ];
+    const message = redactSensitiveText(
+      error instanceof Error ? error.message : String(error),
+      knownSecrets,
+    );
+    console.error(`steward: ${sanitizeTerminalText(message)}`);
     process.exit(1);
   });
 }

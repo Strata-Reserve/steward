@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { assertTokenNotRevoked, hashSha256Hex, revocationStore } from "@stwd/auth";
 import { accounts, closeDb, getDb, refreshTokens, tenants, users, userTenants } from "@stwd/db";
@@ -9,6 +9,7 @@ process.env.STEWARD_MASTER_PASSWORD ??= "dev-secret";
 process.env.STEWARD_JWT_SECRET ??= "session-revocation-jwt-secret-with-enough-bytes";
 process.env.STEWARD_AUDIT_HMAC_KEY ??= "session-revocation-audit-hmac-key-with-enough-bytes";
 process.env.STEWARD_PGLITE_MEMORY = "true";
+setDefaultTimeout(30_000);
 
 const JWT_SECRET = new TextEncoder().encode(
   process.env.STEWARD_SESSION_SECRET || process.env.STEWARD_MASTER_PASSWORD || "dev-secret",
@@ -78,6 +79,60 @@ async function verifyAgentToken(token: string) {
 }
 
 describe("API access-token revocation", () => {
+  it("returns 401 for unknown and reused refresh tokens", async () => {
+    const unknown = await authRoutes.request("/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: `unknown-${randomUUID()}` }),
+    });
+    expect(unknown.status).toBe(401);
+    expect(await unknown.json()).toEqual({
+      ok: false,
+      error: "Invalid or expired refresh token",
+    });
+
+    const db = getDb();
+    const userId = randomUUID();
+    const tenantId = `tenant-refresh-reuse-${Date.now()}`;
+    const rawRefreshToken = `refresh-reuse-${randomUUID()}`;
+
+    await db.insert(tenants).values({
+      id: tenantId,
+      name: "Refresh Reuse Test Tenant",
+      apiKeyHash: `test-hash-${tenantId}`,
+    });
+    await db.insert(users).values({ id: userId, email: `${userId}@example.com` });
+    await db.insert(userTenants).values({ userId, tenantId, role: "owner" });
+    await db.insert(refreshTokens).values({
+      id: randomUUID(),
+      userId,
+      tenantId,
+      tokenHash: hashSha256Hex(rawRefreshToken),
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    });
+
+    const firstUse = await authRoutes.request("/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: rawRefreshToken }),
+    });
+    expect(firstUse.status).toBe(200);
+
+    const reused = await authRoutes.request("/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: rawRefreshToken }),
+    });
+    expect(reused.status).toBe(401);
+    expect(await reused.json()).toEqual({
+      ok: false,
+      error: "Refresh token reuse detected. Please sign in again.",
+    });
+
+    const remaining = await db.select().from(refreshTokens);
+    expect(remaining.some((row) => row.userId === userId)).toBe(false);
+  });
+
   it("refresh flow still works without a valid access token", async () => {
     const db = getDb();
     const userId = randomUUID();
@@ -140,6 +195,60 @@ describe("API access-token revocation", () => {
       userId,
       tenantId,
     });
+  });
+
+  it("rotates a refresh token across memberships and rejects a non-member target", async () => {
+    const db = getDb();
+    const userId = randomUUID();
+    const sourceTenantId = `tenant-refresh-source-${Date.now()}`;
+    const targetTenantId = `tenant-refresh-target-${Date.now()}`;
+    const deniedTenantId = `tenant-refresh-denied-${Date.now()}`;
+    const rawRefreshToken = `refresh-switch-${randomUUID()}`;
+
+    for (const [id, name] of [
+      [sourceTenantId, "Refresh Source"],
+      [targetTenantId, "Refresh Target"],
+      [deniedTenantId, "Refresh Denied"],
+    ]) {
+      await db.insert(tenants).values({ id, name, apiKeyHash: `hash-${id}` });
+    }
+    await db.insert(users).values({ id: userId, email: `${userId}@example.com` });
+    await db.insert(userTenants).values([
+      { userId, tenantId: sourceTenantId, role: "owner" },
+      { userId, tenantId: targetTenantId, role: "member" },
+    ]);
+    await db.insert(refreshTokens).values({
+      id: randomUUID(),
+      userId,
+      tenantId: sourceTenantId,
+      tokenHash: hashSha256Hex(rawRefreshToken),
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    });
+
+    const switched = await authRoutes.request("/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: rawRefreshToken, tenantId: targetTenantId }),
+    });
+    expect(switched.status).toBe(200);
+    const switchedBody = (await switched.json()) as { token: string; refreshToken: string };
+    expect(await verifySessionToken(switchedBody.token)).toMatchObject({
+      userId,
+      tenantId: targetTenantId,
+    });
+
+    const denied = await authRoutes.request("/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        refreshToken: switchedBody.refreshToken,
+        tenantId: deniedTenantId,
+      }),
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({ ok: false, error: "Not a member of this tenant" });
+    const remaining = await db.select().from(refreshTokens);
+    expect(remaining.some((row) => row.userId === userId)).toBe(false);
   });
 
   it("/auth/logout revokes the presented access token", async () => {

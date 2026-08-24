@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID, scryptSync } from "node:crypto";
 import {
   calculateJwkThumbprint,
@@ -14,7 +15,8 @@ export const JWT_ISSUER = "steward";
 export const JWT_AUDIENCE = "steward-api";
 export const ACCESS_TOKEN_EXPIRY = "15m";
 export const ACCESS_TOKEN_EXPIRY_SECONDS = 900;
-export const AGENT_TOKEN_EXPIRY = process.env.AGENT_TOKEN_EXPIRY || "30d";
+/** Stable default retained for API compatibility. Runtime overrides are read by getAgentTokenExpiry. */
+export const AGENT_TOKEN_EXPIRY = "30d";
 export const REFRESH_TOKEN_EXPIRY = "30d";
 export const IDENTITY_TOKEN_EXPIRY = ACCESS_TOKEN_EXPIRY;
 
@@ -55,13 +57,57 @@ export interface JwtSecretOptions {
   nodeEnv?: string;
   /** Defaults to console.warn. Pass null to silence warnings. */
   warn?: ((message: string) => void) | null;
+  /** Explicit immutable environment used to construct request-scoped authority. */
+  environment?: JwtRuntimeEnvironment;
 }
+
+export interface JwtRuntimeEnvironment {
+  readonly NODE_ENV?: string;
+  readonly STEWARD_JWT_SECRET?: string;
+  readonly STEWARD_SESSION_SECRET?: string;
+  readonly STEWARD_MASTER_PASSWORD?: string;
+  readonly STEWARD_EMBEDDED?: string;
+  readonly STEWARD_EMBEDDED_MODE?: string;
+  readonly STEWARD_DB_MODE?: string;
+  readonly DATABASE_URL?: string;
+  readonly STEWARD_ALLOW_DEV_SECRETS?: string;
+  readonly STEWARD_ALLOW_DEV_SECRET?: string;
+  readonly AGENT_TOKEN_EXPIRY?: string;
+  readonly STEWARD_IDENTITY_JWT_ALG?: string;
+  readonly STEWARD_IDENTITY_JWT_PRIVATE_KEY?: string;
+  readonly STEWARD_IDENTITY_JWT_KID?: string;
+  readonly STEWARD_IDENTITY_JWT_ISSUER?: string;
+  readonly STEWARD_IDENTITY_JWT_AUDIENCE?: string;
+  readonly APP_URL?: string;
+}
+
+/** Immutable symmetric and asymmetric JWT authority for one request. */
+export interface JwtRuntimeAuthority {
+  readonly nodeEnv: string | undefined;
+  readonly jwtSecret: string;
+  readonly agentTokenExpiry: string;
+  readonly identityJwtAlgorithm: IdentityJwtAlgorithm;
+  readonly identityJwtPrivateKey?: string;
+  readonly identityJwtKid?: string;
+  readonly identityJwtIssuer?: string;
+  readonly identityJwtAudience: string;
+  readonly appUrl?: string;
+}
+
+const jwtRuntimeAuthorityStorage = new AsyncLocalStorage<JwtRuntimeAuthority>();
 
 export interface IdentityJwtConfig {
   alg: IdentityJwtAlgorithm;
   kid: string;
   issuer: string;
   audience: string;
+}
+
+export class IdentityJwtConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IdentityJwtConfigurationError";
+  }
 }
 
 let warnedDeprecatedSessionSecret = false;
@@ -97,12 +143,12 @@ function deriveEmbeddedJwtSecret(masterPassword: string): string {
   return derived;
 }
 
-function isEmbeddedMode(): boolean {
+function isEmbeddedMode(environment: JwtRuntimeEnvironment = process.env): boolean {
   return (
-    process.env.STEWARD_EMBEDDED === "true" ||
-    process.env.STEWARD_EMBEDDED_MODE === "true" ||
-    process.env.STEWARD_DB_MODE === "pglite" ||
-    process.env.DATABASE_URL === "pglite://embedded"
+    environment.STEWARD_EMBEDDED === "true" ||
+    environment.STEWARD_EMBEDDED_MODE === "true" ||
+    environment.STEWARD_DB_MODE === "pglite" ||
+    environment.DATABASE_URL === "pglite://embedded"
   );
 }
 
@@ -117,13 +163,16 @@ function isEmbeddedMode(): boolean {
  * Exported so other packages (vault, webhooks, api key stores) can apply the
  * same consistent guard.
  */
-export function isDevSecretAllowed(nodeEnv: string | undefined = process.env.NODE_ENV): boolean {
+export function isDevSecretAllowed(
+  nodeEnv: string | undefined = process.env.NODE_ENV,
+  environment: JwtRuntimeEnvironment = process.env,
+): boolean {
   if (nodeEnv === "production") return false;
   // Canonical var is STEWARD_ALLOW_DEV_SECRETS; the singular
   // STEWARD_ALLOW_DEV_SECRET is accepted for backwards compatibility.
   return (
-    process.env.STEWARD_ALLOW_DEV_SECRETS === "true" ||
-    process.env.STEWARD_ALLOW_DEV_SECRET === "true"
+    environment.STEWARD_ALLOW_DEV_SECRETS === "true" ||
+    environment.STEWARD_ALLOW_DEV_SECRET === "true"
   );
 }
 
@@ -189,10 +238,14 @@ export function checkJwtSecretStrength(
  * derivation input — never used verbatim (see deriveEmbeddedJwtSecret).
  */
 export function getJwtSecret(options: JwtSecretOptions = {}): string {
-  const nodeEnv = options.nodeEnv ?? process.env.NODE_ENV;
+  const requestAuthority = jwtRuntimeAuthorityStorage.getStore();
+  if (!options.environment && requestAuthority) return requestAuthority.jwtSecret;
+
+  const environment = options.environment ?? process.env;
+  const nodeEnv = options.nodeEnv ?? environment.NODE_ENV;
   const warn = options.warn === undefined ? console.warn : options.warn;
-  const jwtSecret = process.env.STEWARD_JWT_SECRET;
-  const sessionSecret = process.env.STEWARD_SESSION_SECRET;
+  const jwtSecret = environment.STEWARD_JWT_SECRET;
+  const sessionSecret = environment.STEWARD_SESSION_SECRET;
 
   let sourceName:
     | "STEWARD_JWT_SECRET"
@@ -208,9 +261,9 @@ export function getJwtSecret(options: JwtSecretOptions = {}): string {
     sourceName = "STEWARD_SESSION_SECRET";
     secret = sessionSecret;
     warnOnce("session", warn);
-  } else if (isEmbeddedMode() && process.env.STEWARD_MASTER_PASSWORD) {
+  } else if (isEmbeddedMode(environment) && environment.STEWARD_MASTER_PASSWORD) {
     sourceName = "STEWARD_MASTER_PASSWORD";
-    secret = deriveEmbeddedJwtSecret(process.env.STEWARD_MASTER_PASSWORD);
+    secret = deriveEmbeddedJwtSecret(environment.STEWARD_MASTER_PASSWORD);
     warnOnce("master", warn);
   } else {
     sourceName = "dev-secret";
@@ -228,7 +281,7 @@ export function getJwtSecret(options: JwtSecretOptions = {}): string {
   }
 
   if (!secret) {
-    if (!isDevSecretAllowed(nodeEnv)) {
+    if (!isDevSecretAllowed(nodeEnv, environment)) {
       throw new Error(
         "⛔ No JWT secret configured. Set STEWARD_JWT_SECRET, or for local development " +
           "explicitly opt in to the insecure dev fallback with STEWARD_ALLOW_DEV_SECRETS=true " +
@@ -250,15 +303,25 @@ function normalizePrivateKeyInput(value: string): string {
   return value.trim().replace(/\\n/g, "\n");
 }
 
-function getIdentityJwtAlgorithm(): IdentityJwtAlgorithm {
-  const alg = process.env.STEWARD_IDENTITY_JWT_ALG?.trim() || "RS256";
+function resolveIdentityJwtAlgorithm(value?: string): IdentityJwtAlgorithm {
+  const alg = value?.trim() || "RS256";
   if (alg !== "RS256" && alg !== "ES256") {
     throw new Error("STEWARD_IDENTITY_JWT_ALG must be RS256 or ES256");
   }
   return alg;
 }
 
+function getIdentityJwtAlgorithm(): IdentityJwtAlgorithm {
+  const authority = jwtRuntimeAuthorityStorage.getStore();
+  return (
+    authority?.identityJwtAlgorithm ??
+    resolveIdentityJwtAlgorithm(process.env.STEWARD_IDENTITY_JWT_ALG)
+  );
+}
+
 function getIdentityJwtPrivateKeyInput(): string | undefined {
+  const authority = jwtRuntimeAuthorityStorage.getStore();
+  if (authority) return authority.identityJwtPrivateKey;
   return process.env.STEWARD_IDENTITY_JWT_PRIVATE_KEY?.trim() || undefined;
 }
 
@@ -266,17 +329,60 @@ export function isAsymmetricIdentityJwtConfigured(): boolean {
   return Boolean(getIdentityJwtPrivateKeyInput());
 }
 
+function resolveIdentityJwtBase(requestOrigin?: string): string {
+  const authority = jwtRuntimeAuthorityStorage.getStore();
+  const nodeEnv = authority?.nodeEnv ?? process.env.NODE_ENV;
+  const configured = authority
+    ? authority.identityJwtIssuer || authority.appUrl
+    : process.env.STEWARD_IDENTITY_JWT_ISSUER?.trim() || process.env.APP_URL?.trim();
+  if (configured) {
+    let url: URL;
+    try {
+      url = new URL(configured);
+    } catch {
+      throw new IdentityJwtConfigurationError("Identity JWT issuer base must be an absolute URL");
+    }
+    if (
+      (url.protocol !== "https:" && (nodeEnv === "production" || url.protocol !== "http:")) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      throw new IdentityJwtConfigurationError(
+        "Identity JWT issuer base must be a canonical HTTPS URL",
+      );
+    }
+    return url.toString().replace(/\/$/, "");
+  }
+  if (nodeEnv === "production") {
+    throw new IdentityJwtConfigurationError(
+      "STEWARD_IDENTITY_JWT_ISSUER or APP_URL is required for identity JWTs",
+    );
+  }
+  return requestOrigin?.trim().replace(/\/$/, "") || JWT_ISSUER;
+}
+
 export function getIdentityJwtIssuer(requestOrigin?: string): string {
-  return (
-    process.env.STEWARD_IDENTITY_JWT_ISSUER?.trim().replace(/\/$/, "") ||
-    process.env.APP_URL?.trim().replace(/\/$/, "") ||
-    requestOrigin?.trim().replace(/\/$/, "") ||
-    JWT_ISSUER
-  );
+  return resolveIdentityJwtBase(requestOrigin);
+}
+
+/**
+ * Resolve the externally visible identity-discovery base for the current
+ * request. Worker requests use their immutable authority snapshot so an
+ * overlapping invocation cannot substitute its process.env compatibility
+ * mirror while this request is suspended.
+ */
+export function getIdentityDiscoveryBaseUrl(requestUrl: string): string {
+  return resolveIdentityJwtBase(new URL(requestUrl).origin);
 }
 
 export function getIdentityJwtAudience(): string {
-  return process.env.STEWARD_IDENTITY_JWT_AUDIENCE?.trim() || JWT_AUDIENCE;
+  return (
+    jwtRuntimeAuthorityStorage.getStore()?.identityJwtAudience ??
+    process.env.STEWARD_IDENTITY_JWT_AUDIENCE?.trim() ??
+    JWT_AUDIENCE
+  );
 }
 
 async function importIdentityPrivateKey(alg: IdentityJwtAlgorithm) {
@@ -298,10 +404,12 @@ async function identityPublicJwk(alg: IdentityJwtAlgorithm): Promise<JWK | null>
   const publicJwk = await exportJWK(privateKey);
   publicJwk.alg = alg;
   publicJwk.use = "sig";
-  publicJwk.kid =
-    process.env.STEWARD_IDENTITY_JWT_KID?.trim() ||
-    publicJwk.kid ||
-    (await calculateJwkThumbprint(publicJwk));
+  const authority = jwtRuntimeAuthorityStorage.getStore();
+  publicJwk.kid = authority
+    ? authority.identityJwtKid || publicJwk.kid || (await calculateJwkThumbprint(publicJwk))
+    : process.env.STEWARD_IDENTITY_JWT_KID?.trim() ||
+      publicJwk.kid ||
+      (await calculateJwkThumbprint(publicJwk));
   delete publicJwk.d;
   delete publicJwk.dp;
   delete publicJwk.dq;
@@ -346,6 +454,156 @@ async function getIdentityJwtSigningConfig(
 /** Validate JWT env at service startup; throws clear errors for invalid production config. */
 export function validateJwtSecretEnv(options?: JwtSecretOptions): void {
   getJwtSecret(options);
+  if (options?.environment) {
+    validateAgentTokenExpiryEnv(options.environment.AGENT_TOKEN_EXPIRY ?? AGENT_TOKEN_EXPIRY);
+    return;
+  }
+  validateAgentTokenExpiryEnv();
+}
+
+// Matches the relative-duration grammar jose accepts in setExpirationTime,
+// restricted to positive forward durations ("30d", "12h", "15 minutes").
+const DURATION_PATTERN =
+  /^(\d+|\d+\.\d+) ?(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|years?|yrs?|y)$/i;
+
+const DURATION_UNIT_SECONDS: Record<string, number> = {
+  s: 1,
+  sec: 1,
+  secs: 1,
+  second: 1,
+  seconds: 1,
+  m: 60,
+  min: 60,
+  mins: 60,
+  minute: 60,
+  minutes: 60,
+  h: 3600,
+  hr: 3600,
+  hrs: 3600,
+  hour: 3600,
+  hours: 3600,
+  d: 86400,
+  day: 86400,
+  days: 86400,
+  w: 604800,
+  week: 604800,
+  weeks: 604800,
+  y: 31557600,
+  yr: 31557600,
+  yrs: 31557600,
+  year: 31557600,
+  years: 31557600,
+};
+
+/** Hard upper bound for AGENT_TOKEN_EXPIRY: one year. */
+export const AGENT_TOKEN_EXPIRY_MAX_SECONDS = DURATION_UNIT_SECONDS.y;
+
+/**
+ * Parse a relative duration string ("30m", "12h", "5 days") into seconds.
+ * Returns null when the value is not a positive forward duration in the
+ * grammar jose accepts for setExpirationTime.
+ */
+export function parseDurationSeconds(value: string): number | null {
+  const match = DURATION_PATTERN.exec(value.trim());
+  const seconds = match
+    ? Number.parseFloat(match[1]) * (DURATION_UNIT_SECONDS[match[2].toLowerCase()] ?? Number.NaN)
+    : Number.NaN;
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+/**
+ * Validate AGENT_TOKEN_EXPIRY format and bound at startup (SEC-134). A bad
+ * value otherwise surfaces as a 500 at token-signing time, and an unbounded
+ * value mints effectively-permanent agent tokens.
+ *
+ * The default resolves an immutable request authority when present, then falls
+ * back to process.env for Bun/Node entry points. It never uses a module-init
+ * environment capture.
+ */
+export function validateAgentTokenExpiryEnv(value?: string): void {
+  const resolved =
+    value ??
+    jwtRuntimeAuthorityStorage.getStore()?.agentTokenExpiry ??
+    process.env.AGENT_TOKEN_EXPIRY ??
+    AGENT_TOKEN_EXPIRY;
+  const seconds = parseDurationSeconds(resolved);
+  if (seconds === null) {
+    throw new Error(
+      `⛔ AGENT_TOKEN_EXPIRY "${resolved}" is not a valid positive duration (examples: "30m", "12h", "30d").`,
+    );
+  }
+  if (seconds > AGENT_TOKEN_EXPIRY_MAX_SECONDS) {
+    throw new Error(
+      `⛔ AGENT_TOKEN_EXPIRY "${resolved}" exceeds the one-year maximum; agent tokens must not be effectively permanent.`,
+    );
+  }
+}
+
+/** Resolve and validate an explicit, request-scoped, or process default agent-token TTL. */
+export function getAgentTokenExpiry(value?: string): string {
+  const normalized = (
+    value ??
+    jwtRuntimeAuthorityStorage.getStore()?.agentTokenExpiry ??
+    process.env.AGENT_TOKEN_EXPIRY ??
+    AGENT_TOKEN_EXPIRY
+  ).trim();
+  validateAgentTokenExpiryEnv(normalized);
+  return normalized;
+}
+
+/**
+ * Resolve and validate one immutable JWT authority before a Worker request can
+ * yield. The returned snapshot never consults process.env again.
+ */
+export function createJwtRuntimeAuthority(
+  environment: JwtRuntimeEnvironment,
+  options: Pick<JwtSecretOptions, "warn"> = {},
+): Readonly<JwtRuntimeAuthority> {
+  const jwtSecret = getJwtSecret({
+    environment,
+    nodeEnv: environment.NODE_ENV,
+    warn: options.warn,
+  });
+  const agentTokenExpiry = getAgentTokenExpiry(
+    environment.AGENT_TOKEN_EXPIRY ?? AGENT_TOKEN_EXPIRY,
+  );
+  const identityJwtAlgorithm = resolveIdentityJwtAlgorithm(environment.STEWARD_IDENTITY_JWT_ALG);
+  const identityJwtPrivateKey = environment.STEWARD_IDENTITY_JWT_PRIVATE_KEY?.trim() || undefined;
+  const identityJwtKid = environment.STEWARD_IDENTITY_JWT_KID?.trim() || undefined;
+  const identityJwtIssuer =
+    environment.STEWARD_IDENTITY_JWT_ISSUER?.trim().replace(/\/$/, "") || undefined;
+  const identityJwtAudience = environment.STEWARD_IDENTITY_JWT_AUDIENCE?.trim() || JWT_AUDIENCE;
+  const appUrl = environment.APP_URL?.trim().replace(/\/$/, "") || undefined;
+  return Object.freeze({
+    nodeEnv: environment.NODE_ENV,
+    jwtSecret,
+    agentTokenExpiry,
+    identityJwtAlgorithm,
+    identityJwtPrivateKey,
+    identityJwtKid,
+    identityJwtIssuer,
+    identityJwtAudience,
+    appUrl,
+  });
+}
+
+/** Bind one immutable JWT authority to all asynchronous work spawned by a request. */
+export function withJwtRuntimeAuthority<T>(
+  authority: Readonly<JwtRuntimeAuthority>,
+  callback: () => T,
+): T {
+  const immutableAuthority = Object.freeze({
+    nodeEnv: authority.nodeEnv,
+    jwtSecret: authority.jwtSecret,
+    agentTokenExpiry: authority.agentTokenExpiry,
+    identityJwtAlgorithm: authority.identityJwtAlgorithm,
+    identityJwtPrivateKey: authority.identityJwtPrivateKey,
+    identityJwtKid: authority.identityJwtKid,
+    identityJwtIssuer: authority.identityJwtIssuer,
+    identityJwtAudience: authority.identityJwtAudience,
+    appUrl: authority.appUrl,
+  });
+  return jwtRuntimeAuthorityStorage.run(immutableAuthority, callback);
 }
 
 export async function signJwtPayload(
@@ -359,7 +617,7 @@ export async function signJwtPayload(
   // revocation store. Callers may pre-set payload.jti to override.
   const jti = (typeof payload.jti === "string" && payload.jti) || randomUUID();
   return new SignJWT({ ...payload, jti })
-    .setProtectedHeader({ alg: "HS256" })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
     .setIssuedAt()
     .setIssuer(issuer)
     .setAudience(audience)
@@ -413,12 +671,13 @@ export async function signAccessToken(
   payload: AccessTokenPayload,
   expiresIn: string = ACCESS_TOKEN_EXPIRY,
 ): Promise<string> {
-  return signJwtPayload(payload, expiresIn);
+  const subject = typeof payload.userId === "string" ? payload.userId.trim() : "";
+  return signJwtPayload(subject ? { ...payload, sub: subject } : payload, expiresIn);
 }
 
 export async function signAgentToken(
   payload: Omit<AgentTokenPayload, "scope"> & { scope?: "agent"; scopes?: string[] },
-  expiresIn: string = AGENT_TOKEN_EXPIRY,
+  expiresIn: string = getAgentTokenExpiry(),
 ): Promise<string> {
   const merged: Record<string, unknown> = { ...payload, scope: "agent" };
   if (Array.isArray(payload.scopes)) merged.scopes = payload.scopes;

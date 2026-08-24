@@ -4,15 +4,25 @@
  * Mount: app.route("/agents", agentRoutes)
  */
 
-import { hashSha256Hex, importP256PublicKey, revocationStore } from "@stwd/auth";
+import {
+  getAgentTokenExpiry,
+  hashSha256Hex,
+  importP256PublicKey,
+  revocationStore,
+} from "@stwd/auth";
 import { agentPolicies, toPersistedPolicyRule } from "@stwd/db";
 import { getSpend, getSpendByHost, invalidateCache, type SpendPeriod } from "@stwd/redis";
+import { redactedThrownDiagnostics } from "@stwd/shared";
 import { and, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { isRedisAvailable } from "../middleware/redis";
-import { writeAuditEvent } from "../services/audit";
+import { deleteAgentAuthority } from "../services/agent-deletion";
 import {
-  AGENT_TOKEN_EXPIRY,
+  type AuditEventInput,
+  withTenantAuditedTransaction,
+  writeAuditEvent,
+} from "../services/audit";
+import {
   type AgentIdentity,
   type ApiResponse,
   type AppVariables,
@@ -21,7 +31,7 @@ import {
   agents,
   agentWallets,
   approvalQueue,
-  createAgentToken,
+  createAgentTokenForExistingAgent,
   db,
   encryptedChainKeys,
   encryptedKeys,
@@ -49,6 +59,7 @@ import {
   readTenantGasSponsorshipConfig,
 } from "../services/gas-sponsorship";
 import { getPolicyRulesValidationError } from "../services/policy-validation";
+import { isRecentMfaTimestamp } from "../services/recent-mfa";
 import { createSignerCredentialHash } from "../services/signer-credentials";
 import { redactWalletMetadataSecrets } from "../services/wallet-metadata";
 import { dispatchWebhook } from "../services/webhook-dispatch";
@@ -213,7 +224,7 @@ function agentWalletRowsToAccountWallets(
   ];
 }
 
-async function writeAgentAudit(
+function agentAuditEvent(
   c: Parameters<typeof requireTenantLevel>[0],
   event: {
     tenantId: string;
@@ -222,9 +233,9 @@ async function writeAgentAudit(
     resourceId: string;
     metadata?: Record<string, unknown>;
   },
-): Promise<void> {
+): AuditEventInput {
   const authType = c.get("authType");
-  await writeAuditEvent({
+  return {
     tenantId: event.tenantId,
     actorType: authType === "api-key" ? "api-key" : "user",
     actorId:
@@ -236,7 +247,14 @@ async function writeAgentAudit(
     ipAddress: c.req.header("x-forwarded-for") ?? null,
     userAgent: c.req.header("user-agent") ?? null,
     requestId: c.get("requestId") ?? null,
-  });
+  };
+}
+
+async function writeAgentAudit(
+  c: Parameters<typeof requireTenantLevel>[0],
+  event: Parameters<typeof agentAuditEvent>[1],
+): Promise<void> {
+  await writeAuditEvent(agentAuditEvent(c, event));
 }
 
 function parseDurationSeconds(value: string): number | null {
@@ -250,7 +268,8 @@ function parseDurationSeconds(value: string): number | null {
 }
 
 function normalizeAgentTokenExpiry(value: unknown): string | null {
-  const requested = typeof value === "string" && value.trim() ? value.trim() : AGENT_TOKEN_EXPIRY;
+  const requested =
+    typeof value === "string" && value.trim() ? value.trim() : getAgentTokenExpiry();
   const seconds = parseDurationSeconds(requested);
   if (!seconds || seconds > MAX_AGENT_TOKEN_SECONDS) return null;
   return requested;
@@ -453,7 +472,7 @@ async function invalidateAgentPolicyCache(agentId: string, tenantId: string): Pr
   try {
     await invalidateCache(agentId, tenantId);
   } catch (err) {
-    console.error("[policy] Failed to invalidate policy cache:", err);
+    console.error("[policy] Failed to invalidate policy cache", redactedThrownDiagnostics(err));
   }
 }
 
@@ -560,12 +579,7 @@ async function validateSignerPolicyIdsForAgent(
 }
 
 function hasRecentSessionMfa(c: Parameters<typeof requireTenantLevel>[0], maxAgeMs = 5 * 60_000) {
-  const verifiedAt = c.get("sessionMfaVerifiedAt");
-  return (
-    typeof verifiedAt === "number" &&
-    Number.isFinite(verifiedAt) &&
-    Date.now() - verifiedAt <= maxAgeMs
-  );
+  return isRecentMfaTimestamp(c.get("sessionMfaVerifiedAt"), maxAgeMs);
 }
 
 function requireRecentAdminMfa(c: Parameters<typeof requireTenantLevel>[0], reason: string) {
@@ -934,6 +948,34 @@ function policyLooseningViolation(
   return null;
 }
 
+/**
+ * Exact policy compare-and-swap fence used after authorizing an agent-token
+ * tightening. The attribution fields are part of the expected snapshot too:
+ * two concurrent requests that produce identical limits but claim different
+ * reasons must not both commit against the same audit `before` state.
+ */
+export function buildAgentPolicyCompareAndSwapPredicate(
+  agentId: string,
+  tenantId: string,
+  expected: typeof agentPolicies.$inferSelect,
+) {
+  return and(
+    eq(agentPolicies.agentId, agentId),
+    eq(agentPolicies.tenantId, tenantId),
+    eq(agentPolicies.dailyCapUsd, expected.dailyCapUsd),
+    eq(agentPolicies.perOrderCapUsd, expected.perOrderCapUsd),
+    eq(agentPolicies.leverageCap, expected.leverageCap),
+    eq(agentPolicies.allowedAssets, expected.allowedAssets),
+    eq(agentPolicies.allowedVenues, expected.allowedVenues),
+    eq(agentPolicies.allowBuilderPerps, expected.allowBuilderPerps),
+    eq(agentPolicies.updatedAt, expected.updatedAt),
+    eq(agentPolicies.updatedBy, expected.updatedBy),
+    expected.updatedReason === null
+      ? isNull(agentPolicies.updatedReason)
+      : eq(agentPolicies.updatedReason, expected.updatedReason),
+  );
+}
+
 // ─── Create agent ─────────────────────────────────────────────────────────────
 
 agentRoutes.post("/", async (c) => {
@@ -1012,8 +1054,10 @@ agentRoutes.post("/", async (c) => {
     }
     return c.json<ApiResponse<AgentIdentity>>({ ok: true, data: identity });
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Unknown error";
-    return c.json<ApiResponse>({ ok: false, error: message }, 400);
+    // SEC-210: never return raw internal error text (DB constraint names, RPC
+    // endpoint details); sanitizeErrorMessage passes through only known-safe
+    // client-facing messages.
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 400);
   }
 });
 
@@ -1163,10 +1207,7 @@ agentRoutes.post("/pregenerated", async (c) => {
     return c.json<ApiResponse>(
       {
         ok: false,
-        error:
-          error instanceof Error
-            ? `Failed to create pregenerated wallets: ${error.message}`
-            : "Failed to create pregenerated wallets",
+        error: `Failed to create pregenerated wallets: ${sanitizeErrorMessage(error)}`,
       },
       500,
     );
@@ -1430,7 +1471,10 @@ agentRoutes.post("/:agentId/token", async (c) => {
       resourceId: agentId,
       metadata: { scopes, expiresIn },
     });
-    const token = await createAgentToken(agentId, tenantId, expiresIn, scopes);
+    const token = await createAgentTokenForExistingAgent(agentId, tenantId, expiresIn, scopes);
+    if (!token) {
+      return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
+    }
     await writeAgentAudit(c, {
       tenantId,
       action: "agent.token.create",
@@ -1456,7 +1500,10 @@ agentRoutes.post("/:agentId/token", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    console.error(`[${requestId}] Failed to generate agent token for ${agentId}:`, e);
+    console.error(
+      `[${requestId}] Failed to generate agent token for ${agentId}`,
+      redactedThrownDiagnostics(e),
+    );
     return c.json<ApiResponse>({ ok: false, error: "Failed to generate token" }, 500);
   }
 });
@@ -1565,6 +1612,9 @@ agentRoutes.post("/:agentId/wallets", async (c) => {
     });
     const wallet = await vault.createWallet({
       agentId,
+      // SEC-162: vault-layer tenant verification (defense-in-depth on top of
+      // ensureAgentForTenant above).
+      tenantId,
       venue: body.venue,
       scope: body.scope,
       chainType: body.chainType,
@@ -1616,8 +1666,10 @@ agentRoutes.post("/:agentId/wallets", async (c) => {
       }>
     >({ ok: true, data: { ...wallet, metadata: redactWalletMetadataSecrets(wallet.metadata) } });
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Unknown error";
-    return c.json<ApiResponse>({ ok: false, error: message }, 400);
+    // SEC-210: never return raw internal error text (DB constraint names, RPC
+    // endpoint details); sanitizeErrorMessage passes through only known-safe
+    // client-facing messages.
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 400);
   }
 });
 
@@ -1662,13 +1714,14 @@ agentRoutes.get("/:agentId/policy", async (c) => {
 });
 
 agentRoutes.put("/:agentId/policy", async (c) => {
-  // SEC-208: two write paths into the trade-policy table —
-  //   1. agent token (self-update): TIGHTEN-ONLY, enforced below after
-  //      validation via policyLooseningViolation.
-  //   2. human owner/admin session with recent MFA: unrestricted (subject to
-  //      the platform ceilings), restoring the human-ceiling administration
-  //      path this route previously lacked.
-  // Tenant API keys stay rejected, as before.
+  // Two write paths enter the trade-policy table:
+  //   1. agent token (self-update): TIGHTEN-ONLY against the existing row,
+  //      enforced below after validation via policyLooseningViolation, and
+  //      forbidden from creating the initial row (creation activates the
+  //      trade-route ceilings, so it is reserved for path 2).
+  //   2. human owner/admin session with recent MFA: unrestricted subject to the
+  //      platform ceilings.
+  // Tenant API keys are rejected.
   const isAgentSelfUpdate = c.get("authType") === "agent-token";
   if (isAgentSelfUpdate) {
     if (!requireAgentAccess(c)) {
@@ -1702,103 +1755,103 @@ agentRoutes.put("/:agentId/policy", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "reason is required" }, 400);
   }
 
-  const [existing] = await db
-    .select()
-    .from(agentPolicies)
-    .where(and(eq(agentPolicies.agentId, agentId), eq(agentPolicies.tenantId, tenantId)));
-  const before = existing ? policyRowToResponse(existing) : defaultPolicySnapshot(agentId);
-
-  const nextDailyCap =
-    body.dailyCap === undefined ? before.dailyCap : validatePolicyNumber("dailyCap", body.dailyCap);
-  const nextPerOrderCap =
-    body.perOrderCap === undefined
-      ? before.perOrderCap
-      : validatePolicyNumber("perOrderCap", body.perOrderCap);
-  const nextLeverageCap =
-    body.leverageCap === undefined
-      ? before.leverageCap
-      : validatePolicyNumber("leverageCap", body.leverageCap);
-  const nextAllowedAssets =
-    body.allowedAssets === undefined
-      ? before.allowedAssets
-      : validatePolicyStringArray("allowedAssets", body.allowedAssets);
-  const nextAllowedVenues =
-    body.allowedVenues === undefined
-      ? before.allowedVenues
-      : validatePolicyStringArray("allowedVenues", body.allowedVenues);
-  const nextAllowBuilderPerps =
-    body.allowBuilderPerps === undefined
-      ? before.allowBuilderPerps
-      : validateOptionalBoolean("allowBuilderPerps", body.allowBuilderPerps);
-
-  const validationError = [
-    nextDailyCap,
-    nextPerOrderCap,
-    nextLeverageCap,
-    nextAllowedAssets,
-    nextAllowedVenues,
-    nextAllowBuilderPerps,
-  ].find((value) => typeof value === "string");
+  // Validate caller-provided fields before opening the write transaction, but
+  // do not fill omitted partial-patch fields yet. Their values must come from
+  // the row locked and re-read inside the audited transaction.
+  const validatedPatch = {
+    dailyCap:
+      body.dailyCap === undefined ? undefined : validatePolicyNumber("dailyCap", body.dailyCap),
+    perOrderCap:
+      body.perOrderCap === undefined
+        ? undefined
+        : validatePolicyNumber("perOrderCap", body.perOrderCap),
+    leverageCap:
+      body.leverageCap === undefined
+        ? undefined
+        : validatePolicyNumber("leverageCap", body.leverageCap),
+    allowedAssets:
+      body.allowedAssets === undefined
+        ? undefined
+        : validatePolicyStringArray("allowedAssets", body.allowedAssets),
+    allowedVenues:
+      body.allowedVenues === undefined
+        ? undefined
+        : validatePolicyStringArray("allowedVenues", body.allowedVenues),
+    allowBuilderPerps:
+      body.allowBuilderPerps === undefined
+        ? undefined
+        : validateOptionalBoolean("allowBuilderPerps", body.allowBuilderPerps),
+  };
+  const validationError = Object.values(validatedPatch).find((value) => typeof value === "string");
   if (typeof validationError === "string") {
     return c.json<ApiResponse>({ ok: false, error: validationError }, 400);
-  }
-
-  const dailyCapValue = nextDailyCap as number;
-  const perOrderCapValue = nextPerOrderCap as number;
-  const leverageCapValue = nextLeverageCap as number;
-  const allowedAssetsValue = nextAllowedAssets as string[];
-  const allowedVenuesValue = nextAllowedVenues as string[];
-  const allowBuilderPerpsValue = nextAllowBuilderPerps as boolean;
-
-  if (hasBuilderPerpAsset(allowedAssetsValue) && !allowBuilderPerpsValue) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "builder perp assets require allowBuilderPerps=true" },
-      400,
-    );
-  }
-
-  if (perOrderCapValue > dailyCapValue) {
-    return c.json<ApiResponse>({ ok: false, error: "perOrderCap cannot exceed dailyCap" }, 400);
-  }
-
-  // SEC-208: agent self-updates are tighten-only — reject any loosening here
-  // (fail closed, AFTER input validation so malformed bodies still 400).
-  if (isAgentSelfUpdate) {
-    const loosening = policyLooseningViolation(before, {
-      dailyCap: dailyCapValue,
-      perOrderCap: perOrderCapValue,
-      leverageCap: leverageCapValue,
-      allowedAssets: allowedAssetsValue,
-      allowedVenues: allowedVenuesValue,
-      allowBuilderPerps: allowBuilderPerpsValue,
-    });
-    if (loosening) {
-      return c.json<ApiResponse>({ ok: false, error: loosening }, 403);
-    }
   }
 
   const updatedBy = isAgentSelfUpdate
     ? (c.get("agentSubject") ?? `agent:${agentId}`)
     : (c.get("userId") ?? "unknown");
   const updatedReason = body.reason.trim();
-  const [upserted] = await db
-    .insert(agentPolicies)
-    .values({
-      agentId,
-      tenantId,
-      dailyCapUsd: String(dailyCapValue),
-      perOrderCapUsd: String(perOrderCapValue),
-      leverageCap: String(leverageCapValue),
-      allowedAssets: allowedAssetsValue,
-      allowedVenues: allowedVenuesValue,
-      allowBuilderPerps: allowBuilderPerpsValue,
-      updatedAt: new Date(),
-      updatedBy,
-      updatedReason,
-    })
-    .onConflictDoUpdate({
-      target: agentPolicies.agentId,
-      set: {
+
+  const mutation = await withTenantAuditedTransaction(
+    tenantId,
+    async (txRaw, appendRequiredAudit) => {
+      const tx = txRaw as typeof db;
+      // Serialize the complete partial-patch read/materialize/write sequence,
+      // including initial-row creation where SELECT FOR UPDATE has no row to
+      // lock. PGLite runs tests on one connection and lacks this PG function.
+      if (process.env.STEWARD_PGLITE_MEMORY !== "true") {
+        await tx.execute(
+          sql`SELECT pg_advisory_xact_lock(hashtextextended(${`agent-policy:${tenantId}:${agentId}`}, 0))`,
+        );
+      }
+      const [existing] = await tx
+        .select()
+        .from(agentPolicies)
+        .where(and(eq(agentPolicies.agentId, agentId), eq(agentPolicies.tenantId, tenantId)))
+        .for("update");
+      const before = existing ? policyRowToResponse(existing) : defaultPolicySnapshot(agentId);
+      const dailyCapValue = (validatedPatch.dailyCap ?? before.dailyCap) as number;
+      const perOrderCapValue = (validatedPatch.perOrderCap ?? before.perOrderCap) as number;
+      const leverageCapValue = (validatedPatch.leverageCap ?? before.leverageCap) as number;
+      const allowedAssetsValue = (validatedPatch.allowedAssets ?? before.allowedAssets) as string[];
+      const allowedVenuesValue = (validatedPatch.allowedVenues ?? before.allowedVenues) as string[];
+      const allowBuilderPerpsValue = (validatedPatch.allowBuilderPerps ??
+        before.allowBuilderPerps) as boolean;
+
+      if (hasBuilderPerpAsset(allowedAssetsValue) && !allowBuilderPerpsValue) {
+        return {
+          kind: "invalid" as const,
+          status: 400 as const,
+          error: "builder perp assets require allowBuilderPerps=true",
+        };
+      }
+      if (perOrderCapValue > dailyCapValue) {
+        return {
+          kind: "invalid" as const,
+          status: 400 as const,
+          error: "perOrderCap cannot exceed dailyCap",
+        };
+      }
+      if (isAgentSelfUpdate) {
+        if (!existing) {
+          return {
+            kind: "invalid" as const,
+            status: 403 as const,
+            error: "Initial trade policy creation requires an owner/admin session with recent MFA",
+          };
+        }
+        const loosening = policyLooseningViolation(before, {
+          dailyCap: dailyCapValue,
+          perOrderCap: perOrderCapValue,
+          leverageCap: leverageCapValue,
+          allowedAssets: allowedAssetsValue,
+          allowedVenues: allowedVenuesValue,
+          allowBuilderPerps: allowBuilderPerpsValue,
+        });
+        if (loosening) return { kind: "invalid" as const, status: 403 as const, error: loosening };
+      }
+
+      const nextPolicyValues = {
         dailyCapUsd: String(dailyCapValue),
         perOrderCapUsd: String(perOrderCapValue),
         leverageCap: String(leverageCapValue),
@@ -1808,31 +1861,58 @@ agentRoutes.put("/:agentId/policy", async (c) => {
         updatedAt: new Date(),
         updatedBy,
         updatedReason,
-      },
-    })
-    .returning();
+      };
+      let upserted: typeof agentPolicies.$inferSelect | undefined;
+      if (existing) {
+        [upserted] = await tx
+          .update(agentPolicies)
+          .set(nextPolicyValues)
+          .where(buildAgentPolicyCompareAndSwapPredicate(agentId, tenantId, existing))
+          .returning();
+        if (!upserted) return { kind: "conflict" as const };
+      } else {
+        [upserted] = await tx
+          .insert(agentPolicies)
+          .values({ agentId, tenantId, ...nextPolicyValues })
+          .returning();
+      }
+      if (!upserted) throw new Error("Failed to update agent policy");
 
-  const after = policyRowToResponse(upserted);
-  const diff = policyDiff(before, after);
-  await writeAuditEvent({
-    tenantId,
-    actorType: isAgentSelfUpdate ? "agent" : "user",
-    actorId: updatedBy,
-    action: "agent.policy.updated",
-    resourceType: "agent_policy",
-    resourceId: agentId,
-    metadata: {
-      agentId,
-      reason: updatedReason,
-      diff,
-      before,
-      after,
-      multisigApprovalProvided: body.multisigApproval !== undefined,
+      const after = policyRowToResponse(upserted);
+      const diff = policyDiff(before, after);
+      await appendRequiredAudit({
+        tenantId,
+        actorType: isAgentSelfUpdate ? "agent" : "user",
+        actorId: updatedBy,
+        action: "agent.policy.updated",
+        resourceType: "agent_policy",
+        resourceId: agentId,
+        metadata: {
+          agentId,
+          reason: updatedReason,
+          diff,
+          before,
+          after,
+          multisigApprovalProvided: body.multisigApproval !== undefined,
+        },
+        ipAddress: c.req.header("x-forwarded-for") ?? null,
+        userAgent: c.req.header("user-agent") ?? null,
+        requestId: c.get("requestId") ?? null,
+      });
+      return { kind: "updated" as const, after, diff };
     },
-    ipAddress: c.req.header("x-forwarded-for") ?? null,
-    userAgent: c.req.header("user-agent") ?? null,
-    requestId: c.get("requestId") ?? null,
-  });
+  );
+
+  if (mutation.kind === "invalid") {
+    return c.json<ApiResponse>({ ok: false, error: mutation.error }, mutation.status);
+  }
+  if (mutation.kind === "conflict") {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Agent policy changed concurrently; retry against the latest policy" },
+      409,
+    );
+  }
+  const { after, diff } = mutation;
 
   return c.json<
     ApiResponse<{ policy: AgentTradePolicyResponse; diff: ReturnType<typeof policyDiff> }>
@@ -1888,31 +1968,6 @@ agentRoutes.delete("/:agentId", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
   }
 
-  const deleteSnapshot = await db.transaction(async (tx) => {
-    const [agentRow] = await tx
-      .select()
-      .from(agents)
-      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
-    return {
-      agent: agentRow ?? null,
-      approvalQueue: await tx
-        .select()
-        .from(approvalQueue)
-        .where(eq(approvalQueue.agentId, agentId)),
-      transactions: await tx.select().from(transactions).where(eq(transactions.agentId, agentId)),
-      policies: await tx.select().from(policies).where(eq(policies.agentId, agentId)),
-      encryptedChainKeys: await tx
-        .select()
-        .from(encryptedChainKeys)
-        .where(eq(encryptedChainKeys.agentId, agentId)),
-      encryptedKeys: await tx
-        .select()
-        .from(encryptedKeys)
-        .where(eq(encryptedKeys.agentId, agentId)),
-      agentWallets: await tx.select().from(agentWallets).where(eq(agentWallets.agentId, agentId)),
-    };
-  });
-  let agentRowsDeleted = false;
   try {
     await writeAgentAudit(c, {
       tenantId,
@@ -1921,60 +1976,54 @@ agentRoutes.delete("/:agentId", async (c) => {
       resourceId: agentId,
       metadata: { walletAddress: agent.walletAddress },
     });
-    const issuedBefore = Math.floor(Date.now() / 1000);
-    await revocationStore.revokeAgentTokens(agentId, issuedBefore);
-    await db.transaction(async (tx) => {
-      // Cascade delete in dependency order
-      await tx.delete(approvalQueue).where(eq(approvalQueue.agentId, agentId));
-      await tx.delete(transactions).where(eq(transactions.agentId, agentId));
-      await tx.delete(policies).where(eq(policies.agentId, agentId));
-      await tx.delete(encryptedChainKeys).where(eq(encryptedChainKeys.agentId, agentId));
-      await tx.delete(encryptedKeys).where(eq(encryptedKeys.agentId, agentId));
-      await tx.delete(agentWallets).where(eq(agentWallets.agentId, agentId));
-      await tx.delete(agents).where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
-    });
-    agentRowsDeleted = true;
-    await writeAgentAudit(c, {
+    let issuedBefore = 0;
+    const completionAudit = agentAuditEvent(c, {
       tenantId,
       action: "agent.delete",
       resourceType: "agent",
       resourceId: agentId,
-      metadata: { revokedAgentTokensIssuedBefore: issuedBefore },
+      metadata: {},
     });
+    const deletion = await deleteAgentAuthority({
+      tenantId,
+      agentId,
+      completionAudit,
+      beforeDelete: async () => {
+        issuedBefore = Math.floor(Date.now() / 1000);
+        await revocationStore.revokeAgentTokens(agentId, issuedBefore);
+        completionAudit.metadata = { revokedAgentTokensIssuedBefore: issuedBefore };
+      },
+    });
+
+    if (deletion === "blocked_by_upstream_lease") {
+      return c.json<ApiResponse>(
+        { ok: false, error: "Agent has unresolved upstream credential leases" },
+        409,
+      );
+    }
+    if (deletion === "blocked_by_executing_proxy") {
+      return c.json<ApiResponse>(
+        { ok: false, error: "Agent has an executing proxy request; retry deletion later" },
+        409,
+      );
+    }
+    if (deletion === "blocked_by_unresolved_execution") {
+      return c.json<ApiResponse>(
+        { ok: false, error: "Agent has unresolved execution evidence; reconcile it first" },
+        409,
+      );
+    }
+    if (deletion === "missing") {
+      return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
+    }
 
     return c.json<ApiResponse<{ deleted: string }>>({
       ok: true,
       data: { deleted: agentId },
     });
   } catch (e: unknown) {
-    if (agentRowsDeleted && deleteSnapshot.agent) {
-      await db.transaction(async (tx) => {
-        await tx.insert(agents).values(deleteSnapshot.agent).onConflictDoNothing();
-        if (deleteSnapshot.agentWallets.length > 0) {
-          await tx.insert(agentWallets).values(deleteSnapshot.agentWallets).onConflictDoNothing();
-        }
-        if (deleteSnapshot.encryptedKeys.length > 0) {
-          await tx.insert(encryptedKeys).values(deleteSnapshot.encryptedKeys).onConflictDoNothing();
-        }
-        if (deleteSnapshot.encryptedChainKeys.length > 0) {
-          await tx
-            .insert(encryptedChainKeys)
-            .values(deleteSnapshot.encryptedChainKeys)
-            .onConflictDoNothing();
-        }
-        if (deleteSnapshot.policies.length > 0) {
-          await tx.insert(policies).values(deleteSnapshot.policies).onConflictDoNothing();
-        }
-        if (deleteSnapshot.transactions.length > 0) {
-          await tx.insert(transactions).values(deleteSnapshot.transactions).onConflictDoNothing();
-        }
-        if (deleteSnapshot.approvalQueue.length > 0) {
-          await tx.insert(approvalQueue).values(deleteSnapshot.approvalQueue).onConflictDoNothing();
-        }
-      });
-    }
     const requestId = c.get("requestId") || "unknown";
-    console.error(`[${requestId}] Failed to delete agent ${agentId}:`, e);
+    console.error(`[${requestId}] Failed to delete agent ${agentId}`, redactedThrownDiagnostics(e));
     return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
   }
 });
@@ -2017,8 +2066,10 @@ agentRoutes.get("/:agentId/balance", async (c) => {
       },
     });
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Unknown error";
-    return c.json<ApiResponse>({ ok: false, error: message }, 400);
+    // SEC-210: never return raw internal error text (DB constraint names, RPC
+    // endpoint details); sanitizeErrorMessage passes through only known-safe
+    // client-facing messages.
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 400);
   }
 });
 
@@ -2074,8 +2125,10 @@ agentRoutes.get("/:agentId/tokens", async (c) => {
       },
     });
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Unknown error";
-    return c.json<ApiResponse>({ ok: false, error: message }, 400);
+    // SEC-210: never return raw internal error text (DB constraint names, RPC
+    // endpoint details); sanitizeErrorMessage passes through only known-safe
+    // client-facing messages.
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 400);
   }
 });
 

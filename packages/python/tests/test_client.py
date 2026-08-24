@@ -110,9 +110,9 @@ class StewardClientTests(unittest.TestCase):
                 f"unsigned mutation: {path}",
             )
 
-    def test_redirect_strips_credential_headers_cross_host(self):
-        # SEC-125: urllib's default redirect handling copies every header to
-        # the redirect target; an open redirect must not receive credentials.
+    def test_redirect_refuses_cross_origin_and_embedded_credentials(self):
+        # SEC-125: stripping headers is insufficient because following an open
+        # redirect would still expose server-side SDK callers to SSRF.
         handler = _StewardRedirectHandler()
         original = Request(
             "https://api.example.test/accounts",
@@ -126,14 +126,24 @@ class StewardClientTests(unittest.TestCase):
         )
 
         cross = handler.redirect_request(original, None, 302, "Found", {}, "https://evil.example/harvest")
-        self.assertIsNone(cross.get_header("Authorization"))
-        self.assertIsNone(cross.get_header("X-steward-key"))
-        self.assertIsNone(cross.get_header("X-steward-platform-key"))
-        self.assertIsNone(cross.get_header("X-steward-signature"))
+        self.assertIsNone(cross)
 
         same_host = handler.redirect_request(original, None, 302, "Found", {}, "https://api.example.test/other")
         self.assertEqual(same_host.get_header("Authorization"), "Bearer user-token")
+
+        downgrade = handler.redirect_request(original, None, 302, "Found", {}, "http://api.example.test/other")
+        self.assertIsNone(downgrade)
         self.assertEqual(same_host.get_header("X-steward-key"), "tenant-key")
+
+        different_port = handler.redirect_request(
+            original, None, 302, "Found", {}, "https://api.example.test:444/harvest"
+        )
+        self.assertIsNone(different_port)
+
+        credential_target = handler.redirect_request(
+            original, None, 302, "Found", {}, "https://user:password@api.example.test/other"
+        )
+        self.assertIsNone(credential_target)
 
     def test_path_parameters_are_url_encoded(self):
         # SEC-127: raw interpolation lets `/`, `?`, `#` in an id silently
@@ -158,6 +168,24 @@ class StewardClientTests(unittest.TestCase):
             request.full_url,
             "https://api.example.test/user/me/push-subscriptions/sub%2F1",
         )
+
+    def test_plaintext_non_loopback_base_url_rejected(self):
+        # SEC-200: credentials must never travel to a plaintext non-loopback
+        # endpoint unless the operator explicitly opts out.
+        for base_url in ("http://api.example.test", "http://192.168.1.10:3200", "ftp://api.example.test", "not-a-url", "https://user:secret@api.example.test"):
+            with self.assertRaises(ValueError, msg=base_url):
+                StewardClient(base_url=base_url, api_key="tenant-key")
+
+        for base_url in ("https://api.example.test", "http://localhost:3200", "http://127.0.0.1:3200", "http://[::1]:3200"):
+            StewardClient(base_url=base_url, api_key="tenant-key")
+
+    def test_allow_insecure_base_url_opts_out_with_warning(self):
+        with self.assertWarns(UserWarning):
+            StewardClient(
+                base_url="http://api.example.test",
+                api_key="tenant-key",
+                allow_insecure_base_url=True,
+            )
 
 
 if __name__ == "__main__":

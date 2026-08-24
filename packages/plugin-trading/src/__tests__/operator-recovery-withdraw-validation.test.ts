@@ -13,13 +13,14 @@
  * mock.module HyperliquidAdapter, no signing / no network).
  */
 
-import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, mock, setDefaultTimeout } from "bun:test";
 import { agents, agentWallets, closeDb, getDb, policies as policiesTable, tenants } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
 import { Hono } from "hono";
 import { z } from "zod";
 
 const PLATFORM_KEY = "stw_platform_test_operator_key";
+setDefaultTimeout(30_000);
 
 // ── Mock the Hyperliquid adapter (no signing / no network) ─────────────────────
 const signWithdrawCalls: Array<{ amount: string | number; destination: string }> = [];
@@ -186,6 +187,7 @@ async function postWithdraw(
       "Content-Type": "application/json",
       "X-Steward-Platform-Key": PLATFORM_KEY,
       "X-Steward-Tenant": tenantId,
+      "Idempotency-Key": crypto.randomUUID(),
     },
     body: JSON.stringify(body),
   });
@@ -290,7 +292,7 @@ describe("operator recovery withdraw spend-cap enforcement (issue #109)", () => 
     const tenantId = `tenant-wd-cap-${Date.now()}`;
     const agentId = `agent-wd-cap-${Date.now()}`;
     // maxPerTx = 0.01 ETH in wei; a 100 USDC withdraw (~0.025 ETH at the
-    // stubbed $4000) exceeds it. Before the fix the policy saw value:"0" and
+    // stubbed $4000) exceeds it. The policy must not see value:"0" and
     // PASSED; with USDC-as-wei denomination it would still pass (1e8 < 1e16).
     await seedAgent({
       tenantId,

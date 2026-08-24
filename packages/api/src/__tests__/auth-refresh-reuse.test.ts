@@ -24,10 +24,20 @@ describe("refresh token reuse detection", () => {
     expect(rotationBody).toContain("pg_advisory_xact_lock");
     expect(rotationBody).toContain("lockUserSession(tx, refreshCandidate.userId)");
     const userLock = rotationBody.indexOf("lockUserSession(tx, refreshCandidate.userId)");
-    const validDelete = rotationBody.indexOf(".delete(refreshTokens)", userLock);
-    expect(userLock).toBeLessThan(validDelete);
-    expect(rotationBody.indexOf("revocationStore.getUserRevokedBefore")).toBeLessThan(
-      rotationBody.indexOf(".insert(refreshTokens)"),
+    const atomicRotate = rotationBody.indexOf("auth_rotate_refresh_token", userLock);
+    expect(userLock).toBeLessThan(atomicRotate);
+    expect(rotationBody.indexOf("revocationStore.getUserRevokedBefore")).toBeLessThan(atomicRotate);
+  });
+
+  it("serializes the raw rotation expiry parameter before it reaches the database driver", () => {
+    const rotationStart = authSource.indexOf("async function rotateRefreshTokenInsideTenant");
+    expect(rotationStart).toBeGreaterThanOrEqual(0);
+    const rotationBody = authSource.slice(
+      rotationStart,
+      authSource.indexOf("/** Build the standard dual-token auth response.", rotationStart),
     );
+    expect(rotationBody).toContain(").toISOString();");
+    expect(rotationBody).toContain("${successorExpiresAt}::timestamptz");
+    expect(rotationBody).not.toContain("const successorExpiresAt = new Date(Date.now()");
   });
 });

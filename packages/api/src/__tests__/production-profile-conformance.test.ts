@@ -1,16 +1,22 @@
 import { describe, expect, it } from "bun:test";
+import type { AwsOperationKey } from "@stwd/provider-aws";
 import type { GithubOperationKey } from "@stwd/provider-github";
+import type { GoogleOperationKey } from "@stwd/provider-google";
+import type { SlackOperationKey } from "@stwd/provider-slack";
 import type { XOperationKey } from "@stwd/provider-x";
 import { parseGovernedCanonicalActionForDispatch } from "@stwd/proxy/src/handlers/governed-execution";
 import {
+  AWS_PROVIDER_ACTION_PROFILE,
   buildGenericHttpAction,
   CanonError,
   GENERIC_GOLDEN_DESCRIPTOR_A,
   GENERIC_HTTP_PROVIDER_ACTION_PROFILE,
   GITHUB_PROVIDER_ACTION_PROFILE,
+  GOOGLE_PROVIDER_ACTION_PROFILE,
   inspectProviderProfileConformance,
   jcsStringify,
   REGISTERED_PROFILES,
+  SLACK_PROVIDER_ACTION_PROFILE,
   strictParseJson,
   validateGenericHttpDescriptor,
   X_PROVIDER_ACTION_PROFILE,
@@ -23,6 +29,13 @@ import {
 const GENERIC_DESCRIPTOR = validateGenericHttpDescriptor(GENERIC_GOLDEN_DESCRIPTOR_A);
 
 const FIXTURES = {
+  [AWS_PROVIDER_ACTION_PROFILE]: {
+    operationKey: "aws.ec2.DescribeInstances" as const,
+    method: undefined,
+    args: { region: "us-east-1", instanceIds: ["i-12345678"] },
+    traversalArgs: { region: ".." },
+    traversalCode: "CANON_FIELD_TYPE_INVALID",
+  },
   [GITHUB_PROVIDER_ACTION_PROFILE]: {
     operationKey: "github.issue.list" as const,
     method: undefined,
@@ -36,6 +49,20 @@ const FIXTURES = {
     args: { tweetId: "1234567890" },
     traversalArgs: { tweetId: ".." },
     traversalCode: "CANON_PATH_SEGMENT_INVALID",
+  },
+  [SLACK_PROVIDER_ACTION_PROFILE]: {
+    operationKey: "slack.users.info" as const,
+    method: undefined,
+    args: { user: "U12345678" },
+    traversalArgs: { user: ".." },
+    traversalCode: "CANON_PATH_SEGMENT_INVALID",
+  },
+  [GOOGLE_PROVIDER_ACTION_PROFILE]: {
+    operationKey: "google.calendar.events.list" as const,
+    method: undefined,
+    args: { maxResults: 50 },
+    traversalArgs: { maxResults: 50 },
+    traversalCode: "CANON_FIELD_TYPE_INVALID",
   },
   [GENERIC_HTTP_PROVIDER_ACTION_PROFILE]: {
     operationKey: "generic.items.list",
@@ -55,6 +82,16 @@ const FIXTURES = {
 } as const;
 
 const OPERATION_FIXTURES = {
+  [AWS_PROVIDER_ACTION_PROFILE]: [
+    {
+      operationKey: "aws.ec2.DescribeInstances",
+      args: { region: "us-east-1", instanceIds: ["i-12345678"] },
+    },
+    {
+      operationKey: "aws.ec2.StopInstances",
+      args: { region: "eu-central-1", instanceIds: ["i-abcdef01234567890"], dryRun: true },
+    },
+  ],
   [GITHUB_PROVIDER_ACTION_PROFILE]: [
     {
       operationKey: "github.issue.list",
@@ -79,6 +116,39 @@ const OPERATION_FIXTURES = {
       args: {},
     },
   ],
+  [SLACK_PROVIDER_ACTION_PROFILE]: [
+    {
+      operationKey: "slack.chat.postMessage",
+      args: { channel: "C12345678", text: "hello world" },
+    },
+    {
+      operationKey: "slack.conversations.list",
+      args: {},
+    },
+    {
+      operationKey: "slack.users.info",
+      args: { user: "U12345678" },
+    },
+  ],
+  [GOOGLE_PROVIDER_ACTION_PROFILE]: [
+    {
+      operationKey: "google.gmail.messages.send",
+      args: { to: ["person@example.com"], subject: "hello", body: "world" },
+    },
+    {
+      operationKey: "google.calendar.events.list",
+      args: { maxResults: 50 },
+    },
+    {
+      operationKey: "google.calendar.events.insert",
+      args: {
+        summary: "meeting",
+        start: "2026-08-17T10:00:00Z",
+        end: "2026-08-17T11:00:00Z",
+        attendees: ["person@example.com"],
+      },
+    },
+  ],
   [GENERIC_HTTP_PROVIDER_ACTION_PROFILE]: [
     {
       operationKey: "generic.items.list",
@@ -101,10 +171,16 @@ function buildFromProductionSpec(
   fixture: OperationFixture = FIXTURES[spec.profile],
 ) {
   switch (spec.profile) {
+    case AWS_PROVIDER_ACTION_PROFILE:
+      return spec.build(fixture.operationKey as AwsOperationKey, args);
     case GITHUB_PROVIDER_ACTION_PROFILE:
       return spec.build(fixture.operationKey as GithubOperationKey, args);
     case X_PROVIDER_ACTION_PROFILE:
       return spec.build(fixture.operationKey as XOperationKey, args);
+    case SLACK_PROVIDER_ACTION_PROFILE:
+      return spec.build(fixture.operationKey as SlackOperationKey, args);
+    case GOOGLE_PROVIDER_ACTION_PROFILE:
+      return spec.build(fixture.operationKey as GoogleOperationKey, args);
     case GENERIC_HTTP_PROVIDER_ACTION_PROFILE:
       return spec.build(
         fixture.operationKey,
@@ -115,10 +191,13 @@ function buildFromProductionSpec(
   }
 }
 
-function allowedOriginsFromProductionSpec(spec: ProductionProviderProfileSpec): readonly string[] {
-  return spec.kind === "config-driven"
-    ? spec.allowedOrigins(GENERIC_DESCRIPTOR)
-    : spec.allowedOrigins;
+function allowedOriginsFromProductionSpec(
+  spec: ProductionProviderProfileSpec,
+  action = buildFromProductionSpec(spec, { ...FIXTURES[spec.profile].args }).action,
+): readonly string[] {
+  if (spec.kind === "config-driven") return spec.allowedOrigins(GENERIC_DESCRIPTOR);
+  if (spec.profile === AWS_PROVIDER_ACTION_PROFILE) return spec.allowedOriginsForAction(action);
+  return spec.allowedOrigins;
 }
 
 function operationContext(spec: ProductionProviderProfileSpec) {
@@ -156,7 +235,7 @@ function runCanonicalBoundaryConformance(
 ): string[] {
   const built = buildFromProductionSpec(spec, { ...FIXTURES[spec.profile].args });
   const apiAction = mutate ? mutate(built.action) : built.action;
-  const allowedOrigins = allowedOriginsFromProductionSpec(spec);
+  const allowedOrigins = allowedOriginsFromProductionSpec(spec, apiAction);
   const apiViolations = inspectProviderProfileConformance(spec.profile, allowedOrigins, apiAction, [
     "registered-malicious-canary",
   ]);
@@ -207,7 +286,7 @@ describe("#220 executable provider profile conformance", () => {
           parseGovernedCanonicalActionForDispatch(
             new TextEncoder().encode(jcsStringify(action)),
             spec.profile,
-            spec.allowedOrigins,
+            allowedOriginsFromProductionSpec(spec, built.action),
             { operationKey: fixture.operationKey, requestProfile: { profile: spec.profile } },
           );
 
@@ -326,7 +405,7 @@ describe("#220 executable provider profile conformance", () => {
         expect(
           inspectProviderProfileConformance(
             spec.profile,
-            allowedOriginsFromProductionSpec(spec),
+            allowedOriginsFromProductionSpec(spec, first.action),
             first.action,
           ),
         ).toEqual([]);
@@ -458,7 +537,7 @@ describe("#220 executable provider profile conformance", () => {
           parseGovernedCanonicalActionForDispatch(
             new TextEncoder().encode(jcsStringify(action)),
             spec.profile,
-            allowedOriginsFromProductionSpec(spec),
+            allowedOriginsFromProductionSpec(spec, built.action),
             operation,
           );
         expect(parse(built.action)).toEqual(built.action);
@@ -539,10 +618,14 @@ describe("#220 executable provider profile conformance", () => {
       "%2525255c",
     ]) {
       expect(
-        inspectProviderProfileConformance(spec.profile, allowedOriginsFromProductionSpec(spec), {
-          ...built.action,
-          normalizedPath: `/repos/${segment}/hello/issues`,
-        }),
+        inspectProviderProfileConformance(
+          spec.profile,
+          allowedOriginsFromProductionSpec(spec, built.action),
+          {
+            ...built.action,
+            normalizedPath: `/repos/${segment}/hello/issues`,
+          },
+        ),
       ).toContain("path-traversal");
     }
   });

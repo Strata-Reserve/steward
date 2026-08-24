@@ -122,6 +122,37 @@ describe("SecretVault lifecycle semantics", () => {
     expect(oldVersion?.deletedAt).toBeInstanceOf(Date);
   });
 
+  it("requires explicit recovery opt-in to append to a deleted lineage", async () => {
+    const tenantId = `tenant-restore-${crypto.randomUUID()}`;
+    await ensureTenant(tenantId);
+    await ensureAgent(tenantId, "agent-restore");
+    const original = await vault.createSecret(tenantId, "provider", "old-token");
+    const route = await vault.createRoute(tenantId, original.id, {
+      agentId: "agent-restore",
+      hostPattern: "api.openai.com",
+      injectAs: "header",
+      injectKey: "authorization",
+    });
+    await getDb()
+      .update(secrets)
+      .set({ deletedAt: new Date() })
+      .where(and(eq(secrets.tenantId, tenantId), eq(secrets.id, original.id)));
+
+    await expect(
+      getDb().transaction((tx) =>
+        vault.rotateSecretWithinTx(tx, tenantId, "provider", "new-token"),
+      ),
+    ).rejects.toThrow('Secret "provider" not found');
+    const replacement = await getDb().transaction((tx) =>
+      vault.rotateSecretWithinTx(tx, tenantId, "provider", "new-token", {
+        allowDeletedCurrent: true,
+      }),
+    );
+    expect(replacement.version).toBe(2);
+    expect(await vault.decryptSecret(tenantId, replacement.id)).toBe("new-token");
+    expect((await vault.getRoute(tenantId, route.id))?.secretId).toBe(replacement.id);
+  });
+
   it("deletes all dependent routes when deleting a secret family", async () => {
     const tenantId = `tenant-delete-${crypto.randomUUID()}`;
     await ensureTenant(tenantId);
@@ -288,6 +319,14 @@ describe("SecretVault lifecycle semantics", () => {
     ).rejects.toThrow(/different authority model/);
     await expect(
       vault.updateRoute(tenantId, governed.id, { pathPattern: "/v1/responses" }),
+    ).rejects.toThrow(/provider operation authoring/);
+    await expect(
+      vault.updateRoute(tenantId, governed.id, { injectionStrategy: "sigv4" }),
+    ).rejects.toThrow(/provider operation authoring/);
+    await expect(
+      vault.updateRoute(tenantId, governed.id, {
+        injectionConfig: { service: "ec2", region: "us-west-2" },
+      }),
     ).rejects.toThrow(/provider operation authoring/);
     expect((await vault.getRoute(tenantId, governed.id))?.pathPattern).toBe("/v1/chat/completions");
   });

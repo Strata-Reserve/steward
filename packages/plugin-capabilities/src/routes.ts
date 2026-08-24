@@ -16,7 +16,9 @@
 import type { ApiResponse, AppVariables } from "@stwd/shared";
 import type { Context } from "hono";
 import { Hono } from "hono";
+import { trustedClientIp } from "./client-ip";
 import type { AuditEventInput, StewardAppContext } from "./context";
+import { GitHubAppInstallationTokenIssuer } from "./github-app-issuer";
 import type { Capability, CapabilityGrant } from "./schema";
 import {
   AgentNotFoundError,
@@ -24,6 +26,7 @@ import {
   GrantExistsError,
   SecretRouteAuthorityConflict,
 } from "./store";
+import { revokeUpstreamLeasesForAuthority } from "./upstream-leases";
 import {
   createCapabilitySchema,
   createGrantSchema,
@@ -114,6 +117,27 @@ function requireCapabilityAdmin(
 export function createCapabilityRoutes(ctx: StewardAppContext): Hono<{ Variables: AppVariables }> {
   const routes = new Hono<{ Variables: AppVariables }>();
   const store = new CapabilityStore(ctx.db, ctx.withTenantAuditedTransaction);
+  const githubIssuer = new GitHubAppInstallationTokenIssuer();
+
+  async function revokeBoundLeases(
+    tenantId: string,
+    binding: { grantId?: string; capabilityId?: string },
+  ): Promise<void> {
+    const result = await revokeUpstreamLeasesForAuthority({
+      db: ctx.db,
+      tenantId,
+      ...binding,
+      issuer: githubIssuer,
+      exerciseToken:
+        ctx.exerciseCredentialLeaseToken ??
+        (async () => {
+          throw new Error("credential lease revocation is not configured");
+        }),
+      auditedTransaction: ctx.withTenantAuditedTransaction,
+      withDatabaseDeadline: ctx.withCredentialLeaseDatabaseDeadline,
+    });
+    if (!result.ok) throw new Error(result.error);
+  }
 
   function auditEvent(
     c: Context<{ Variables: AppVariables }>,
@@ -133,7 +157,9 @@ export function createCapabilityRoutes(ctx: StewardAppContext): Hono<{ Variables
       resourceType: event.resourceType,
       resourceId: event.resourceId,
       metadata: event.metadata,
-      ipAddress: c.req.header("x-forwarded-for") ?? null,
+      // the raw x-forwarded-for header is caller-spoofable; record only an IP
+      // derived from the platform-trusted proxy chain (NULL when none).
+      ipAddress: trustedClientIp(c) ?? null,
       userAgent: c.req.header("user-agent") ?? null,
       requestId: c.get("requestId") ?? null,
     };
@@ -312,6 +338,16 @@ export function createCapabilityRoutes(ctx: StewardAppContext): Hono<{ Variables
             : null,
       );
       if (!updated) return c.json<ApiResponse>({ ok: false, error: "capability not found" }, 404);
+      if (
+        patch.enabled === false ||
+        patch.constraints !== undefined ||
+        patch.secretId !== undefined
+      ) {
+        // Mutate authority first. Any in-flight issuer finalization now observes
+        // the tombstoned/changed authority and self-revokes; the subsequent scan
+        // catches every lease that finalized before this commit.
+        await revokeBoundLeases(tenantId, { capabilityId: id });
+      }
       return c.json<ApiResponse>({ ok: true, data: toCapabilityView(updated) });
     } catch (e) {
       if (e instanceof SecretRouteAuthorityConflict) {
@@ -338,6 +374,9 @@ export function createCapabilityRoutes(ctx: StewardAppContext): Hono<{ Variables
             })
           : null,
       );
+      // Always sweep after the tombstone, including a retry after a prior
+      // mutation committed but provider revocation returned 503.
+      await revokeBoundLeases(tenantId, { capabilityId: id });
       if (!removed) return c.json<ApiResponse>({ ok: false, error: "capability not found" }, 404);
       return c.json<ApiResponse>({ ok: true, data: { id } });
     } catch (e) {
@@ -428,6 +467,7 @@ export function createCapabilityRoutes(ctx: StewardAppContext): Hono<{ Variables
           : null,
       );
       if (!revoked) return c.json<ApiResponse>({ ok: false, error: "grant not found" }, 404);
+      await revokeBoundLeases(tenantId, { grantId });
       return c.json<ApiResponse>({ ok: true, data: { id: grantId } });
     } catch (e) {
       return errorResponse(c, e);

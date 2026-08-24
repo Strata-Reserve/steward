@@ -38,6 +38,7 @@ import type {
   StewardMfaRequiredResult,
   StewardOAuthConfig,
   StewardOAuthResult,
+  StewardPasskeyAlreadyRegisteredErrorData,
   StewardProviders,
   StewardRecoveryCodeStatus,
   StewardRecoveryCodesResult,
@@ -57,7 +58,7 @@ import type {
   StewardUser,
   StewardWhatsAppOtpResult,
 } from "./auth-types.ts";
-import { assertSecureBaseUrl } from "./base-url.ts";
+import { assertSecureBaseUrl, stripTrailingSlashes } from "./base-url.ts";
 import { StewardApiError } from "./client.ts";
 
 // ─── Storage key ──────────────────────────────────────────────────────────────
@@ -67,6 +68,8 @@ const REFRESH_TOKEN_KEY = "steward_refresh_token";
 const OAUTH_STATE_KEY = "steward_oauth_state";
 const OAUTH_VERIFIER_KEY = "steward_oauth_verifier";
 const OAUTH_TENANT_KEY = "steward_oauth_tenant";
+const AUTH_LOGOUT_EPOCH_KEY = "steward_auth_logout_epoch";
+const AUTH_ROTATION_LOCK = "steward-auth-refresh";
 
 /**
  * Header the same-origin auth proxy (see `authProxyUrl`) requires on every
@@ -192,6 +195,37 @@ function isBrowser(): boolean {
   );
 }
 
+/** Resolve the cookie-custody proxy without permitting a refresh-token handoff
+ * to another origin. Protocol-relative URLs are cross-origin capable too. */
+function normalizeAuthProxyUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = stripTrailingSlashes(value);
+  if (!trimmed) throw new Error("authProxyUrl must identify a non-root path");
+  if (!isBrowser()) {
+    if (!trimmed.startsWith("/") || trimmed.startsWith("//")) {
+      throw new Error("authProxyUrl must be root-relative outside a browser");
+    }
+    return trimmed;
+  }
+  let resolved: URL;
+  try {
+    resolved = new URL(trimmed, window.location.origin);
+  } catch {
+    throw new Error("authProxyUrl must be a valid same-origin HTTP(S) URL");
+  }
+  if (
+    !["http:", "https:"].includes(resolved.protocol) ||
+    resolved.origin !== window.location.origin ||
+    resolved.username ||
+    resolved.password ||
+    resolved.search ||
+    resolved.hash
+  ) {
+    throw new Error("authProxyUrl must be a credential-free same-origin HTTP(S) URL");
+  }
+  return trimmed.startsWith("/") ? trimmed : stripTrailingSlashes(resolved.href);
+}
+
 function getSignInOrigin(): { domain: string; origin: string } {
   return isBrowser()
     ? { domain: window.location.host, origin: window.location.origin }
@@ -254,7 +288,7 @@ function buildSiwsMessage(
 
 type AuthApiResult<T> =
   | { ok: true; status: number; data: T }
-  | { ok: false; status: number; error: string };
+  | { ok: false; status: number; error: string; data: Record<string, unknown> };
 
 // Narrow view of @simplewebauthn/browser — a peer dep we import dynamically.
 type SimpleWebAuthnBrowser = Pick<
@@ -281,9 +315,10 @@ async function authRequest<T>(
 
   let response: Response;
   try {
-    response = await fetch(`${baseUrl.replace(/\/+$/, "")}${path}`, {
+    response = await fetch(`${stripTrailingSlashes(baseUrl)}${path}`, {
       ...init,
       headers,
+      redirect: "error",
     });
   } catch (err) {
     throw new StewardApiError(err instanceof Error ? err.message : "Network request failed", 0);
@@ -305,10 +340,24 @@ async function authRequest<T>(
       typeof payload.error === "string"
         ? payload.error
         : `Request failed with status ${response.status}`;
-    return { ok: false, status: response.status, error: errMsg };
+    return { ok: false, status: response.status, error: errMsg, data: payload };
   }
 
   return { ok: true, status: response.status, data: payload as unknown as T };
+}
+
+/** Narrow an SDK error to the stable existing-passkey recovery contract. */
+export function isStewardPasskeyAlreadyRegisteredError(
+  error: unknown,
+): error is StewardApiError<StewardPasskeyAlreadyRegisteredErrorData> {
+  if (!(error instanceof StewardApiError) || error.status !== 409) return false;
+  const data = error.data;
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "code" in data &&
+    data.code === "passkey_already_registered"
+  );
 }
 
 // ─── StewardAuth ──────────────────────────────────────────────────────────────
@@ -319,6 +368,9 @@ export class StewardAuth {
   private readonly tenantId: string | undefined;
   private readonly authProxyUrl: string | undefined;
   private readonly listeners: Array<(session: StewardSession | null) => void> = [];
+  private refreshPromise: Promise<StewardSession | null> | null = null;
+  private rotationTail: Promise<void> = Promise.resolve();
+  private sessionGeneration = 0;
 
   constructor({
     baseUrl,
@@ -329,9 +381,9 @@ export class StewardAuth {
     allowInsecureBaseUrl,
   }: StewardAuthConfig) {
     assertSecureBaseUrl(baseUrl, allowInsecureBaseUrl);
-    this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.baseUrl = stripTrailingSlashes(baseUrl);
     this.tenantId = tenantId;
-    this.authProxyUrl = authProxyUrl ? authProxyUrl.replace(/\/+$/, "") : undefined;
+    this.authProxyUrl = normalizeAuthProxyUrl(authProxyUrl);
 
     // Use caller-provided storage only. Tokens default to memory so a browser
     // XSS cannot read long-lived refresh tokens from localStorage by default.
@@ -343,6 +395,15 @@ export class StewardAuth {
 
     if (onSessionChange) {
       this.listeners.push(onSessionChange);
+    }
+
+    if (this.authProxyUrl && isBrowser()) {
+      window.addEventListener("storage", (event) => {
+        if (event.key !== AUTH_LOGOUT_EPOCH_KEY) return;
+        this.sessionGeneration += 1;
+        this.clearLocalTokens();
+        this.notifyListeners(null);
+      });
     }
   }
 
@@ -572,6 +633,10 @@ export class StewardAuth {
    * Clears the stored session (both tokens) and notifies listeners.
    */
   signOut(): void {
+    // Invalidate any refresh already in flight so its eventual response cannot
+    // resurrect a session after the user signed out.
+    this.sessionGeneration += 1;
+    this.publishLogoutEpoch();
     this.clearToken();
     this.notifyListeners(null);
   }
@@ -582,9 +647,23 @@ export class StewardAuth {
    * Returns the new session, or null if the refresh token is missing or invalid.
    */
   async refreshSession(): Promise<StewardSession | null> {
-    if (this.authProxyUrl) {
-      return this.refreshViaProxy();
-    }
+    // Refresh tokens rotate on every use and replay detection revokes the token
+    // family. Coalesce near-expiry callers so one client instance never sends
+    // the same one-time token more than once concurrently.
+    if (this.refreshPromise) return this.refreshPromise;
+    const refresh = this.runSerializedRotation(() => this.rotateSession());
+    this.refreshPromise = refresh;
+    const clear = () => {
+      if (this.refreshPromise === refresh) this.refreshPromise = null;
+    };
+    void refresh.then(clear, clear);
+    return refresh;
+  }
+
+  private async refreshDirect(
+    tenantId: string | undefined,
+    generation: number,
+  ): Promise<StewardSession | null> {
     const refreshToken = this.getRefreshToken();
     if (!refreshToken) return null;
 
@@ -592,7 +671,7 @@ export class StewardAuth {
     try {
       res = await authRequest<StewardRefreshResult>(this.baseUrl, "/auth/refresh", {
         method: "POST",
-        body: JSON.stringify({ refreshToken }),
+        body: JSON.stringify({ refreshToken, ...(tenantId ? { tenantId } : {}) }),
       });
     } catch {
       return null;
@@ -604,6 +683,8 @@ export class StewardAuth {
       }
       return null;
     }
+
+    if (generation !== this.sessionGeneration) return null;
 
     this.storage.setItem(STORAGE_KEY, res.data.token);
     this.storage.setItem(REFRESH_TOKEN_KEY, res.data.refreshToken);
@@ -617,16 +698,30 @@ export class StewardAuth {
    * Also clears local session state.
    */
   async revokeSession(): Promise<void> {
+    this.sessionGeneration += 1;
     if (this.authProxyUrl) {
-      // The proxy injects the cookie-held refresh token and clears the cookie.
-      await authRequest(this.authProxyUrl, "/revoke", {
-        method: "POST",
-        headers: AUTH_PROXY_HEADERS,
-        body: JSON.stringify({}),
-      }).catch(() => {
-        /* best-effort */
+      this.publishLogoutEpoch();
+      this.clearLocalTokens();
+      this.notifyListeners(null);
+    }
+    await this.runSerializedRotation(async () => this.revokeSessionOnce());
+  }
+
+  private async revokeSessionOnce(): Promise<void> {
+    // The rotation queue guarantees we revoke the newest token, not the stale
+    // predecessor of an in-flight refresh. Invalidate any later response too.
+    if (this.authProxyUrl) {
+      await this.runProxyMutation(async () => {
+        // The proxy injects the cookie-held refresh token and clears the cookie.
+        await authRequest(this.authProxyUrl!, "/revoke", {
+          method: "POST",
+          headers: AUTH_PROXY_HEADERS,
+          body: JSON.stringify({}),
+        }).catch(() => {
+          /* best-effort */
+        });
       });
-      this.clearToken();
+      this.clearLocalTokens();
       this.notifyListeners(null);
       return;
     }
@@ -639,7 +734,7 @@ export class StewardAuth {
         /* best-effort */
       });
     }
-    this.clearToken();
+    this.clearLocalTokens();
     this.notifyListeners(null);
   }
 
@@ -696,6 +791,7 @@ export class StewardAuth {
         device_code: input.deviceCode,
         ...(input.clientId ? { client_id: input.clientId } : {}),
       }),
+      redirect: "error",
     }).catch((err) => {
       throw new StewardApiError(err instanceof Error ? err.message : "Network request failed", 0);
     });
@@ -843,9 +939,11 @@ export class StewardAuth {
     let authResponse: unknown;
     try {
       // Server-provided options; types are validated by the WebAuthn browser library.
-      authResponse = await lib.startAuthentication(
-        options as Parameters<SimpleWebAuthnBrowser["startAuthentication"]>[0],
-      );
+      authResponse = await lib.startAuthentication({
+        optionsJSON: options as Parameters<
+          SimpleWebAuthnBrowser["startAuthentication"]
+        >[0]["optionsJSON"],
+      });
     } catch (err) {
       throw new StewardApiError(
         `WebAuthn authentication cancelled or failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -898,15 +996,17 @@ export class StewardAuth {
     );
 
     if (!regOptsRes.ok) {
-      throw new StewardApiError(regOptsRes.error, regOptsRes.status);
+      throw new StewardApiError(regOptsRes.error, regOptsRes.status, regOptsRes.data);
     }
 
     let regResponse: unknown;
     try {
       // Server-provided options; types are validated by the WebAuthn browser library.
-      regResponse = await lib.startRegistration(
-        regOptsRes.data as Parameters<SimpleWebAuthnBrowser["startRegistration"]>[0],
-      );
+      regResponse = await lib.startRegistration({
+        optionsJSON: regOptsRes.data as unknown as Parameters<
+          SimpleWebAuthnBrowser["startRegistration"]
+        >[0]["optionsJSON"],
+      });
     } catch (err) {
       throw new StewardApiError(
         `WebAuthn registration cancelled or failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1655,9 +1755,11 @@ export class StewardAuth {
 
     let authResponse: unknown;
     try {
-      authResponse = await browserLib.startAuthentication(
-        optionsRes.data as Parameters<SimpleWebAuthnBrowser["startAuthentication"]>[0],
-      );
+      authResponse = await browserLib.startAuthentication({
+        optionsJSON: optionsRes.data as unknown as Parameters<
+          SimpleWebAuthnBrowser["startAuthentication"]
+        >[0]["optionsJSON"],
+      });
     } catch (err) {
       throw new StewardApiError(
         `WebAuthn authentication cancelled or failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -2266,29 +2368,7 @@ export class StewardAuth {
    * Returns the new session, or null if the switch failed (user may need to re-auth).
    */
   async switchTenant(tenantId: string): Promise<StewardSession | null> {
-    if (this.authProxyUrl) {
-      return this.refreshViaProxy(tenantId);
-    }
-    const refreshToken = this.getRefreshToken();
-    if (!refreshToken) {
-      return null;
-    }
-
-    const res = await authRequest<StewardRefreshResult>(this.baseUrl, "/auth/refresh", {
-      method: "POST",
-      body: JSON.stringify({ refreshToken, tenantId }),
-    });
-
-    if (!res.ok) {
-      // Refresh failed, user needs to re-authenticate
-      return null;
-    }
-
-    this.storage.setItem(STORAGE_KEY, res.data.token);
-    this.storage.setItem(REFRESH_TOKEN_KEY, res.data.refreshToken);
-    const session = sessionFromToken(res.data.token);
-    this.notifyListeners(session);
-    return session;
+    return this.runSerializedRotation(() => this.rotateSession(tenantId));
   }
 
   // ─── Private helpers ────────────────────────────────────────────────────────
@@ -2298,7 +2378,11 @@ export class StewardAuth {
    * which holds the refresh token in an HttpOnly cookie. The proxy rotates the
    * cookie itself; only the new access token comes back to JS-readable storage.
    */
-  private async refreshViaProxy(tenantId?: string): Promise<StewardSession | null> {
+  private async refreshViaProxy(
+    tenantId: string | undefined,
+    generation: number,
+    logoutEpoch: string | null,
+  ): Promise<StewardSession | null> {
     const proxyUrl = this.authProxyUrl;
     if (!proxyUrl) return null;
 
@@ -2320,10 +2404,61 @@ export class StewardAuth {
       return null;
     }
 
+    if (
+      generation !== this.sessionGeneration ||
+      this.readLogoutEpoch() === undefined ||
+      this.readLogoutEpoch() !== logoutEpoch
+    ) {
+      // The response may already have rotated the HttpOnly cookie. Clear it
+      // again after the stale response so a concurrent sign-out stays final.
+      this.clearLocalTokens();
+      await this.deleteProxyCookieUnlocked();
+      return null;
+    }
+
     this.storage.setItem(STORAGE_KEY, res.data.token);
     const session = sessionFromToken(res.data.token);
     this.notifyListeners(session);
     return session;
+  }
+
+  /**
+   * Serialize cookie-backed token rotation across tabs in browsers that expose
+   * the Web Locks API. The lock is origin-scoped, matching the HttpOnly cookie;
+   * a waiting tab therefore sends the newly rotated cookie after its predecessor
+   * completes instead of replaying the predecessor's one-time token.
+   */
+  private async rotateSession(tenantId?: string): Promise<StewardSession | null> {
+    const generation = this.sessionGeneration;
+    if (this.authProxyUrl) {
+      // Cookie rotation is safe only with both an origin-wide lock and a shared
+      // logout epoch. Without either primitive, fail closed instead of risking
+      // one-time-token replay or cross-tab session resurrection.
+      const logoutEpoch = this.readLogoutEpoch();
+      if (!isBrowser() || !navigator.locks || logoutEpoch === undefined) return null;
+      return navigator.locks.request(AUTH_ROTATION_LOCK, async () => {
+        if (generation !== this.sessionGeneration || this.readLogoutEpoch() !== logoutEpoch) {
+          return null;
+        }
+        return this.refreshViaProxy(tenantId, generation, logoutEpoch);
+      });
+    }
+    return this.refreshDirect(tenantId, generation);
+  }
+
+  /** Serialize every one-time refresh-token mutation within this instance. */
+  private async runSerializedRotation<T>(operation: () => Promise<T>): Promise<T> {
+    const predecessor = this.rotationTail;
+    let release!: () => void;
+    this.rotationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   /**
@@ -2362,17 +2497,40 @@ export class StewardAuth {
     if (!token) {
       throw new StewardApiError("Auth response did not include a session token", 0);
     }
-    this.storage.setItem(STORAGE_KEY, token);
+    const generation = this.sessionGeneration;
+    const logoutEpoch = this.authProxyUrl ? this.readLogoutEpoch() : null;
     // Only persist the refresh token when it's a non-empty string.
     // An empty string means the API didn't issue one (e.g. SIWE flow).
     if (refreshToken) {
       if (this.authProxyUrl) {
         // HttpOnly cookie custody — never written to JS-readable storage.
-        await this.depositRefreshToken(refreshToken);
+        await this.runProxyMutation(async () => {
+          if (
+            generation !== this.sessionGeneration ||
+            (logoutEpoch !== undefined && this.readLogoutEpoch() !== logoutEpoch)
+          ) {
+            throw new StewardApiError("Authentication was cancelled by sign-out", 0);
+          }
+          await this.depositRefreshToken(refreshToken);
+          if (
+            generation !== this.sessionGeneration ||
+            (logoutEpoch !== undefined && this.readLogoutEpoch() !== logoutEpoch)
+          ) {
+            // The cookie deposit completed after this or another tab signed
+            // out. Remove it while still holding the origin mutation lock so
+            // the stale authentication cannot resurrect the browser session.
+            await this.deleteProxyCookieUnlocked();
+            throw new StewardApiError("Authentication was cancelled by sign-out", 0);
+          }
+        });
       } else {
         this.storage.setItem(REFRESH_TOKEN_KEY, refreshToken);
       }
     }
+    // Persist the access token only after the refresh token is safely in its
+    // final custody location. In proxy mode a failed deposit must leave no
+    // partially authenticated local session behind.
+    this.storage.setItem(STORAGE_KEY, token);
     const session = sessionFromToken(token, user);
     this.notifyListeners(session);
     return { token, refreshToken, expiresIn, user };
@@ -2400,17 +2558,59 @@ export class StewardAuth {
     );
   }
 
-  private clearToken(): void {
+  private clearLocalTokens(): void {
     this.storage.removeItem(STORAGE_KEY);
     this.storage.removeItem(REFRESH_TOKEN_KEY);
+  }
+
+  private readLogoutEpoch(): string | null | undefined {
+    if (!isBrowser()) return undefined;
+    try {
+      return window.localStorage.getItem(AUTH_LOGOUT_EPOCH_KEY);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private publishLogoutEpoch(): void {
+    if (!this.authProxyUrl || !isBrowser()) return;
+    try {
+      const nonce = globalThis.crypto.randomUUID();
+      window.localStorage.setItem(AUTH_LOGOUT_EPOCH_KEY, `${Date.now()}:${nonce}`);
+    } catch {
+      // Proxy rotation subsequently fails closed while shared storage is absent.
+    }
+  }
+
+  private async deleteProxyCookieUnlocked(): Promise<void> {
+    if (!this.authProxyUrl) return;
+    await authRequest(this.authProxyUrl, "/session", {
+      method: "DELETE",
+      headers: AUTH_PROXY_HEADERS,
+      keepalive: true,
+    }).catch(() => {
+      /* best-effort */
+    });
+  }
+
+  private async runProxyMutation<T>(operation: () => Promise<T>): Promise<T> {
+    if (isBrowser()) {
+      if (navigator.locks && this.readLogoutEpoch() !== undefined) {
+        return await navigator.locks.request(AUTH_ROTATION_LOCK, operation);
+      }
+      // Rotation is disabled when coordination primitives are unavailable, so
+      // an unlocked destructive clear/revoke cannot race a supported rotation.
+      return await operation();
+    }
+    return await operation();
+  }
+
+  private clearToken(): void {
+    this.clearLocalTokens();
     if (this.authProxyUrl) {
       // Best-effort: expire the proxy-held refresh cookie too. keepalive lets
       // the request outlive the page when sign-out is followed by navigation.
-      void authRequest(this.authProxyUrl, "/session", {
-        method: "DELETE",
-        headers: AUTH_PROXY_HEADERS,
-        keepalive: true,
-      }).catch(() => {
+      void this.runProxyMutation(() => this.deleteProxyCookieUnlocked()).catch(() => {
         /* best-effort */
       });
     }

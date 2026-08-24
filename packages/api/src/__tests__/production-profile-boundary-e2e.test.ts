@@ -28,14 +28,18 @@ import {
   providerActionBindings,
   providerGrants,
   providerOperations,
+  proxyAuditLog,
   secretRoutes,
   secrets,
 } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
 import {
+  AWS_PROVIDER_ACTION_PROFILE,
   GENERIC_HTTP_PROVIDER_ACTION_PROFILE,
   GITHUB_PROVIDER_ACTION_PROFILE,
+  GOOGLE_PROVIDER_ACTION_PROFILE,
   REGISTERED_PROFILES,
+  SLACK_PROVIDER_ACTION_PROFILE,
   X_PROVIDER_ACTION_PROFILE,
 } from "@stwd/shared";
 import { KeyStore } from "@stwd/vault";
@@ -56,6 +60,7 @@ let app: Hono<{ Variables: AppVariables }>;
 let jwksServer: Server;
 let agentPrivateKey: KeyLike;
 let dispatchGovernedExecution: typeof import("@stwd/proxy/src/handlers/governed-execution")["dispatchGovernedExecution"];
+let proxy: typeof import("@stwd/proxy/src/handlers/proxy");
 let forwardCount = 0;
 
 const PROFILES = [
@@ -77,6 +82,41 @@ const PROFILES = [
     method: "POST",
     path: "/2/tweets",
     args: { text: "boundary proof", summoned: false },
+    requestProfile: {},
+  },
+  {
+    profile: SLACK_PROVIDER_ACTION_PROFILE,
+    adapterKey: "slack",
+    operationKey: "slack.chat.postMessage",
+    host: "slack.com",
+    method: "POST",
+    path: "/api/chat.postMessage",
+    args: { channel: "C12345678", text: "boundary proof" },
+    requestProfile: {},
+  },
+  {
+    profile: GOOGLE_PROVIDER_ACTION_PROFILE,
+    adapterKey: "google",
+    operationKey: "google.calendar.events.list",
+    host: "www.googleapis.com",
+    method: "GET",
+    path: "/calendar/v3/calendars/primary/events",
+    args: { maxResults: 50 },
+    requestProfile: {},
+  },
+  {
+    // AWS resolves its one permitted origin dynamically from the canonical
+    // action bytes (registry dynamicOriginPolicy "aws-ec2-region"), so the
+    // host below MUST equal `ec2.${args.region}.amazonaws.com` and the route
+    // must carry the exact SigV4 binding (see the credential/route
+    // special-cases in runAuthenticatedBoundary).
+    profile: AWS_PROVIDER_ACTION_PROFILE,
+    adapterKey: "aws",
+    operationKey: "aws.ec2.DescribeInstances",
+    host: "ec2.us-west-2.amazonaws.com",
+    method: "POST",
+    path: "/",
+    args: { region: "us-west-2", instanceIds: ["i-0123456789abcdef0"] },
     requestProfile: {},
   },
   {
@@ -149,8 +189,10 @@ beforeAll(async () => {
   process.env.STEWARD_AUDIT_HMAC_KEY = "0".repeat(64);
   process.env.STEWARD_EXECUTION_AUTH_SECRET = "1".repeat(64);
   process.env.STEWARD_MASTER_PASSWORD = "profile-boundary-master-password";
-  process.env.STEWARD_SECRET_ROUTE_ALLOWED_HOSTS = "api.github.com,api.x.com,api.example.com";
-  process.env.STEWARD_PROXY_ALLOWED_HOSTS = "api.github.com,api.x.com,api.example.com";
+  process.env.STEWARD_SECRET_ROUTE_ALLOWED_HOSTS =
+    "api.github.com,api.x.com,slack.com,www.googleapis.com,api.example.com,ec2.us-west-2.amazonaws.com";
+  process.env.STEWARD_PROXY_ALLOWED_HOSTS =
+    "api.github.com,api.x.com,slack.com,www.googleapis.com,api.example.com,ec2.us-west-2.amazonaws.com";
   process.env.STEWARD_JWT_SECRET = "profile-boundary-jwt-secret-0123456789abcdef0123456789";
   const signingKeys = generateKeyPairSync("ed25519");
   process.env.STEWARD_AUDIT_SIGNING_KEY = signingKeys.privateKey
@@ -174,18 +216,38 @@ beforeAll(async () => {
   const address = jwksServer.address();
   const port = typeof address === "object" && address ? address.port : 0;
   process.env.ELIZA_CLOUD_JWKS_URL = `http://127.0.0.1:${port}/jwks`;
+  process.env.GOOGLE_PROVIDER_CLIENT_ID = "boundary-google-client";
+  process.env.GOOGLE_PROVIDER_CLIENT_SECRET = "boundary-google-secret";
   const { clearAgentJwksCacheForTests } = await import("../middleware/agent-jwt");
   clearAgentJwksCacheForTests();
   const { resetCheckpointSignerCache } = await import("../services/audit-checkpoint");
   resetCheckpointSignerCache();
   app = (await import("../app")).app as Hono<{ Variables: AppVariables }>;
-  const proxy = await import("@stwd/proxy/src/handlers/proxy");
+  proxy = await import("@stwd/proxy/src/handlers/proxy");
+  proxy.__resetSecretVaultForTests();
   ({ dispatchGovernedExecution } = await import("@stwd/proxy/src/handlers/governed-execution"));
+  proxy.__setCheckProxyRateLimitForTests(async () => ({
+    allowed: true,
+    remaining: Number.POSITIVE_INFINITY,
+    resetMs: 0,
+  }));
+  proxy.__setCheckProxySpendLimitForTests(async () => ({
+    allowed: true,
+    configured: false,
+    spent: 0,
+    remaining: Number.POSITIVE_INFINITY,
+  }));
   proxy.__setResolveProxyHostForTests(async () => [{ address: "93.184.216.34", family: 4 }]);
+  // The boundary proof is about canonical provider authority and exact
+  // credential injection, not Redis availability. Make the rate-limit seam
+  // deterministic so an unrelated process-local fallback cannot turn every
+  // dispatch into a 429 when this file runs in a larger suite.
+  proxy.__setCheckProxyRateLimitForTests(async () => ({ allowed: true, resetMs: 0 }));
   proxy.__setForwardProxyRequestForTests(async () => {
     forwardCount += 1;
     return new Response('{"ok":true}', { status: 201 });
   });
+  resetGoogleExecutionTokenForwarder();
 });
 
 beforeEach(async () => {
@@ -194,6 +256,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  resetGoogleExecutionTokenForwarder();
   await getDb()
     .update(secretRoutes)
     .set({ authorityMode: "legacy", providerOperationId: null })
@@ -214,6 +277,8 @@ afterAll(async () => {
     "STEWARD_JWT_SECRET",
     "STEWARD_AUDIT_SIGNING_KEY",
     "ELIZA_CLOUD_JWKS_URL",
+    "GOOGLE_PROVIDER_CLIENT_ID",
+    "GOOGLE_PROVIDER_CLIENT_SECRET",
   ]) {
     delete process.env[key];
   }
@@ -221,10 +286,21 @@ afterAll(async () => {
 
 type BoundaryFixture = (typeof PROFILES)[number];
 
-async function runAuthenticatedBoundary(
+function resetGoogleExecutionTokenForwarder(): void {
+  proxy.__setGoogleExecutionTokenForwarderForTests(async () =>
+    Response.json({
+      access_token: "profile-boundary-ephemeral-access",
+      token_type: "Bearer",
+      scope: "openid email https://www.googleapis.com/auth/calendar.readonly",
+      expires_in: 3600,
+    }),
+  );
+}
+
+async function prepareAuthenticatedBoundary(
   fixture: BoundaryFixture,
   options: { maliciousOperationDescriptor?: boolean } = {},
-): Promise<void> {
+): Promise<{ actionId: string }> {
   const requestProfile = {
     ...fixture.requestProfile,
     policyRules: approvalRules(fixture.operationKey),
@@ -235,7 +311,26 @@ async function runAuthenticatedBoundary(
     undefined,
     "secret-vault",
   );
-  const encrypted = vault.encrypt("profile-boundary-credential", {
+  const credential =
+    fixture.profile === SLACK_PROVIDER_ACTION_PROFILE
+      ? "xoxb-profile-boundary-credential"
+      : fixture.profile === GOOGLE_PROVIDER_ACTION_PROFILE
+        ? JSON.stringify({
+            schemaVersion: "steward.provider-google.credential.v1",
+            accessToken: "profile-boundary-stale-access",
+            refreshToken: "profile-boundary-refresh",
+            scopesGranted: ["openid", "email", "https://www.googleapis.com/auth/calendar.readonly"],
+          })
+        : fixture.profile === AWS_PROVIDER_ACTION_PROFILE
+          ? // Strict SigV4 credential schema (packages/proxy/src/sigv4.ts):
+            // accessKeyId is /^[A-Z0-9]{16,128}$/, secretAccessKey 16..256
+            // printable chars, optional sessionToken. No other keys allowed.
+            JSON.stringify({
+              accessKeyId: "AKIAPROFILEBOUNDARY0",
+              secretAccessKey: "profile-boundary-aws-secret-key",
+            })
+          : "profile-boundary-credential";
+  const encrypted = vault.encrypt(credential, {
     tenantId: F.TENANT,
     name: "github",
     version: 1,
@@ -270,6 +365,16 @@ async function runAuthenticatedBoundary(
       agentId: F.AGENT,
       authorityMode: "governed_v2",
       providerOperationId: F.OP,
+      // The AWS profile dispatches through the SigV4 final-boundary signer,
+      // which requires the route's exact sigv4 binding (service ec2 + the
+      // region the fixture host commits to). Both assertAwsCredentialRouteBinding
+      // (ingress) and injectAwsSigV4AtFinalBoundary (dispatch) fail closed
+      // without it. Other profiles keep the seeded header-injection strategy.
+      injectionStrategy: fixture.profile === AWS_PROVIDER_ACTION_PROFILE ? "sigv4" : "header",
+      injectionConfig:
+        fixture.profile === AWS_PROVIDER_ACTION_PROFILE
+          ? { service: "ec2", region: "us-west-2" }
+          : {},
     })
     .where(and(eq(secretRoutes.tenantId, F.TENANT), eq(secretRoutes.id, F.ROUTE)));
 
@@ -291,7 +396,11 @@ async function runAuthenticatedBoundary(
       idempotencyKey: `profile-boundary-${fixture.adapterKey}-${options.maliciousOperationDescriptor ? "malicious" : "valid"}`,
     }),
   });
-  expect(actionResponse.status).toBe(202);
+  if (actionResponse.status !== 202) {
+    throw new Error(
+      `${fixture.profile} ingress returned ${actionResponse.status}: ${await actionResponse.text()}`,
+    );
+  }
   const action = (await actionResponse.json()) as {
     id: string;
     requestHash: string;
@@ -358,7 +467,16 @@ async function runAuthenticatedBoundary(
     await db.execute(sql`UPDATE provider_operations SET revision = 1 WHERE id = ${F.OP}`);
   }
 
-  const dispatch = await dispatchGovernedExecution(action.id, F.TENANT);
+  return { actionId: action.id };
+}
+
+async function runAuthenticatedBoundary(
+  fixture: BoundaryFixture,
+  options: { maliciousOperationDescriptor?: boolean } = {},
+): Promise<void> {
+  const { actionId } = await prepareAuthenticatedBoundary(fixture, options);
+
+  const dispatch = await dispatchGovernedExecution(actionId, F.TENANT);
   if (options.maliciousOperationDescriptor) {
     expect(dispatch).toMatchObject({
       ok: false,
@@ -373,16 +491,16 @@ async function runAuthenticatedBoundary(
 
   const admin = await sessionToken(F.APPROVER_2);
   const humanHeaders = { authorization: `Bearer ${admin}`, "x-steward-tenant": F.TENANT };
-  const caseResponse = await app.request(`/v2/provider-actions/${action.id}/case`, {
+  const caseResponse = await app.request(`/v2/provider-actions/${actionId}/case`, {
     headers: humanHeaders,
   });
   expect(caseResponse.status).toBe(200);
   expect(await caseResponse.json()).toMatchObject({
-    caseId: action.id,
+    caseId: actionId,
     operation: { key: fixture.operationKey, canonicalProfile: fixture.profile },
     terminalState: options.maliciousOperationDescriptor ? "execution_ready" : "succeeded",
   });
-  const evidenceResponse = await app.request(`/v2/provider-actions/${action.id}/evidence`, {
+  const evidenceResponse = await app.request(`/v2/provider-actions/${actionId}/evidence`, {
     headers: humanHeaders,
   });
   expect(evidenceResponse.status).toBe(200);
@@ -391,7 +509,7 @@ async function runAuthenticatedBoundary(
     bundle: { events: unknown[] };
   };
   expect(evidence.manifest).toMatchObject({
-    caseId: action.id,
+    caseId: actionId,
     operation: { canonicalProfile: fixture.profile },
   });
   expect(evidence.bundle.events.length).toBeGreaterThan(0);
@@ -409,6 +527,51 @@ describe("#220 real production profile boundaries", () => {
   }
 
   test("the identical authenticated runner rejects a malicious registered fixture pre-claim", async () => {
-    await runAuthenticatedBoundary(PROFILES[2], { maliciousOperationDescriptor: true });
+    const genericFixture = PROFILES.find(
+      ({ profile }) => profile === GENERIC_HTTP_PROVIDER_ACTION_PROFILE,
+    );
+    expect(genericFixture).toBeDefined();
+    if (!genericFixture) throw new Error("generic HTTP production fixture is missing");
+    await runAuthenticatedBoundary(genericFixture, { maliciousOperationDescriptor: true });
+  });
+
+  test("google governed dispatch redacts thrown execution-token canaries from logs, response, and audit", async () => {
+    const googleFixture = PROFILES.find(
+      ({ profile }) => profile === GOOGLE_PROVIDER_ACTION_PROFILE,
+    );
+    expect(googleFixture).toBeDefined();
+    if (!googleFixture) throw new Error("google production fixture is missing");
+    const canary = "profile-boundary-refresh-canary profile-boundary-error-canary";
+    const logged: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      logged.push(
+        args.map((value) => (typeof value === "string" ? value : JSON.stringify(value))).join(" "),
+      );
+    };
+    proxy.__setGoogleExecutionTokenForwarderForTests(async () => {
+      const error = Object.assign(new Error(canary), { name: canary, code: canary });
+      throw error;
+    });
+    try {
+      const { actionId } = await prepareAuthenticatedBoundary(googleFixture);
+      const dispatch = await dispatchGovernedExecution(actionId, F.TENANT);
+      expect(dispatch).toMatchObject({ ok: false });
+      expect(JSON.stringify(dispatch)).not.toContain(canary);
+      expect(forwardCount).toBe(0);
+    } finally {
+      console.error = originalError;
+      resetGoogleExecutionTokenForwarder();
+    }
+    const audits = await getDb()
+      .select()
+      .from(proxyAuditLog)
+      .where(eq(proxyAuditLog.tenantId, F.TENANT));
+    expect(audits.some((audit) => audit.reason === "credential-resolution-failed")).toBeTrue();
+    expect(JSON.stringify(audits)).not.toContain(canary);
+    expect(logged.join("\n")).toContain('"errorClass":"Error"');
+    expect(logged.join("\n")).toContain('"errorCode":null');
+    expect(logged.join("\n")).not.toContain(canary);
+    expect(logged.join("\n")).not.toContain("profile-boundary-name-canary");
   });
 });

@@ -19,7 +19,7 @@ import { authRoutes, clearOAuthTokenKeyStoreForTests } from "../routes/auth";
  * NOTE on test isolation:
  *   Uses the ambient `DATABASE_URL` from the `Integration Tests (Postgres)`
  *   CI job rather than swapping pglite into the global handle. Closing a
- *   pglite handle in `afterAll` previously poisoned every subsequent test
+ *   PGLite handle in `afterAll` must not poison subsequent tests
  *   in `bun test packages/api` with `error: PGlite is closed`. We use a
  *   unique tenant prefix and clean up the rows in `afterAll` instead.
  */
@@ -229,7 +229,7 @@ describeWithDatabase("OAuth redirect_uri allowlist", () => {
     expect(callbackRes.status).toBe(400);
     const body = (await callbackRes.json()) as { ok: boolean; error: string };
     expect(body.ok).toBe(false);
-    expect(body.error).toContain("redirect_uri is not allowed");
+    expect(body.error).toContain("application return address is not allowed");
   });
 
   it("rejects /token when redirectUri is outside the tenant allowlist", async () => {

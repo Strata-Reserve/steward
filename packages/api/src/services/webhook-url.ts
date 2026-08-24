@@ -21,7 +21,10 @@ function isNonPublicIpv4(hostname: string): boolean {
     (a === 192 && b === 168) ||
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 192 && b === 0 && (octets[2] === 0 || octets[2] === 2)) ||
+    (a === 192 && b === 31 && octets[2] === 196) ||
+    (a === 192 && b === 52 && octets[2] === 193) ||
     (a === 192 && b === 88 && octets[2] === 99) ||
+    (a === 192 && b === 175 && octets[2] === 48) ||
     (a === 198 && (b === 18 || b === 19)) ||
     (a === 198 && b === 51 && octets[2] === 100) ||
     (a === 203 && b === 0 && octets[2] === 113) ||
@@ -85,9 +88,19 @@ function embeddedIpv4FromIpv6(hostname: string): string | null {
     words[5] === 0;
   if (isNat64WellKnown) return fromWords(words[6], words[7]);
 
-  const isNat64LocalUse =
-    words[0] === 0x64 && words[1] === 0xff9b && words[2] === 1 && words[3] === 0;
-  if (isNat64LocalUse) return fromWords(words[6], words[7]);
+  // RFC 8215 IPv4-translated ::ffff:0:0/96 — distinct from the IPv4-mapped
+  // form (words[5] === 0xffff, handled by mappedIpv4FromIpv6). The IPv4 is
+  // embedded in the low 32 bits and reachable through NAT64/SIIT paths, so
+  // it must face the same non-public checks. Parity with the delivery-time
+  // dispatcher screen (SEC-178); registration should reject these up front.
+  const isIpv4Translated =
+    words[0] === 0 &&
+    words[1] === 0 &&
+    words[2] === 0 &&
+    words[3] === 0 &&
+    words[4] === 0xffff &&
+    words[5] === 0;
+  if (isIpv4Translated) return fromWords(words[6], words[7]);
 
   if (words[0] === 0x2002) return fromWords(words[1], words[2]);
 
@@ -101,9 +114,32 @@ function isNonPublicIpv6(hostname: string): boolean {
   const ipv4Embedded = embeddedIpv4FromIpv6(normalized);
   if (ipv4Embedded) return isNonPublicIpv4(ipv4Embedded);
   const words = expandIpv6Words(normalized);
-  if (words?.[0] === 0x2001 && (words[1] === 0 || words[1] === 0xdb8)) return true;
+  // RFC 8215 reserves 64:ff9b:1::/48 for local use and explicitly says no
+  // assumption can be made about an embedded IPv4 address or its location.
+  // Treat the entire non-globally-reachable prefix as non-public (matching the
+  // OIDC screeners) instead of extracting a would-be /96 suffix.
+  if (words?.[0] === 0x64 && words[1] === 0xff9b && words[2] === 1) return true;
+  // Deprecated IPv4-compatible ::/96 space is special-use, not a public
+  // webhook destination. Closes parser-dependent forms such as
+  // `[::127.0.0.1]` / `[::7f00:1]` (parity with the dispatcher screen).
+  if (words && words.slice(0, 6).every((word) => word === 0) && (words[6] !== 0 || words[7] !== 0))
+    return true;
+  // Only ordinary global-unicast space is a valid literal destination. Public
+  // IPv4 embeddings above return before this check; everything else outside
+  // 2000::/3 is reserved, local, discard-only, or currently unallocated.
+  if (words?.[0] !== undefined && (words[0] & 0xe000) !== 0x2000) return true;
+  // IANA protocol assignments occupy 2001::/23. Individual sub-prefixes such
+  // as benchmarking 2001:2::/48 do not make the adjacent space public.
+  if (words?.[0] === 0x2001 && words[1] <= 0x01ff) return true;
+  if (words?.[0] === 0x2001 && words[1] === 0xdb8) return true;
+  // Keep registration-time screening aligned with the delivery dispatcher for
+  // the complete benchmarking and discard-only special-use prefixes.
+  if (words?.[0] === 0x2001 && words[1] === 0x0002 && words[2] === 0) return true;
+  if (words?.[0] === 0x0100 && words[1] === 0 && words[2] === 0 && words[3] === 0) return true;
   if (words?.[0] !== undefined && (words[0] & 0xffc0) === 0xfe80) return true;
   if (words?.[0] !== undefined && (words[0] & 0xffc0) === 0xfec0) return true;
+  if (words?.[0] === 0x2620 && words[1] === 0x004f && words[2] === 0x8000) return true;
+  if (words?.[0] === 0x3fff && (words[1] & 0xf000) === 0) return true;
   return (
     normalized === "::" ||
     normalized === "::1" ||
@@ -153,12 +189,13 @@ export type DnsResolver = (hostname: string) => Promise<DnsAnswer[]>;
 
 const defaultResolver: DnsResolver = (hostname) => lookup(hostname, { all: true, verbatim: true });
 
-function isNonPublicAddress(address: string): boolean {
+function isNonPublicAddress(address: string, family?: number): boolean {
   const normalized = address.toLowerCase();
   const version = isIP(normalized);
+  if (version === 0 || (family !== undefined && family !== version)) return true;
   if (version === 4) return isNonPublicIpv4(normalized);
   if (version === 6) return isNonPublicIpv6(normalized);
-  // Unexpected answer form — fail closed.
+  // Kept as an explicit fail-closed fallback if Node adds another family.
   return true;
 }
 
@@ -198,7 +235,7 @@ export async function validateWebhookUrlResolved(
   }
   if (answers.length === 0) return "url host could not be resolved";
   for (const answer of answers) {
-    if (isNonPublicAddress(answer.address)) {
+    if (isNonPublicAddress(answer.address, answer.family)) {
       return "url host must resolve to a public address";
     }
   }

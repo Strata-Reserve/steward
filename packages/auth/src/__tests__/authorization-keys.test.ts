@@ -65,4 +65,11 @@ describe("decodeFlexible hex/base64 disambiguation (SEC-063)", () => {
     expect(await importP256PublicKey("not-a-key!!!")).toBeNull();
     expect(await verifyP256Signature("not-a-key!!!", "m", "c2ln")).toBe(false);
   });
+
+  test("oversized base64 padding fails closed without regex backtracking", async () => {
+    expect(await importP256PublicKey(`not-a-key${"=".repeat(200_000)}`)).toBeNull();
+    const nearMiss = `not-a-key${"=".repeat(200_000)}!`;
+    expect(await importP256PublicKey(nearMiss)).toBeNull();
+    expect(await verifyP256Signature(nearMiss, "message", nearMiss)).toBe(false);
+  });
 });
