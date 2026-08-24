@@ -436,7 +436,7 @@ const stewardSignatureHeader = headerParameter(
 );
 const signingKeyIdHeader = headerParameter(
   "X-Steward-Signing-Key-Id",
-  "Optional tenant request-signing key id used to select a managed HMAC signing key.",
+  "Tenant request-signing key id used to select a managed HMAC signing key. Required when signing with a managed tenant key; omit only for static or app-client signing secrets.",
 );
 const idempotencyKeyHeader = headerParameter(
   "Idempotency-Key",
@@ -1482,6 +1482,74 @@ const walletActionSponsorshipSchema: JsonSchema = {
   },
 };
 
+const vaultSignInputSchema: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["to", "value"],
+  properties: {
+    to: stringSchema,
+    value: stringSchema,
+    data: stringSchema,
+    chainId: { type: "integer", minimum: 1 },
+    nonce: { type: "integer", minimum: 0 },
+    gasLimit: stringSchema,
+    broadcast: { type: "boolean", default: true },
+    venue: stringSchema,
+    walletAddress: stringSchema,
+  },
+};
+
+const vaultSignSuccessSchema: JsonSchema = {
+  type: "object",
+  required: ["txId"],
+  properties: {
+    txId: stringSchema,
+    txHash: stringSchema,
+    signedTx: stringSchema,
+  },
+  oneOf: [{ required: ["txHash"] }, { required: ["signedTx"] }],
+};
+
+const vaultSignPendingSchema: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["ok", "error", "data"],
+  properties: {
+    ok: { type: "boolean", const: false },
+    error: stringSchema,
+    data: {
+      type: "object",
+      required: ["txId", "status", "results"],
+      properties: {
+        txId: stringSchema,
+        status: { type: "string", const: "pending_approval" },
+        results: { type: "array", items: metadataSchema },
+      },
+    },
+  },
+};
+
+const vaultSignOutcomeUnknownSchema: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["ok", "error", "data"],
+  properties: {
+    ok: { type: "boolean", const: false },
+    error: stringSchema,
+    data: {
+      type: "object",
+      additionalProperties: false,
+      required: ["code", "txId", "txHash", "reconciliationRequired"],
+      properties: {
+        code: { type: "string", const: "external_broadcast_outcome_unknown" },
+        txId: stringSchema,
+        txHash: stringSchema,
+        reconciliationRequired: { type: "boolean", const: true },
+      },
+    },
+  },
+};
+
 const transferActionInputSchema: JsonSchema = {
   type: "object",
   required: ["to"],
@@ -1522,7 +1590,15 @@ const transferActionSchema: JsonSchema = {
     type: { type: "string", const: "transfer" },
     status: {
       type: "string",
-      enum: ["pending_approval", "rejected", "signed", "broadcast", "confirmed", "failed"],
+      enum: [
+        "pending_approval",
+        "rejected",
+        "signed",
+        "broadcast",
+        "confirmed",
+        "failed",
+        "outcome_unknown",
+      ],
     },
     chainId: { type: "integer", minimum: 1 },
     to: stringSchema,
@@ -1915,6 +1991,8 @@ const secretRouteSchema: JsonSchema = {
     "method",
     "injectAs",
     "injectKey",
+    "injectionStrategy",
+    "injectionConfig",
     "enabled",
   ],
   properties: {
@@ -1931,6 +2009,12 @@ const secretRouteSchema: JsonSchema = {
     injectAs: { type: "string", enum: ["header"] },
     injectKey: stringSchema,
     injectFormat: nullableStringSchema,
+    injectionStrategy: { type: "string", enum: ["header", "sigv4"] },
+    injectionConfig: {
+      type: "object",
+      properties: { service: { type: "string", enum: ["ec2"] }, region: stringSchema },
+      additionalProperties: false,
+    },
     priority: { type: "integer", minimum: 0, maximum: 1000000 },
     enabled: { type: "boolean" },
     createdAt: dateTimeSchema,
@@ -1949,6 +2033,12 @@ const secretRouteMutationProperties: Record<string, JsonSchema> = {
   injectAs: { type: "string", enum: ["header"] },
   injectKey: stringSchema,
   injectFormat: stringSchema,
+  injectionStrategy: { type: "string", enum: ["header", "sigv4"] },
+  injectionConfig: {
+    type: "object",
+    properties: { service: { type: "string", enum: ["ec2"] }, region: stringSchema },
+    additionalProperties: false,
+  },
   priority: { type: "integer", minimum: 0, maximum: 1000000 },
   enabled: { type: "boolean" },
 };
@@ -2651,15 +2741,18 @@ function approvalPaths(prefix = ""): Record<string, unknown> {
       get: {
         tags: ["Approvals"],
         summary: "List manual approval queue entries",
-        description: `${approvalDescription} Supports status, limit, and offset filters.`,
+        description: `${approvalDescription} Supports status and tenant-scoped agent filters before stable (requestedAt, id) keyset pagination.`,
         security: [{ bearerAuth: [] }],
         parameters: [
           parameter("status", "query", {
             type: "string",
             enum: ["pending", "approved", "rejected", "all"],
           }),
+          parameter("agentId", "query", { type: "string", minLength: 1, maxLength: 64 }),
           parameter("limit", "query", { type: "integer", minimum: 1, maximum: 200 }),
           parameter("offset", "query", { type: "integer", minimum: 0, maximum: 10000 }),
+          parameter("cursorRequestedAt", "query", { type: "string", format: "date-time" }),
+          parameter("cursorId", "query", { type: "string", minLength: 1, maxLength: 64 }),
         ],
         responses: {
           "200": jsonResponse(apiResponse({ type: "array", items: approvalQueueEntrySchema })),
@@ -6273,7 +6366,8 @@ function addHardeningInventory(spec: OpenApiSpec): OpenApiSpec {
           requiredWhen: "STEWARD_REQUIRE_AUTH_SIGNATURE=true",
           header: "X-Steward-Signature",
           schemes: ["v1=hmac-sha256", "p256=ecdsa-secp256r1"],
-          optionalSigningKeyHeader: "X-Steward-Signing-Key-Id",
+          managedTenantKeyHeader: "X-Steward-Signing-Key-Id",
+          requiredForManagedTenantKey: true,
         },
         idempotency: {
           header: "Idempotency-Key",
@@ -6646,6 +6740,27 @@ export function getOpenApiSpec() {
           requestBody: jsonRequestBody(encryptedKeyImportSubmitRequestSchema),
           responses: {
             "200": jsonResponse(apiResponse(encryptedKeyImportResultSchema)),
+            ...errorResponses(),
+          },
+        },
+      },
+      "/vault/{agentId}/sign": {
+        parameters: [parameter("agentId", "path")],
+        post: {
+          tags: ["Vault"],
+          summary: "Sign or broadcast a governed transaction",
+          description:
+            "Evaluates current agent policy and signs a transaction. Broadcast requests require an Idempotency-Key. HTTP 202 may mean either pending_approval or outcome_unknown; outcome_unknown includes the deterministic transaction hash and requires receipt reconciliation before any retry.",
+          security: [{ tenantApiKey: [] }, { bearerAuth: [] }],
+          requestBody: jsonRequestBody(vaultSignInputSchema),
+          responses: {
+            "200": jsonResponse(apiResponse(vaultSignSuccessSchema)),
+            "202": jsonResponse({
+              oneOf: [vaultSignPendingSchema, vaultSignOutcomeUnknownSchema],
+            }),
+            "428": jsonResponse(errorResponse()),
+            "500": jsonResponse(errorResponse()),
+            "502": jsonResponse(errorResponse()),
             ...errorResponses(),
           },
         },

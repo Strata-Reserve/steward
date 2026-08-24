@@ -47,12 +47,14 @@ export {
   assertExternalKeyCustodyProviderV1,
   assertNoExternalPrivateKeyMaterial,
   EXTERNAL_KEY_CUSTODY_CONTRACT_VERSION,
+  ExternalBroadcastOutcomeUnknownError,
   externalKeyCustodyUnavailableError,
   externalKeyPrivateExportUnavailableError,
   externalKeySigningUnavailableError,
   FailClosedExternalKeyCustodyProvider,
   InMemoryExternalKeyCustodyProvider,
   normalizeExternalKeyHandleRegistration,
+  SolanaBroadcastNotSubmittedError,
 } from "./external-key-custody";
 export type {
   ExternalKeyCustodyV1ConformanceResult,
@@ -129,14 +131,22 @@ export {
   SecretRouteAuthorityConflict,
   secretRouteAuthorityPatternsOverlap,
 } from "./secret-route-authority";
-export type { SecretRouteConfigInput } from "./secret-route-validator";
+export type {
+  CredentialInjectionConfig,
+  CredentialInjectionStrategy,
+  SecretRouteConfigInput,
+} from "./secret-route-validator";
 export {
   configuredSecretRouteHosts,
   DEFAULT_SECRET_ROUTE_HOSTS,
   STRICT_HOSTS,
   validateSecretRouteConfig,
 } from "./secret-route-validator";
-export type { CreateSecretOptions, SecretMetadata } from "./secret-vault";
+export type {
+  CreateSecretOptions,
+  LegacyRootSecretMigration,
+  SecretMetadata,
+} from "./secret-vault";
 export { SecretVault } from "./secret-vault";
 export type {
   SignerBackend,
@@ -163,6 +173,7 @@ export {
   generateSolanaKeypair,
   getSolanaBalance,
   getSplTokenBalances,
+  isValidSolanaPublicKey,
   restoreSolanaKeypair,
   signSolanaMessage,
   signSolanaTransaction,

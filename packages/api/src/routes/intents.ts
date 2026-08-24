@@ -5,7 +5,7 @@
  */
 
 import { toPersistedPolicyRule, users, userTenants } from "@stwd/db";
-import type { PolicyRule } from "@stwd/shared";
+import { type PolicyRule, redactedThrownDiagnostics } from "@stwd/shared";
 import { and, desc, eq, inArray, type SQL, sql } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { enforceRateLimit, recordVaultSpend } from "../middleware/redis-enforcement";
@@ -27,12 +27,14 @@ import {
   priceOracle,
   requireTenantLevel,
   safeJsonParse,
+  sanitizeErrorMessage,
   toPolicyRule,
   transactions,
   vault,
 } from "../services/context";
 import { redactSignedTransactions, toIntentResponse } from "../services/intent-response";
 import { getPolicyRulesValidationError } from "../services/policy-validation";
+import { isRecentMfaTimestamp } from "../services/recent-mfa";
 import { dispatchWebhook } from "../services/webhook-dispatch";
 
 export const intentRoutes = new Hono<{ Variables: AppVariables }>();
@@ -137,12 +139,7 @@ async function hasCurrentTenantReviewerMembership(
 }
 
 function hasRecentSessionMfa(c: Context<{ Variables: AppVariables }>, maxAgeMs = 5 * 60_000) {
-  const verifiedAt = c.get("sessionMfaVerifiedAt");
-  return (
-    typeof verifiedAt === "number" &&
-    Number.isFinite(verifiedAt) &&
-    Date.now() - verifiedAt <= maxAgeMs
-  );
+  return isRecentMfaTimestamp(c.get("sessionMfaVerifiedAt"), maxAgeMs);
 }
 
 function parseListLimit(value: string | undefined): number | null {
@@ -584,6 +581,8 @@ async function executeTransferIntent(row: typeof intents.$inferSelect) {
       recentTxCount24h: stats.recentTxCount24h,
       spentToday: stats.spentToday,
       spentThisWeek: stats.spentThisWeek,
+      additionalUsdSpentTodayMicros: stats.additionalUsdSpentTodayMicros,
+      additionalUsdSpentThisWeekMicros: stats.additionalUsdSpentThisWeekMicros,
       priceOracle,
       conditionSets,
     });
@@ -624,22 +623,29 @@ async function executeTransferIntent(row: typeof intents.$inferSelect) {
         .where(eq(transactions.id, txId));
       if (request.broadcast !== false) {
         recordVaultSpend(request.agentId, row.tenantId, request.value, request.chainId).catch(
-          (error) => console.error("[intents] Failed to record transfer intent spend:", error),
+          (error) =>
+            console.error(
+              "[intents] Failed to record transfer intent spend",
+              redactedThrownDiagnostics(error),
+            ),
         );
       }
       return completedResult;
     } catch (error) {
       if (completedResult) {
-        console.error("[intents] Post-transfer intent bookkeeping failed after signing:", error);
+        console.error(
+          "[intents] Post-transfer intent bookkeeping failed after signing",
+          redactedThrownDiagnostics(error),
+        );
         return completedResult;
       }
-      const message = error instanceof Error ? error.message : "Transfer execution failed";
       dispatchWebhook(row.tenantId, request.agentId, "wallet_action.transfer.failed", {
         actionId: txId,
         intent_id: row.id,
-        error: message,
+        error: "Transfer execution failed",
+        ...redactedThrownDiagnostics(error),
       });
-      throw new IntentExecutionError(message, 502);
+      throw new IntentExecutionError("Transfer execution failed", 502);
     }
   });
 }
@@ -690,6 +696,8 @@ async function executeSendCallsIntent(row: typeof intents.$inferSelect) {
           recentTxCount24h: stats.recentTxCount24h,
           spentToday: runningSpentToday,
           spentThisWeek: runningSpentThisWeek,
+          additionalUsdSpentTodayMicros: stats.additionalUsdSpentTodayMicros,
+          additionalUsdSpentThisWeekMicros: stats.additionalUsdSpentThisWeekMicros,
           priceOracle,
           conditionSets,
         }),
@@ -754,7 +762,11 @@ async function executeSendCallsIntent(row: typeof intents.$inferSelect) {
       }
       if (request.broadcast) {
         recordVaultSpend(request.agentId, row.tenantId, request.totalValue, request.chainId).catch(
-          (error) => console.error("[intents] Failed to record send-calls intent spend:", error),
+          (error) =>
+            console.error(
+              "[intents] Failed to record send-calls intent spend",
+              redactedThrownDiagnostics(error),
+            ),
         );
       }
       return {
@@ -768,13 +780,13 @@ async function executeSendCallsIntent(row: typeof intents.$inferSelect) {
         signedCalls,
       };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Batch call execution failed";
       dispatchWebhook(row.tenantId, request.agentId, "wallet_action.send_calls.failed", {
         actionId: row.id,
         intent_id: row.id,
-        error: message,
+        error: "Batch call execution failed",
+        ...redactedThrownDiagnostics(error),
       });
-      throw new IntentExecutionError(message, 502);
+      throw new IntentExecutionError("Batch call execution failed", 502);
     }
   });
 }
@@ -1118,7 +1130,7 @@ async function withAgentSpendLock<T>(agentId: string, fn: () => Promise<T>): Pro
     return fn();
   }
   return db.transaction(async (tx) => {
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${agentId}))`);
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${agentId}, 0))`);
     return fn();
   });
 }
@@ -1593,7 +1605,7 @@ async function updateIntentStatus(
     .where(and(eq(intents.id, intentId), eq(intents.tenantId, tenantId)));
   if (!existing) return c.json<ApiResponse>({ ok: false, error: "Intent not found" }, 404);
 
-  // PR3 (N50, I1/I4/I12): a governed provider-action intent's lifecycle is owned
+  // N50/I1/I4/I12: a governed provider-action intent's lifecycle is owned
   // exclusively by the provider approval service + its companion binding/queue.
   // The generic intent status endpoint MUST NOT set authorized/executed/etc on a
   // provider action (that would bypass the exact approval + safe-resume state
@@ -1815,7 +1827,7 @@ async function updateIntentStatus(
       await assertIntentAuthorizationBaselineCurrent(claimed);
       executionResult = await executeTypedIntent(claimed);
     } catch (error) {
-      const failureReason = error instanceof Error ? error.message : "Invalid intent execution";
+      const failureReason = sanitizeErrorMessage(error);
       const failedAt = new Date();
       const [failed] = await db
         .update(intents)

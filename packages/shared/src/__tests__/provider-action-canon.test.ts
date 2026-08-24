@@ -219,6 +219,12 @@ describe("headers", () => {
       ["if-none-match", '"abc"'],
     ]);
   });
+  it("trims adversarial OWS runs without regex backtracking", () => {
+    const ows = " \t".repeat(100_000);
+    expect(canonicalizeHeaders([["if-none-match", `${ows}"abc"${ows}`]])).toEqual([
+      ["if-none-match", '"abc"'],
+    ]);
+  });
   it("accepts weak etag", () => {
     expect(canonicalizeHeaders([["if-none-match", 'W/"7"']])).toEqual([["if-none-match", 'W/"7"']]);
   });
@@ -415,6 +421,18 @@ describe("jcsStringify rejects non-JSON runtime values", () => {
   });
   it("non-integer runtime number", () =>
     expectCanon(() => jcsStringify({ a: 1.5 }), "CANON_RUNTIME_VALUE_UNSUPPORTED"));
+  it("accessor property — getter is rejected, never invoked (SEC-191)", () => {
+    let getterRan = false;
+    const exotic = Object.defineProperty({}, "a", {
+      enumerable: true,
+      get() {
+        getterRan = true;
+        return 1;
+      },
+    });
+    expectCanon(() => jcsStringify(exotic), "CANON_RUNTIME_VALUE_UNSUPPORTED");
+    expect(getterRan).toBe(false);
+  });
 });
 
 describe("jcs key ordering (UTF-16 code units)", () => {

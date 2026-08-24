@@ -35,6 +35,36 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 
+// ─── Tenant isolation posture (SEC-169) ──────────────────────────────────────
+//
+// Tenant isolation is enforced ENTIRELY at the application layer: every query
+// filters `tenant_id` in code, and the API/proxy resolve the tenant from an
+// authenticated credential — never from caller-supplied input. No Postgres
+// Row-Level Security is enabled on any table (`isRLSEnabled: false`
+// throughout drizzle/meta). Consequence: a single app-layer query bug that
+// drops the tenant predicate is a cross-tenant data leak; the database would
+// not catch it.
+//
+// RLS activation is tracked by SEC-169. The executable transaction-context
+// primitive, complete policy inventory, and rollout gates live in
+// `tenant-rls-context.ts`, `rls-inventory.ts`, and
+// `docs/security/database-rls-rollout.mdx`. Enabling it safely requires all of
+// the following, and shipping half of it is worse than none:
+//   1. a per-request `SET LOCAL app.tenant_id` inside EVERY transaction (the
+//      pooled postgres-js role is shared by all tenants, so the GUC must be
+//      set on the checked-out connection for exactly the unit of work);
+//   2. `ENABLE` + `FORCE ROW LEVEL SECURITY` so the table-owning app role is
+//      also subject to policy, plus a break-glass role for migrations and
+//      cross-tenant jobs (audit archival, billing rollups);
+//   3. a policy matrix review for tables with legitimate cross-tenant reads
+//      (e.g. `tenants` lookup by API-key hash at auth time — before any
+//      tenant context exists);
+//   4. PGLite/Workers parity: the embedded and neon-http runtimes must honor
+//      the same GUC discipline, or dev/prod behavior diverges.
+// App-layer predicates are the current isolation boundary while RLS is disabled;
+// treat any change that relaxes a `tenant_id`
+// predicate as a security review trigger.
+
 // Postgres BYTEA column. Typed as Uint8Array to avoid the Node `Buffer` vs
 // Cloudflare workers-types Buffer conflict that bites when both type packs
 // are in scope. The runtime value is whatever the driver returns; callers
@@ -55,6 +85,12 @@ export interface TenantEmailConfig {
   apiKeyEncrypted?: string;
   from?: string;
   replyTo?: string;
+  /**
+   * Display brand used by the built-in magic-link and OTP templates. This
+   * keeps shared-provider tenants branded without requiring raw HTML
+   * templates. Defaults to "Steward" when unset.
+   */
+  brandName?: string;
   templateId?: string;
   subjectOverride?: string;
   /**
@@ -90,7 +126,7 @@ export interface TenantEmailConfig {
 
 export const chainFamilyEnum = pgEnum("chain_family", ["evm", "solana", "bitcoin", "monero"]);
 
-// PR4 (0082): governed provider route authority mode. `legacy` = the historical
+// Migration 0082 governed provider route authority mode. `legacy` is the direct
 // direct-proxy credential path; `governed_v2` = decrypt/inject only reachable via
 // a claimed v2 execution authorization (dispatchGovernedExecution). A route is
 // never both. Default `legacy` => migration 0082 changes nothing at deploy (X9).
@@ -125,13 +161,14 @@ export const transactionStatusEnum = pgEnum("transaction_status", [
   "broadcast",
   "confirmed",
   "failed",
+  "outcome_unknown",
 ]);
 
 export const approvalQueueStatusEnum = pgEnum("approval_queue_status", [
   "pending",
   "approved",
   "rejected",
-  // PR3 provider-action arm lifecycle statuses (0081). The legacy transaction
+  // Migration 0081 provider-action arm lifecycle statuses. The transaction
   // arm only ever uses pending/approved/rejected.
   "expired",
   "stale",
@@ -458,7 +495,7 @@ export const agentWallets = pgTable(
     chainFamily: chainFamilyEnum("chain_family").notNull(),
     address: varchar("address", { length: 128 }).notNull(),
     /**
-     * Sprint 4: trading venue this wallet is scoped to (e.g. "hyperliquid").
+     * Trading venue this wallet is scoped to (e.g. "hyperliquid").
      * NULL on legacy rows; vault lookups fall back to chainFamily when
      * venue isn't provided. See VenueId in @stwd/shared.
      */
@@ -476,7 +513,7 @@ export const agentWallets = pgTable(
       sql`COALESCE(${table.venue}, '')`,
     ),
     /**
-     * Sprint 4: partial unique index on the legacy NULL-venue subset.
+     * Partial unique index on the legacy NULL-venue subset.
      * Targeted by importKey()'s upsert (drizzle's onConflictDoUpdate
      * needs a named unique index, not an expression index).
      */
@@ -526,9 +563,40 @@ export const vaultSigningFreezes = pgTable(
   }),
 );
 
+/**
+ * Globally claims an EVM (address, chain) nonce namespace for exactly one
+ * tenant. The counter itself is tenant-scoped for RLS, while this claim keeps
+ * duplicate custody of the same address in two tenants from allocating the
+ * same on-chain nonce independently.
+ */
+export const evmWalletNonceOwners = pgTable(
+  "evm_wallet_nonce_owners",
+  {
+    tenantId: varchar("tenant_id", { length: 64 })
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    walletAddress: varchar("wallet_address", { length: 42 }).notNull(),
+    chainId: integer("chain_id").notNull(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    key: primaryKey({ columns: [table.walletAddress, table.chainId] }),
+    tenantWalletChainUniqueIdx: uniqueIndex("evm_wallet_nonce_owners_tenant_key_idx").on(
+      table.tenantId,
+      table.walletAddress,
+      table.chainId,
+    ),
+    addressCheck: check(
+      "evm_wallet_nonce_owners_address_chk",
+      sql`${table.walletAddress} ~ '^0x[0-9a-f]{40}$'`,
+    ),
+  }),
+);
+
 export const evmWalletNonces = pgTable(
   "evm_wallet_nonces",
   {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
     walletAddress: varchar("wallet_address", { length: 42 }).notNull(),
     chainId: integer("chain_id").notNull(),
     nextNonce: bigint("next_nonce", { mode: "number" }).notNull(),
@@ -539,9 +607,19 @@ export const evmWalletNonces = pgTable(
   },
   (table) => ({
     walletChainUniqueIdx: uniqueIndex("evm_wallet_nonces_wallet_chain_idx").on(
+      table.tenantId,
       table.walletAddress,
       table.chainId,
     ),
+    ownerFk: foreignKey({
+      columns: [table.tenantId, table.walletAddress, table.chainId],
+      foreignColumns: [
+        evmWalletNonceOwners.tenantId,
+        evmWalletNonceOwners.walletAddress,
+        evmWalletNonceOwners.chainId,
+      ],
+      name: "evm_wallet_nonces_owner_fk",
+    }).onDelete("cascade"),
   }),
 );
 
@@ -555,6 +633,7 @@ export const evmWalletNonces = pgTable(
 export const evmWalletNonceInflight = pgTable(
   "evm_wallet_nonce_inflight",
   {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
     walletAddress: varchar("wallet_address", { length: 42 }).notNull(),
     chainId: integer("chain_id").notNull(),
     nonce: bigint("nonce", { mode: "number" }).notNull(),
@@ -567,16 +646,27 @@ export const evmWalletNonceInflight = pgTable(
   },
   (table) => ({
     walletChainNonceUniqueIdx: uniqueIndex("evm_wallet_nonce_inflight_key_idx").on(
+      table.tenantId,
       table.walletAddress,
       table.chainId,
       table.nonce,
     ),
     reclaimIdx: index("evm_wallet_nonce_inflight_reclaim_idx").on(
+      table.tenantId,
       table.walletAddress,
       table.chainId,
       table.state,
       table.nonce,
     ),
+    ownerFk: foreignKey({
+      columns: [table.tenantId, table.walletAddress, table.chainId],
+      foreignColumns: [
+        evmWalletNonceOwners.tenantId,
+        evmWalletNonceOwners.walletAddress,
+        evmWalletNonceOwners.chainId,
+      ],
+      name: "evm_wallet_nonce_inflight_owner_fk",
+    }).onDelete("cascade"),
   }),
 );
 
@@ -849,7 +939,7 @@ export const encryptedChainKeys = pgTable(
   "encrypted_chain_keys",
   {
     /**
-     * Sprint 4: surrogate PK so a single (agentId, chainFamily) can have
+     * Surrogate PK so a single (agentId, chainFamily) can have
      * multiple rows, one per venue. The uniqueness invariant moves to
      * `agent_chain_venue_idx` below.
      */
@@ -859,7 +949,7 @@ export const encryptedChainKeys = pgTable(
       .references(() => agents.id, { onDelete: "cascade" }),
     chainFamily: chainFamilyEnum("chain_family").notNull(),
     /**
-     * Sprint 4: trading venue this key is scoped to (e.g. "hyperliquid").
+     * Trading venue this key is scoped to (e.g. "hyperliquid").
      * NULL on legacy rows; vault lookups fall back to chainFamily when
      * venue isn't provided.
      */
@@ -915,11 +1005,67 @@ export const transactions = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     signedAt: timestamp("signed_at", { withTimezone: true }),
     confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+    receiptPolledAt: timestamp("receipt_polled_at", { withTimezone: true }),
   },
   (table) => ({
     agentIdIdx: index("transactions_agent_id_idx").on(table.agentId),
     // `value` is a wei amount: must be a non-empty decimal digit string.
     valueIsWei: check("transactions_value_wei_chk", sql`${table.value} ~ '^[0-9]+$'`),
+  }),
+);
+
+/** Durable reservations for off-chain operator fund movements. Pending rows
+ * are intentionally counted: after a venue timeout the transfer may have
+ * landed, so excluding it would permit a retry to overspend the policy cap. */
+export const operatorTransferReservations = pgTable(
+  "operator_transfer_reservations",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: varchar("tenant_id", { length: 64 })
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    agentId: varchar("agent_id", { length: 64 })
+      .notNull()
+      .references(() => agents.id, { onDelete: "cascade" }),
+    rail: varchar("rail", { length: 16 }).notNull(),
+    idempotencyKey: varchar("idempotency_key", { length: 256 }).notNull(),
+    destination: varchar("destination", { length: 128 }).notNull(),
+    amountBaseUnits: text("amount_base_units").notNull(),
+    status: varchar("status", { length: 16 }).notNull().default("pending"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    finalizedAt: timestamp("finalized_at", { withTimezone: true }),
+  },
+  (table) => ({
+    requestUnique: uniqueIndex("operator_transfer_reservation_request_uidx")
+      .on(table.tenantId, table.rail, table.idempotencyKey)
+      .where(sql`${table.status} in ('pending', 'final')`),
+    agentCreatedIdx: index("operator_transfer_reservation_agent_created_idx").on(
+      table.tenantId,
+      table.agentId,
+      table.createdAt,
+    ),
+    tenantAgentFk: foreignKey({
+      columns: [table.tenantId, table.agentId],
+      foreignColumns: [agents.tenantId, agents.id],
+      name: "operator_transfer_reservations_tenant_agent_fk",
+    }).onDelete("cascade"),
+    railValid: check(
+      "operator_transfer_reservation_rail_chk",
+      sql`${table.rail} in ('withdraw', 'usd-send')`,
+    ),
+    amountIsUsdc: check(
+      "operator_transfer_reservation_amount_base_units_chk",
+      sql`${table.amountBaseUnits} ~ '^[0-9]+$'`,
+    ),
+    statusValid: check(
+      "operator_transfer_reservation_status_chk",
+      sql`${table.status} in ('pending', 'final', 'released')`,
+    ),
+    statusFinalizedShape: check(
+      "operator_transfer_reservation_status_finalized_chk",
+      sql`(${table.status} = 'pending' and ${table.finalizedAt} is null)
+          or (${table.status} in ('final', 'released') and ${table.finalizedAt} is not null)`,
+    ),
   }),
 );
 
@@ -949,7 +1095,7 @@ export const executionAuthorizationNonces = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     consumedAt: timestamp("consumed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-    // ─── PR4 (0082): provider execution authorization v2 extension ───────────
+    // ─── Migration 0082: provider execution authorization v2 extension ──────
     // version=1 rows are the legacy wallet/EVM nonce (all v2 fields null).
     // version=2 rows carry the full provider commitment binding + dispatch
     // state machine. Enforced by exec_auth_nonces_v2_arm_chk (raw SQL, 0082).
@@ -1051,10 +1197,10 @@ export const sponsoredGasEvents = pgTable(
   }),
 );
 
-// PR3 (0081): approval_queue is a discriminated union. The legacy transaction
-// arm (approval_kind='transaction') keeps tx_id + the original columns; the new
+// Migration 0081 makes approval_queue a discriminated union. The transaction
+// arm (approval_kind='transaction') keeps tx_id and its original columns; the
 // provider_action arm carries the exact-binding tuple. `tx_id` is now nullable
-// (arm CHECK re-requires it for transaction rows). Several PR3 invariants (the
+// (arm CHECK re-requires it for transaction rows). Several invariants (the
 // arm CHECK, the decision-shape CHECK, and the partial unique indexes) live in
 // 0081 raw SQL and are NOT visible to drizzle-kit.
 export const approvalQueue = pgTable(
@@ -1075,7 +1221,7 @@ export const approvalQueue = pgTable(
     resolvedBy: varchar("resolved_by", { length: 255 }),
     resolvedByType: varchar("resolved_by_type", { length: 32 }),
     resolvedById: varchar("resolved_by_id", { length: 255 }),
-    // ── PR3 provider-action arm (0081) ──
+    // ── Migration 0081 provider-action arm ──
     approvalKind: varchar("approval_kind", { length: 32 }).notNull().default("transaction"),
     intentId: varchar("intent_id", { length: 64 }),
     tenantId: varchar("tenant_id", { length: 64 }),
@@ -1095,8 +1241,8 @@ export const approvalQueue = pgTable(
     decisionRequestHash: varchar("decision_request_hash", { length: 71 }),
     consumedAt: timestamp("consumed_at", { withTimezone: true }),
     consumedBy: varchar("consumed_by", { length: 64 }),
-    // ── #205 M-of-N quorum arm (0083) ──
-    // NULL threshold => single-approver legacy path (byte-for-byte unchanged).
+    // ── Migration 0083 M-of-N quorum arm ──
+    // NULL threshold selects the byte-compatible single-approver path.
     // A non-NULL threshold flips the provider-action approval into flat N-of-M
     // quorum: `quorum_threshold` DISTINCT eligible approvals are required before
     // the queue can transition pending -> approved (execute-reachable). Nested
@@ -1112,12 +1258,18 @@ export const approvalQueue = pgTable(
   (table) => ({
     txIdUniqueIdx: uniqueIndex("approval_queue_tx_id_idx").on(table.txId),
     statusIdx: index("approval_queue_status_idx").on(table.status),
+    agentStatusRequestedIdx: index("approval_queue_agent_status_requested_idx").on(
+      table.agentId,
+      table.status,
+      table.requestedAt.desc(),
+      table.id.desc(),
+    ),
   }),
 );
 
 /**
- * #205 M-of-N quorum: one row per DISTINCT approver decision on a provider-action
- * approval. The single-approver legacy path never inserts here (it records its
+ * Migration 0083 M-of-N quorum: one row per distinct approver decision on a
+ * provider-action approval. The single-approver path never inserts here (it records its
  * lone decision on `approval_queue` directly). Every row binds the EXACT
  * request_hash / action_digest / approval_commitment_hash and the
  * `binding_revision_at_decision` the approval was cast against, so a dependency
@@ -1782,19 +1934,24 @@ export const secretRoutes = pgTable(
     injectAs: varchar("inject_as", { length: 50 }).notNull(),
     injectKey: varchar("inject_key", { length: 255 }).notNull(),
     injectFormat: varchar("inject_format", { length: 255 }).default("{value}"),
+    injectionStrategy: varchar("injection_strategy", { length: 32 }).notNull().default("header"),
+    injectionConfig: jsonb("injection_config")
+      .$type<{ service?: string; region?: string }>()
+      .notNull()
+      .default({}),
     priority: integer("priority").notNull().default(0),
     enabled: boolean("enabled").notNull().default(true),
     requiresApproval: boolean("requires_approval").notNull().default(false),
     approvalConfig: jsonb("approval_config").$type<Record<string, unknown>>().notNull().default({}),
-    // PR3 (0081, G1 adjudication): a route revision that a route/secret rotation
-    // increments. Bound by PR3's approval commitment so resume can detect route
+    // Migration 0081 route revision incremented by route or secret rotation.
+    // Bound by the approval commitment so resume can detect route
     // rotation. Maintained by the `secret_routes_bump_authority_revision`
-    // BEFORE UPDATE trigger (raw SQL only, not visible to drizzle-kit). PR4's
-    // 0082 adds authority_mode + provider_operation_id and extends the trigger.
+    // BEFORE UPDATE trigger (raw SQL only, not visible to drizzle-kit). Migration
+    // 0082 adds authority_mode and provider_operation_id and extends the trigger.
     authorityRevision: integer("authority_revision").notNull().default(1),
-    // PR4 (0082): governed cutover columns. authority_mode default 'legacy' means
-    // every existing route behaves exactly as today until explicitly enrolled
-    // (PR8). A governed route MUST name its provider_operation_id (raw-SQL CHECK
+    // Migration 0082 governed cutover columns. authority_mode defaults to
+    // 'legacy', so a route must be explicitly enrolled. A governed route must
+    // name its provider_operation_id (raw-SQL CHECK
     // secret_routes_governed_operation_chk); a legacy route MUST NOT.
     authorityMode: secretRouteAuthorityModeEnum("authority_mode").notNull().default("legacy"),
     providerOperationId: uuid("provider_operation_id"),
@@ -1809,7 +1966,7 @@ export const secretRoutes = pgTable(
   }),
 );
 
-// ─── Workspace-scoped provider authority (governed-provider plan PR1) ─────────
+// ─── Workspace-scoped provider authority (migration 0079) ────────────────────
 //
 // ⚠️ RAW-SQL-ONLY INVARIANTS (drift risk — NOT expressible in Drizzle, see
 //    drizzle/0079_workspace_provider_authority.sql):
@@ -1944,6 +2101,160 @@ export const providerAccounts = pgTable(
       "provider_accounts_credential_pair_check",
       sql`(${table.credentialSecretId} IS NULL) = (${table.credentialVersion} IS NULL)`,
     ),
+  }),
+);
+
+/**
+ * Durable hand-off journal for OAuth responses that cannot be replayed safely.
+ * Token material is never stored here: credentialSecretId points at a
+ * tenant-bound, encrypted vault row.  The journal lets recovery distinguish a
+ * request that has not called the provider from one whose one-time response
+ * must be adopted or revoked.
+ */
+export const providerGoogleCredentialLifecycles = pgTable(
+  "provider_google_credential_lifecycles",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    providerAccountId: uuid("provider_account_id"),
+    kind: varchar("kind", { length: 32 }).notNull(),
+    state: varchar("state", { length: 32 }).notNull(),
+    credentialSecretId: uuid("credential_secret_id"),
+    expectedAccountRevision: integer("expected_account_revision"),
+    attempts: integer("attempts").notNull().default(0),
+    lastErrorCode: varchar("last_error_code", { length: 64 }),
+    ...timestamps,
+  },
+  (table) => ({
+    workspaceFk: foreignKey({
+      columns: [table.tenantId, table.workspaceId],
+      foreignColumns: [workspaces.tenantId, workspaces.id],
+      name: "provider_google_lifecycle_workspace_fk",
+    }).onDelete("cascade"),
+    accountFk: foreignKey({
+      columns: [table.tenantId, table.workspaceId, table.providerAccountId],
+      foreignColumns: [
+        providerAccounts.tenantId,
+        providerAccounts.workspaceId,
+        providerAccounts.id,
+      ],
+      name: "provider_google_lifecycle_account_fk",
+    }).onDelete("cascade"),
+    secretFk: foreignKey({
+      columns: [table.tenantId, table.credentialSecretId],
+      foreignColumns: [secrets.tenantId, secrets.id],
+      name: "provider_google_lifecycle_secret_fk",
+    }).onDelete("restrict"),
+    stateCheck: check(
+      "provider_google_lifecycle_state_check",
+      sql`${table.state} IN ('inflight', 'credential_staged', 'revocation_pending', 'adopted', 'revoked', 'needs_attention', 'superseded')`,
+    ),
+    kindCheck: check(
+      "provider_google_lifecycle_kind_check",
+      sql`${table.kind} IN ('connect_exchange', 'refresh_rotation', 'disconnect_revoke')`,
+    ),
+    accountStateIdx: index("provider_google_lifecycle_account_state_idx").on(
+      table.tenantId,
+      table.providerAccountId,
+      table.state,
+    ),
+    activeRefreshIdx: uniqueIndex("provider_google_lifecycle_active_refresh_idx")
+      .on(table.tenantId, table.providerAccountId)
+      .where(
+        sql`${table.kind} = 'refresh_rotation' AND ${table.state} IN ('inflight', 'credential_staged')`,
+      ),
+  }),
+);
+
+/**
+ * Durable hand-off journal for X OAuth code exchange, refresh rotation, and
+ * disconnect cleanup. Provider responses and disconnect handles are encrypted
+ * before fallible work, then adopted or revoked through bounded recovery.
+ */
+export const providerXCredentialLifecycles = pgTable(
+  "provider_x_credential_lifecycles",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    providerAccountId: uuid("provider_account_id"),
+    kind: varchar("kind", { length: 32 }).notNull().default("refresh_rotation"),
+    state: varchar("state", { length: 32 }).notNull(),
+    credentialSecretId: uuid("credential_secret_id"),
+    expectedAccountRevision: integer("expected_account_revision"),
+    attempts: integer("attempts").notNull().default(0),
+    nextRetryAt: timestamp("next_retry_at", { withTimezone: true }),
+    lastErrorCode: varchar("last_error_code", { length: 64 }),
+    disabledRoutes: jsonb("disabled_routes")
+      .$type<Array<{ id: string; authorityRevision: number }>>()
+      .notNull()
+      .default([]),
+    ...timestamps,
+  },
+  (table) => ({
+    workspaceFk: foreignKey({
+      columns: [table.tenantId, table.workspaceId],
+      foreignColumns: [workspaces.tenantId, workspaces.id],
+      name: "provider_x_lifecycle_workspace_fk",
+    }).onDelete("cascade"),
+    accountFk: foreignKey({
+      columns: [table.tenantId, table.workspaceId, table.providerAccountId],
+      foreignColumns: [
+        providerAccounts.tenantId,
+        providerAccounts.workspaceId,
+        providerAccounts.id,
+      ],
+      name: "provider_x_lifecycle_account_fk",
+    }).onDelete("cascade"),
+    secretFk: foreignKey({
+      columns: [table.tenantId, table.credentialSecretId],
+      foreignColumns: [secrets.tenantId, secrets.id],
+      name: "provider_x_lifecycle_secret_fk",
+    }).onDelete("restrict"),
+    stateCheck: check(
+      "provider_x_lifecycle_state_check",
+      sql`${table.state} IN ('inflight', 'credential_staged', 'revocation_pending', 'adopted', 'revoked', 'needs_attention', 'superseded')`,
+    ),
+    kindCheck: check(
+      "provider_x_lifecycle_kind_check",
+      sql`${table.kind} IN ('connect_exchange', 'refresh_rotation', 'disconnect_revoke')`,
+    ),
+    revisionCheck: check(
+      "provider_x_lifecycle_revision_check",
+      sql`${table.expectedAccountRevision} IS NULL OR ${table.expectedAccountRevision} >= 1`,
+    ),
+    refreshBindingCheck: check(
+      "provider_x_lifecycle_refresh_binding_check",
+      sql`${table.kind} = 'connect_exchange' OR (${table.providerAccountId} IS NOT NULL AND ${table.expectedAccountRevision} IS NOT NULL)`,
+    ),
+    retryCheck: check(
+      "provider_x_lifecycle_retry_check",
+      sql`${table.attempts} >= 0 AND ${table.attempts} <= 5 AND (${table.state} <> 'revocation_pending' OR ${table.nextRetryAt} IS NOT NULL)`,
+    ),
+    disabledRoutesArrayCheck: check(
+      "provider_x_lifecycle_disabled_routes_array_check",
+      sql`jsonb_typeof(${table.disabledRoutes}) = 'array'`,
+    ),
+    secretStateCheck: check(
+      "provider_x_lifecycle_secret_state_check",
+      sql`(${table.state} = 'inflight' AND ${table.credentialSecretId} IS NULL) OR (${table.state} IN ('credential_staged', 'revocation_pending') AND ${table.credentialSecretId} IS NOT NULL) OR ${table.state} = 'needs_attention' OR (${table.state} IN ('adopted', 'revoked', 'superseded') AND ${table.credentialSecretId} IS NULL)`,
+    ),
+    accountStateIdx: index("provider_x_lifecycle_account_state_idx").on(
+      table.tenantId,
+      table.providerAccountId,
+      table.state,
+    ),
+    recoveryIdx: index("provider_x_lifecycle_recovery_idx").on(
+      table.state,
+      table.nextRetryAt,
+      table.updatedAt,
+    ),
+    activeRefreshIdx: uniqueIndex("provider_x_lifecycle_active_refresh_idx")
+      .on(table.tenantId, table.providerAccountId)
+      .where(
+        sql`${table.kind} = 'refresh_rotation' AND ${table.state} IN ('inflight', 'credential_staged', 'revocation_pending', 'needs_attention')`,
+      ),
   }),
 );
 
@@ -2112,11 +2423,13 @@ export const providerGrants = pgTable(
 
 export type Workspace = typeof workspaces.$inferSelect;
 export type ProviderAccount = typeof providerAccounts.$inferSelect;
+export type ProviderGoogleCredentialLifecycle =
+  typeof providerGoogleCredentialLifecycles.$inferSelect;
 export type ProviderOperation = typeof providerOperations.$inferSelect;
 export type ProviderRoleBinding = typeof providerRoleBindings.$inferSelect;
 export type ProviderGrant = typeof providerGrants.$inferSelect;
 
-// ─── Provider action bindings (PR2) ──────────────────────────────────────────
+// ─── Provider action bindings (migration 0080) ───────────────────────────────
 // The 1:1 typed companion to `intents` that carries the canonical provider
 // action, request envelope, and the two separate (access + policy) decision
 // documents with distinct IDs/hashes. `intents` stays the sole lifecycle root.
@@ -2127,7 +2440,7 @@ export type ProviderGrant = typeof providerGrants.$inferSelect;
 // access/policy/status state machine, byte-size bounds), and (c) the
 // `provider_action_bindings_immutable` BEFORE UPDATE trigger that freezes every
 // column except status/updated_at and allows only the
-// allowed_stub -> stub_succeeded|stub_failed transition in PR2.
+// allowed_stub -> stub_succeeded|stub_failed transition.
 export const providerActionBindings = pgTable(
   "provider_action_bindings",
   {
@@ -2167,7 +2480,7 @@ export const providerActionBindings = pgTable(
     policyDecision: jsonb("policy_decision").$type<Record<string, unknown>>(),
     policyDecisionHash: varchar("policy_decision_hash", { length: 71 }),
 
-    // #239: authoritative execute-time policy evidence. Unlike the approval-time
+    // Authoritative execute-time policy evidence. Unlike the approval-time
     // decision above, this snapshot is derived from current rules immediately
     // before approval consumption and authorization mint.
     executionPolicyDecisionId: uuid("execution_policy_decision_id"),
@@ -2179,11 +2492,11 @@ export const providerActionBindings = pgTable(
     // provider_action_bindings_execution_policy_ready_chk. It is intentionally
     // not modeled here because Drizzle cannot express NOT VALID: PostgreSQL
     // enforces it for every new execution_ready/executing row while tolerating
-    // historical in-flight executions whose outcome may already be unknown.
+    // existing in-flight executions whose outcome may already be unknown.
 
     status: varchar("status", { length: 32 }).notNull(),
-    // ── PR3 approval lifecycle columns (0081) ──
-    // Mutable only via the PR3 transition trigger; binding_revision increments by
+    // ── Migration 0081 approval lifecycle columns ──
+    // Mutable only via the transition trigger; binding_revision increments by
     // exactly one per state-changing transition. Several invariants (transition
     // graph, per-state field-shape CHECK, frozen-column freeze) live in 0081 raw
     // SQL and are not visible to drizzle-kit.
@@ -2208,11 +2521,8 @@ export const providerActionBindings = pgTable(
       foreignColumns: [intents.tenantId, intents.id],
       name: "provider_action_bindings_intent_fk",
     }).onDelete("cascade"),
-    actorFk: foreignKey({
-      columns: [table.tenantId, table.actorAgentId],
-      foreignColumns: [agents.tenantId, agents.id],
-      name: "provider_action_bindings_actor_fk",
-    }).onDelete("restrict"),
+    // Provider-action evidence outlives deleted agent authority. Migration
+    // 0110 replaces the actor FK with a writer/transition fence.
     workspaceFk: foreignKey({
       columns: [table.tenantId, table.workspaceId],
       foreignColumns: [workspaces.tenantId, workspaces.id],
@@ -2315,6 +2625,114 @@ export const providerAgentBudgets = pgTable(
 );
 
 export type ProviderAgentBudget = typeof providerAgentBudgets.$inferSelect;
+
+/**
+ * One-time, upstream-derived credential deliveries. The credential itself is
+ * deliberately absent: only its SHA-256 digest and the immutable authority
+ * binding survive the response boundary.
+ */
+export const upstreamCredentialLeases = pgTable(
+  "upstream_credential_leases",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    agentId: varchar("agent_id", { length: 64 }).notNull(),
+    grantId: uuid("grant_id").notNull(),
+    capabilityId: uuid("capability_id").notNull(),
+    issuer: varchar("issuer", { length: 64 }).notNull(),
+    resource: jsonb("resource").$type<Record<string, unknown>>().notNull(),
+    resourceHash: varchar("resource_hash", { length: 64 }).notNull(),
+    authorityDigest: varchar("authority_digest", { length: 64 }).notNull(),
+    idempotencyKeyHash: varchar("idempotency_key_hash", { length: 64 }).notNull(),
+    tokenHash: varchar("token_hash", { length: 64 }),
+    tokenCiphertext: text("token_ciphertext"),
+    tokenIv: text("token_iv"),
+    tokenAuthTag: text("token_auth_tag"),
+    tokenSalt: text("token_salt"),
+    status: varchar("status", { length: 24 }).notNull().default("issuing"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    authorityCheckedAt: timestamp("authority_checked_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    lastError: text("last_error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    // Lease evidence intentionally outlives deleted agent authority. A database
+    // trigger serializes new lease publication with agent deletion because an
+    // ordinary retention-blocking agent FK is deliberately absent.
+    // Lease evidence intentionally outlives deleted workspace authority. The
+    // 0110 workspace-row fence serializes publication with workspace deletion.
+    replayUnique: uniqueIndex("upstream_credential_leases_replay_uniq").on(
+      table.tenantId,
+      table.agentId,
+      table.idempotencyKeyHash,
+    ),
+    tenantIdUnique: uniqueIndex("upstream_credential_leases_tenant_id_uniq").on(
+      table.tenantId,
+      table.id,
+    ),
+    statusExpiryIdx: index("upstream_credential_leases_status_expiry_idx").on(
+      table.status,
+      table.expiresAt,
+    ),
+    statusUpdatedIdx: index("upstream_credential_leases_status_updated_idx").on(
+      table.status,
+      table.updatedAt,
+    ),
+    statusAuthorityCheckedIdx: index("upstream_credential_leases_status_authority_checked_idx").on(
+      table.status,
+      table.authorityCheckedAt,
+    ),
+    bindingIdx: index("upstream_credential_leases_binding_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.agentId,
+      table.grantId,
+    ),
+    statusCheck: check(
+      "upstream_credential_leases_status_check",
+      sql`${table.status} IN ('issuing','delivery_pending','acknowledging','active','revoking','revoked','expired','failed','needs_attention')`,
+    ),
+  }),
+);
+
+export type UpstreamCredentialLease = typeof upstreamCredentialLeases.$inferSelect;
+
+/** Durable, secret-free lifecycle evidence for upstream credential leases. */
+export const upstreamCredentialLeaseEvents = pgTable(
+  "upstream_credential_lease_events",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    leaseId: uuid("lease_id").notNull(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    action: varchar("action", { length: 64 }).notNull(),
+    decision: varchar("decision", { length: 16 }).notNull(),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    parentFk: foreignKey({
+      columns: [table.tenantId, table.leaseId],
+      foreignColumns: [upstreamCredentialLeases.tenantId, upstreamCredentialLeases.id],
+      name: "upstream_credential_lease_events_parent_fk",
+    }).onDelete("restrict"),
+    leaseCreatedIdx: index("upstream_credential_lease_events_lease_created_idx").on(
+      table.leaseId,
+      table.createdAt,
+    ),
+    tenantCreatedIdx: index("upstream_credential_lease_events_tenant_created_idx").on(
+      table.tenantId,
+      table.createdAt,
+    ),
+  }),
+);
+
+export type UpstreamCredentialLeaseEvent = typeof upstreamCredentialLeaseEvents.$inferSelect;
 
 /** Append-only reservation identities. Mutable reconciliation metadata is
  * isolated from the immutable generation payload and claimed with SKIP LOCKED. */

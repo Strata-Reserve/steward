@@ -4,20 +4,22 @@
  * (index.ts itself boots a server at module scope and cannot be imported by
  * tests).
  *
- * SEC-014: the limiter previously keyed on the LEFTMOST `x-forwarded-for`
- * value with no trusted-proxy validation, so a client could rotate a spoofed
- * XFF header per request for unlimited requests (and grow the in-memory log
- * unboundedly with unique values). Client-supplied forwarding headers are now
- * honored ONLY when the operator declares how many trusted proxy hops sit in
- * front of the server (`STEWARD_TRUSTED_PROXY_HOPS`):
+ * Client-supplied forwarding headers are honored only when the operator
+ * declares the trusted proxy-hop count (`STEWARD_TRUSTED_PROXY_HOPS`):
  *
  *   - each proxy appends the peer it observed, so with N trusted hops the real
  *     client is the entry N positions from the RIGHT of the XFF list — every
  *     entry to its left is attacker-controlled prefix and ignored;
  *   - with zero trusted hops (default) both forwarding headers are ignored and
  *     the socket peer is used;
- *   - when the chain is shorter than the configured trust, the leftmost
- *     (earliest trusted) entry is the best available signal.
+ *   - when the chain is shorter than the configured trust, no forwarded entry
+ *     is trustworthy; fall back to the socket peer instead of accepting a
+ *     client-supplied leftmost value.
+ *
+ * `X-Real-IP` is never consulted: it carries no chain semantics, so the hop
+ * count cannot be applied to it, and whenever XFF is absent/short a direct
+ * client can simply spoof it to rotate rate-limit identities. This matches the
+ * auth-route resolver (routes/auth.ts), which deliberately ignores it too.
  *
  * The log is also capped (`STEWARD_RATE_LIMIT_MAX_KEYS`): when full it sweeps
  * expired entries inline and then fails CLOSED (429) rather than letting the
@@ -25,6 +27,24 @@
  */
 
 export const DEFAULT_RATE_LIMIT_MAX_KEYS = 10_000;
+
+/**
+ * Key in the Hono `env` bag (app.fetch's second argument) through which a
+ * server entry point hands the app the socket peer it observed (Bun's
+ * `server.requestIP`). Unlike any request header, this value is set by the
+ * runtime and cannot be client-influenced, so downstream rate limiters may
+ * key on it when no trusted forwarding config exists (SEC-014 posture
+ * extended to the per-route auth limiter). Runtimes without a socket (e.g.
+ * Cloudflare Workers) simply never set it.
+ */
+export const SOCKET_PEER_ENV_KEY = "steward.socketPeer";
+
+/** Read the entry-injected socket peer from a Hono context's env bag. */
+export function socketPeerFromEnv(env: unknown): string | undefined {
+  if (typeof env !== "object" || env === null) return undefined;
+  const peer = (env as Record<string, unknown>)[SOCKET_PEER_ENV_KEY];
+  return typeof peer === "string" && peer.length > 0 ? peer : undefined;
+}
 
 export function parseNonNegativeInt(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
@@ -52,14 +72,12 @@ export function resolveClientIp(
         .split(",")
         .map((part) => part.trim())
         .filter(Boolean);
-      if (hops.length > 0) {
-        const clientIndex = Math.max(hops.length - trustedProxyHops, 0);
+      if (hops.length >= trustedProxyHops) {
+        const clientIndex = hops.length - trustedProxyHops;
         const derived = hops[clientIndex];
         if (derived) return derived;
       }
     }
-    const realIp = headers.get("x-real-ip")?.trim();
-    if (realIp) return realIp;
   }
   return peerAddress ?? "unknown";
 }

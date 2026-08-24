@@ -2,7 +2,7 @@ import { describe, expect, it, mock } from "bun:test";
 
 import { EmailAuth } from "../email";
 import type { EmailProvider } from "../email-provider";
-import type { StoreBackend } from "../store-backends";
+import type { StoreBackend, StorePublishEntry } from "../store-backends";
 import { TokenStore } from "../token-store";
 
 class CapturingBackend implements StoreBackend {
@@ -32,6 +32,35 @@ class CapturingBackend implements StoreBackend {
     const value = await this.get(key);
     this.values.delete(key);
     return value;
+  }
+
+  async transition(
+    key: string,
+    expected: string,
+    desired: string,
+    ttlMs: number,
+  ): Promise<boolean> {
+    const current = await this.get(key);
+    if (current !== expected && current !== desired) return false;
+    await this.set(key, desired, ttlMs);
+    return true;
+  }
+
+  async publish(entries: readonly StorePublishEntry[]): Promise<boolean> {
+    const now = Date.now();
+    const guarded = entries.filter((entry) => entry.expected !== undefined);
+    const states = guarded.map((entry) => {
+      const existing = this.values.get(entry.key);
+      const current = existing && now <= existing.expiresAt ? existing.value : null;
+      return { expected: current === entry.expected, desired: current === entry.value };
+    });
+    if (states.length > 0 && states.every((state) => state.desired)) return true;
+    if (states.some((state) => !state.expected)) return false;
+    for (const entry of entries) {
+      if (entry.value === null) this.values.delete(entry.key);
+      else this.values.set(entry.key, { value: entry.value, expiresAt: entry.expiresAt });
+    }
+    return true;
   }
 
   async delete(key: string): Promise<void> {
@@ -72,6 +101,44 @@ describe("EmailAuth.sendMagicLink", () => {
     expect(data.magicLink).toContain("email=user%40example.com");
 
     expect(sent).toHaveBeenCalledTimes(1);
+
+    auth.destroy();
+  });
+
+  it("passes the configured brand to magic-link and OTP renderers", async () => {
+    const sent = mock(async () => ({ provider: "test" }));
+    const templateRenderer = mock(() => ({
+      subject: "magic subject",
+      text: "magic text",
+      html: "<p>magic html</p>",
+    }));
+    const otpTemplateRenderer = mock(() => ({
+      subject: "otp subject",
+      text: "otp text",
+      html: "<p>otp html</p>",
+    }));
+    const auth = new EmailAuth({
+      from: "login@example.test",
+      baseUrl: "https://app.example.test",
+      callbackPath: "/auth/callback/email",
+      brandName: "Customer Cloud",
+      provider: { send: sent },
+      templateRenderer,
+      otpTemplateRenderer,
+    });
+
+    await auth.sendMagicLink("user@example.test", { tenantId: "customer" });
+    await auth.sendOtp("user@example.test", { tenantId: "customer" });
+
+    const [, magicData] = templateRenderer.mock.calls[0]!;
+    const [, otpData] = otpTemplateRenderer.mock.calls[0]!;
+    expect(magicData).toMatchObject({
+      tenantName: "Customer Cloud",
+    });
+    expect(magicData.magicLink).toContain("https://app.example.test/auth/callback/email?");
+    expect(otpData).toMatchObject({
+      brandName: "Customer Cloud",
+    });
 
     auth.destroy();
   });

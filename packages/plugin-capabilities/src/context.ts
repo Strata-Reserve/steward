@@ -46,6 +46,13 @@ export interface AgentTokenStatus {
   observedAt: number;
 }
 
+export interface SealedCredentialLeaseToken {
+  ciphertext: string;
+  iv: string;
+  tag: string;
+  salt: string;
+}
+
 /** a hono middleware over the steward app's per-request variables. */
 export type StewardMiddleware = (
   c: Context<{ Variables: AppVariables }>,
@@ -77,10 +84,36 @@ export interface StewardAppContext {
     tenantId: string,
     fn: (tx: unknown, appendRequiredAudit: AppendRequiredAudit) => Promise<T>,
   ): Promise<T>;
+  withCredentialLeaseDatabaseDeadline?<T>(
+    deadlineAt: number,
+    use: (
+      db: DbHandle,
+      auditedTransaction: StewardAppContext["withTenantAuditedTransaction"],
+    ) => Promise<T>,
+  ): Promise<T>;
   getAgentTokenStatus(agentId: string): Promise<AgentTokenStatus | null>;
 
   // ── redis (from @stwd/api middleware/redis) ───────────────────────────────
   getRedisClient(): IoredisLike | null;
+
+  /** Use-only access to an encrypted provider bootstrap credential. The
+   * plaintext exists only inside the callback and is never returned by an API. */
+  exerciseCredentialSecret?<T>(
+    tenantId: string,
+    secretId: string,
+    use: (plaintext: string) => Promise<T>,
+  ): Promise<T>;
+  sealCredentialLeaseToken?(
+    tenantId: string,
+    leaseId: string,
+    token: string,
+  ): Promise<SealedCredentialLeaseToken>;
+  exerciseCredentialLeaseToken?<T>(
+    tenantId: string,
+    leaseId: string,
+    sealed: SealedCredentialLeaseToken,
+    use: (token: string) => Promise<T>,
+  ): Promise<T>;
 
   // ── auth middleware the plugin installs on its own routes ─────────────────
   requireAgentJwt: StewardMiddleware;

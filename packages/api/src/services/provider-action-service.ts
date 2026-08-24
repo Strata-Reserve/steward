@@ -1,5 +1,5 @@
 /**
- * provider-action-service.ts — the PR2 provider-action authority pipeline.
+ * provider-action-service.ts — the provider-action authority pipeline.
  *
  * Given a verified provider principal + a validated GitHub action build, this
  * service runs the transactional authority pipeline (spec §6.4):
@@ -22,7 +22,7 @@
  * a reused key with any different binding is REPLAY_IDEMPOTENCY_CONFLICT (409).
  *
  * The service NEVER decrypts a credential, calls the proxy, mints execution
- * authorization, or performs network I/O. That is PR4.
+ * authorization, or performs network I/O. Execution and dispatch own those operations.
  */
 
 import { randomUUID } from "node:crypto";
@@ -51,13 +51,26 @@ import {
   type ProviderPolicyRule,
   windowedInvokeBucketKey,
 } from "@stwd/policy-engine";
+import { type AwsActionBuild, type AwsOperationKey, buildAwsAction } from "@stwd/provider-aws";
 import {
   buildGithubAction,
   type GithubActionBuild,
   type GithubOperationKey,
 } from "@stwd/provider-github";
+import {
+  buildGoogleAction,
+  type GoogleActionBuild,
+  type GoogleOperationKey,
+} from "@stwd/provider-google";
+import {
+  buildSlackAction,
+  type SlackActionBuild,
+  type SlackOperationKey,
+} from "@stwd/provider-slack";
 import { buildXAction, type XActionBuild, type XOperationKey } from "@stwd/provider-x";
 import {
+  AWS_PROVIDER_ACTION_PROFILE,
+  type AwsCanonicalActionV1,
   assertRegisteredProfile,
   CanonError,
   computeProviderPolicyInputDigest,
@@ -72,9 +85,12 @@ import {
   isGenericDescriptorError,
   jcsStringify,
   type ProviderRequestEnvelopeV1,
+  redactedThrownDiagnostics,
+  type SlackCanonicalActionV1,
   sha256HexPrefixed,
   UnregisteredProfileError,
   validateGenericHttpDescriptor,
+  verifyXSummonAttestation,
   type XCanonicalActionV1,
 } from "@stwd/shared";
 
@@ -92,10 +108,16 @@ import {
  * pipeline reads (action.profile/method/origin/path/query/headers/body,
  * policyArgs, safeSummary), so the pipeline consumes them uniformly.
  */
-export type ConcreteProviderActionBuild = GithubActionBuild | XActionBuild | GenericHttpActionBuild;
+export type ConcreteProviderActionBuild =
+  | AwsActionBuild
+  | GithubActionBuild
+  | SlackActionBuild
+  | GoogleActionBuild
+  | XActionBuild
+  | GenericHttpActionBuild;
 
 /**
- * #201: a DEFERRED build for a config-driven (generic-http) operation. The route
+ * A deferred build for a config-driven (generic-http) operation. The route
  * cannot canonicalize it because the operator-authored descriptor lives on the
  * resolved provider_operations row. The service finalizes it (loads + validates
  * the descriptor, then `buildGenericHttpAction`) immediately after scope
@@ -111,8 +133,11 @@ export interface DeferredGenericBuild {
 export type ProviderActionBuild = ConcreteProviderActionBuild | DeferredGenericBuild;
 /** The structurally-shared canonical action shape every adapter emits. */
 type AnyCanonicalActionV1 =
+  | AwsCanonicalActionV1
   | GithubCanonicalActionV1
+  | GoogleActionBuild["action"]
   | XCanonicalActionV1
+  | SlackCanonicalActionV1
   | GenericHttpCanonicalActionV1;
 
 function isDeferredGenericBuild(b: ProviderActionBuild): b is DeferredGenericBuild {
@@ -122,8 +147,9 @@ function isDeferredGenericBuild(b: ProviderActionBuild): b is DeferredGenericBui
 import {
   type CumulativeSpendScope,
   releaseCumulativeSpend,
+  releaseLegacyCumulativeSpendAfterCutover,
+  releaseLegacyWindowedInvokeAfterCutover,
   releaseWindowedInvoke,
-  reserveCumulativeSpend,
   reserveCumulativeSpendBatch,
   reserveWindowedInvoke,
   settleCumulativeSpend,
@@ -140,15 +166,36 @@ const POLICY_TYPE = "capability-intent" as const;
 /** Select an externally returned reason that agrees with the composed effect.
  * Rule order is not precedence: an approval rule listed before a failed hard
  * constraint must never make a hard denial look resumable. */
-function primaryPolicyDenialReason(doc: PersistedPolicyDecisionV1): string {
+function primaryPolicyDenialCode(reasonCodes: readonly string[]): string {
   return (
-    doc.reasonCodes.find((code) => code !== "APPROVAL_REQUIRED" && code !== "POLICY_ALLOW") ??
+    reasonCodes.find((code) => code !== "APPROVAL_REQUIRED" && code !== "POLICY_ALLOW") ??
     "POLICY_HARD_DENY"
   );
 }
 
+function primaryPolicyDenialReason(doc: PersistedPolicyDecisionV1): string {
+  return primaryPolicyDenialCode(doc.reasonCodes);
+}
+
 /**
- * A handle to an atomic cumulative-spend reservation (#206). #240 persists this
+ * Turn a stable creation identity into the provider-action id shape exposed by
+ * every public status/case/evidence route. UUIDv8 is the RFC 9562 custom UUID
+ * space: the digest supplies 122 collision-resistant bits while the version
+ * and variant nibbles keep the identifier compatible with the established
+ * `pa_<uuid>` contract. This preserves crash-stable Redis reservation members
+ * without creating an id that the public readers must reject.
+ */
+function stableProviderActionId(createIdentity: string): string {
+  const digest = sha256HexPrefixed(createIdentity).slice("sha256:".length);
+  const custom = `${digest.slice(0, 12)}8${digest.slice(13, 16)}${(
+    8 | (Number.parseInt(digest[16], 16) & 3)
+  ).toString(16)}${digest.slice(17, 32)}`;
+  const uuid = `${custom.slice(0, 8)}-${custom.slice(8, 12)}-${custom.slice(12, 16)}-${custom.slice(16, 20)}-${custom.slice(20, 32)}`;
+  return `pa_${uuid}`;
+}
+
+/**
+ * A handle to an atomic cumulative-spend reservation. The binding persists this
  * exact identity on the binding so a known outcome can be reconciled after a
  * process crash. On outcome_unknown the sweeper deliberately does NEITHER - the
  * reservation ages out at the window edge (fail closed for a money cap).
@@ -157,6 +204,7 @@ export interface CumulativeSpendReservationHandle {
   /** the spend-STREAM identity (scope+scopeKey+currency); NOT the cap threshold
    *  (cap edits must not orphan a reservation). */
   stream: {
+    tenantId?: string;
     agentId: string;
     scope: CumulativeSpendScope;
     scopeKey: string;
@@ -166,15 +214,18 @@ export interface CumulativeSpendReservationHandle {
   amount: number;
 }
 
-/** A handle to an atomic windowed-invoke (maxCalls) reservation (#206). */
+/** A handle to an atomic windowed-invoke (maxCalls) reservation. */
 export interface WindowedInvokeReservationHandle {
+  tenantId?: string;
   agentId: string;
   operationKey: string;
   reservationId: string;
 }
 
 export interface PersistedPolicyReservationHandlesV1 {
-  schemaVersion: "steward.provider-policy-reservations.v1";
+  schemaVersion:
+    | "steward.provider-policy-reservations.v1"
+    | "steward.provider-policy-reservations.v2";
   generation: number;
   phase: "decision" | "execution";
   cumulativeSpend: CumulativeSpendReservationHandle[];
@@ -185,6 +236,10 @@ type ReservationReconciliationTarget = "settled" | "released";
 
 let reservationReconciliationFaultForTests: "before_apply" | "after_apply" | null = null;
 let providerPolicyClockForTests: (() => Date) | null = null;
+let decisionReservationCrashForTests = false;
+let providerCreateAfterOptimisticReplayLookupForTests: (() => Promise<void>) | null = null;
+
+class SimulatedDecisionReservationCrash extends Error {}
 
 /** Test-only crash injection at the external-effect / DB-CAS boundary. */
 export function __setReservationReconciliationFaultForTests(
@@ -199,6 +254,20 @@ export function __setProviderPolicyClockForTests(clock: (() => Date) | null): vo
   providerPolicyClockForTests = clock;
 }
 
+/** Test-only ungraceful-death injection after Redis admission but before the
+ * create transaction can persist its intent/generation. */
+export function __setDecisionReservationCrashForTests(enabled: boolean): void {
+  decisionReservationCrashForTests = enabled;
+}
+
+/** Test-only barrier after the unlocked replay miss. This lets the real-Postgres
+ * suite deterministically put two requests on the production advisory-lock path. */
+export function __setProviderCreateAfterOptimisticReplayLookupForTests(
+  hook: (() => Promise<void>) | null,
+): void {
+  providerCreateAfterOptimisticReplayLookupForTests = hook;
+}
+
 function persistedReservationHandles(
   cumulativeSpend: CumulativeSpendReservationHandle[],
   windowedInvoke: WindowedInvokeReservationHandle | undefined,
@@ -207,7 +276,9 @@ function persistedReservationHandles(
 ): PersistedPolicyReservationHandlesV1 | null {
   if (cumulativeSpend.length === 0 && windowedInvoke === undefined) return null;
   return {
-    schemaVersion: "steward.provider-policy-reservations.v1",
+    // v2 makes the tenant namespace an immutable part of every Redis handle.
+    // The parser retains v1 so version-1 generations remain reconcilable.
+    schemaVersion: "steward.provider-policy-reservations.v2",
     generation,
     phase,
     cumulativeSpend,
@@ -217,10 +288,16 @@ function persistedReservationHandles(
 
 function parsePersistedReservationHandles(
   value: unknown,
+  expectedTenantId?: string,
 ): PersistedPolicyReservationHandlesV1 | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
-  if (v.schemaVersion !== "steward.provider-policy-reservations.v1") return null;
+  if (
+    v.schemaVersion !== "steward.provider-policy-reservations.v1" &&
+    v.schemaVersion !== "steward.provider-policy-reservations.v2"
+  )
+    return null;
+  const tenantBound = v.schemaVersion === "steward.provider-policy-reservations.v2";
   if (!Number.isSafeInteger(v.generation) || (v.generation as number) <= 0) return null;
   if (v.phase !== "decision" && v.phase !== "execution") return null;
   if (!Array.isArray(v.cumulativeSpend)) return null;
@@ -232,16 +309,25 @@ function parsePersistedReservationHandles(
     const stream = r.stream as Record<string, unknown>;
     if (
       typeof stream.agentId !== "string" ||
+      stream.agentId.length === 0 ||
+      (tenantBound && typeof stream.tenantId !== "string") ||
+      (tenantBound && (stream.tenantId as string).length === 0) ||
+      (tenantBound && expectedTenantId !== undefined && stream.tenantId !== expectedTenantId) ||
       !["operation", "agent", "grant"].includes(String(stream.scope)) ||
       typeof stream.scopeKey !== "string" ||
       typeof stream.currency !== "string" ||
+      stream.currency.length === 0 ||
       typeof r.reservationId !== "string" ||
+      r.reservationId.length === 0 ||
+      r.reservationId.length > 200 ||
+      r.reservationId.includes("|") ||
       !Number.isSafeInteger(r.amount) ||
       (r.amount as number) < 0
     )
       return null;
     cumulativeSpend.push({
       stream: {
+        ...(typeof stream.tenantId === "string" ? { tenantId: stream.tenantId } : {}),
         agentId: stream.agentId,
         scope: stream.scope as CumulativeSpendScope,
         scopeKey: stream.scopeKey,
@@ -261,12 +347,22 @@ function parsePersistedReservationHandles(
       return null;
     const r = v.windowedInvoke as Record<string, unknown>;
     if (
+      (r.tenantId !== undefined && typeof r.tenantId !== "string") ||
+      (tenantBound && typeof r.tenantId !== "string") ||
+      (tenantBound && (r.tenantId as string).length === 0) ||
+      (tenantBound && expectedTenantId !== undefined && r.tenantId !== expectedTenantId) ||
       typeof r.agentId !== "string" ||
+      r.agentId.length === 0 ||
       typeof r.operationKey !== "string" ||
-      typeof r.reservationId !== "string"
+      r.operationKey.length === 0 ||
+      typeof r.reservationId !== "string" ||
+      r.reservationId.length === 0 ||
+      r.reservationId.length > 200 ||
+      r.reservationId.includes("|")
     )
       return null;
     windowedInvoke = {
+      ...(typeof r.tenantId === "string" ? { tenantId: r.tenantId } : {}),
       agentId: r.agentId,
       operationKey: r.operationKey,
       reservationId: r.reservationId,
@@ -274,7 +370,7 @@ function parsePersistedReservationHandles(
   }
   if (cumulativeSpend.length === 0 && windowedInvoke === null) return null;
   return {
-    schemaVersion: "steward.provider-policy-reservations.v1",
+    schemaVersion: v.schemaVersion,
     generation: v.generation as number,
     phase: v.phase,
     cumulativeSpend,
@@ -312,6 +408,40 @@ function asRecord(value: unknown): Record<string, unknown> {
     throw new Error("canonical provider action must be an object");
   }
   return value as Record<string, unknown>;
+}
+
+/**
+ * SEC-182: lift signals the adapter actually DERIVES from canonical action
+ * content onto the composer's typed `ctx.x` channel. `summoned` is deliberately
+ * excluded: the current X adapter only validates the caller's boolean assertion
+ * and does not attest the referenced post, so presenting it as authoritative
+ * would let callers bypass summoned-only reply policy. Until an authenticated X
+ * lookup supplies that fact, summoned-only fails closed.
+ */
+function xPolicySignalsFrom(
+  args: Record<string, unknown>,
+  authenticatedSummoned = false,
+): {
+  isReply?: boolean;
+  summoned?: boolean;
+  hasUrl?: boolean;
+  textCodePointLength?: number;
+} {
+  return {
+    ...(typeof args.isReply === "boolean" ? { isReply: args.isReply } : {}),
+    // A negative assertion cannot grant authority, so it is safe to preserve
+    // the specific not-summoned deny. A positive assertion remains unavailable
+    // until independently attested.
+    ...(authenticatedSummoned
+      ? { summoned: true as const }
+      : args.summoned === false
+        ? { summoned: false as const }
+        : {}),
+    ...(typeof args.hasUrl === "boolean" ? { hasUrl: args.hasUrl } : {}),
+    ...(typeof args.textCodePointLength === "number" && Number.isInteger(args.textCodePointLength)
+      ? { textCodePointLength: args.textCodePointLength }
+      : {}),
+  };
 }
 
 function genericScalarFromCanonicalText(value: string, type: GenericSegmentType): unknown {
@@ -400,6 +530,19 @@ function rebuildApprovedAction(
     return rebuildGenericApprovedAction(operationKey, action, descriptor);
   }
   const body = action.canonicalBody === null ? undefined : asRecord(action.canonicalBody);
+  if (operationKey === "aws.ec2.DescribeInstances" || operationKey === "aws.ec2.StopInstances") {
+    const origin = new URL(String(action.origin));
+    const match = /^ec2\.([a-z]{2}(?:-[a-z0-9]+){1,3}-[1-9][0-9]?)\.amazonaws\.com$/.exec(
+      origin.hostname,
+    );
+    return buildAwsAction(operationKey as AwsOperationKey, {
+      region: match?.[1],
+      ...(body?.InstanceIds !== undefined ? { instanceIds: body.InstanceIds } : {}),
+      ...(body?.Force !== undefined ? { force: body.Force } : {}),
+      ...(body?.Hibernate !== undefined ? { hibernate: body.Hibernate } : {}),
+      ...(body?.DryRun !== undefined ? { dryRun: body.DryRun } : {}),
+    });
+  }
   if (operationKey === "x.tweet.create") {
     const reply = body?.reply === undefined ? undefined : asRecord(body.reply);
     return buildXAction(operationKey as XOperationKey, {
@@ -447,7 +590,91 @@ function rebuildApprovedAction(
       body: body?.body,
     });
   }
+  if (operationKey === "slack.chat.postMessage") {
+    return buildSlackAction(operationKey as SlackOperationKey, {
+      channel: body?.channel,
+      ...(body?.text !== undefined ? { text: body.text } : {}),
+      ...(body?.blocks !== undefined ? { blocks: body.blocks } : {}),
+      ...(body?.thread_ts !== undefined ? { thread_ts: body.thread_ts } : {}),
+    });
+  }
+  if (operationKey === "slack.conversations.list") {
+    const query = Array.isArray(action.orderedQueryPairs) ? action.orderedQueryPairs : [];
+    const q = new Map<string, unknown>();
+    for (const pair of query) {
+      if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === "string") {
+        q.set(pair[0], pair[1]);
+      }
+    }
+    return buildSlackAction(operationKey as SlackOperationKey, {
+      ...(q.has("types") ? { types: String(q.get("types")).split(",") } : {}),
+      ...(q.has("limit") ? { limit: Number(q.get("limit")) } : {}),
+      ...(q.has("cursor") ? { cursor: q.get("cursor") } : {}),
+    });
+  }
+  if (operationKey === "slack.users.info") {
+    const query = Array.isArray(action.orderedQueryPairs) ? action.orderedQueryPairs : [];
+    const user = query.find(
+      (pair) => Array.isArray(pair) && pair.length === 2 && pair[0] === "user",
+    )?.[1];
+    return buildSlackAction(operationKey as SlackOperationKey, { user });
+  }
+  if (operationKey === "google.gmail.messages.send") {
+    const raw = typeof body?.raw === "string" ? body.raw : "";
+    const padded = raw
+      .replace(/-/g, "+")
+      .replace(/_/g, "/")
+      .padEnd(Math.ceil(raw.length / 4) * 4, "=");
+    const message = Buffer.from(padded, "base64").toString("utf8");
+    const match =
+      /^To: ([^\r\n]+)\r\nSubject: ([^\r\n]+)\r\nContent-Type: text\/plain; charset=utf-8\r\nMIME-Version: 1\.0\r\n\r\n([\s\S]+)$/.exec(
+        message,
+      );
+    return buildGoogleAction(operationKey as GoogleOperationKey, {
+      to: match?.[1]?.split(", "),
+      subject: match?.[2],
+      body: match?.[3],
+    });
+  }
+  if (operationKey === "google.calendar.events.list") {
+    const query = Array.isArray(action.orderedQueryPairs) ? action.orderedQueryPairs : [];
+    const q = new Map<string, unknown>();
+    for (const pair of query) {
+      if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === "string") {
+        q.set(pair[0], pair[1]);
+      }
+    }
+    return buildGoogleAction(operationKey as GoogleOperationKey, {
+      ...(q.has("timeMin") ? { timeMin: q.get("timeMin") } : {}),
+      ...(q.has("timeMax") ? { timeMax: q.get("timeMax") } : {}),
+      ...(q.has("maxResults") ? { maxResults: Number(q.get("maxResults")) } : {}),
+      ...(q.has("pageToken") ? { pageToken: q.get("pageToken") } : {}),
+    });
+  }
+  if (operationKey === "google.calendar.events.insert") {
+    const start = body?.start === undefined ? undefined : asRecord(body.start);
+    const end = body?.end === undefined ? undefined : asRecord(body.end);
+    const attendees = Array.isArray(body?.attendees)
+      ? body.attendees.map((attendee) => asRecord(attendee).email)
+      : undefined;
+    return buildGoogleAction(operationKey as GoogleOperationKey, {
+      summary: body?.summary,
+      start: start?.dateTime,
+      end: end?.dateTime,
+      ...(attendees !== undefined ? { attendees } : {}),
+    });
+  }
   throw new Error(`unsupported provider operation '${operationKey}'`);
+}
+
+/** Test-only seam for approval-time adapter reconstruction invariants. */
+export function __rebuildApprovedActionForTests(
+  operationKey: string,
+  action: Record<string, unknown>,
+  safeSummary: Record<string, unknown>,
+  requestProfile: Record<string, unknown> = {},
+): ProviderActionBuild {
+  return rebuildApprovedAction(operationKey, action, safeSummary, requestProfile);
 }
 
 // ─── Public result envelope ───────────────────────────────────────────────────
@@ -528,15 +755,18 @@ export interface CreateProviderActionInput {
   nonce: string;
   /** Audit provenance (never authority). */
   requestId?: string | null;
+  /** Authenticated adapter provenance. Caller transport is untrusted; the
+   * service verifies its Ed25519 signature and exact scope before use. */
+  summonAttestation?: unknown;
 }
 
-// ─── The in-process executor stub (PR2 only — NEVER real dispatch) ─────────────
+// ─── In-process executor stub (never real dispatch) ───────────────────────────
 
 /**
- * The PR2 executor stub. It accepts ONLY a persisted intent id and reloads the
+ * The executor stub accepts only a persisted intent id and reloads the
  * immutable facts; it accepts no replacement action or identity. It performs no
  * credential decrypt and no network I/O. A successful stub call is NOT proof of
- * credential-bound enforcement (that is PR4).
+ * credential-bound enforcement.
  */
 export async function executeProviderActionStub(
   intentId: string,
@@ -747,7 +977,7 @@ class ProviderActionService {
     const { workspace, account, operation } = resolved;
     const environment = workspace.environment as PersistedAccessDecisionV1["environment"];
 
-    // ── #201: finalize a deferred generic-http build now that the operation
+    // Finalize a deferred generic-http build after resolving the operation
     // (and its operator-authored descriptor) is resolved. Fail closed on an
     // unregistered profile or an invalid descriptor with a stable CANON_* code
     // (mapped to a 400 deny by the route). The descriptor is loaded from the
@@ -765,7 +995,7 @@ class ProviderActionService {
       throw e;
     }
 
-    // #201 fail-closed consumption site: the canonical profile stamped on the
+    // Fail-closed consumption site: the canonical profile stamped on the
     // action MUST be registered before we digest/store/dispatch it. An
     // unregistered profile (e.g. a corrupted or forged build) is rejected here
     // with a stable code rather than persisted.
@@ -782,6 +1012,59 @@ class ProviderActionService {
         operation,
         build as GenericHttpActionBuild,
       );
+    } else if (build.action.profile === AWS_PROVIDER_ACTION_PROFILE) {
+      await this.assertAwsCredentialRouteBinding(
+        actorAgentId,
+        account,
+        operation,
+        build as AwsActionBuild,
+      );
+    }
+
+    // Caller-supplied `summoned: true` is never authority. Only a configured
+    // provider adapter's signed attestation can promote the signal. Freeze the
+    // verified record for resume/dispatch revalidation and bind its digest into
+    // the immutable request envelope.
+    let authenticatedXSummoned = false;
+    let xSummonAttestationDigest: string | undefined;
+    if (input.operationKey === "x.tweet.create") {
+      build = {
+        ...build,
+        safeSummary: { ...build.safeSummary, summoned: false },
+      } as ConcreteProviderActionBuild;
+    }
+    if (input.operationKey === "x.tweet.create" && input.summonAttestation !== undefined) {
+      const canonicalBody = asRecord(build.action.canonicalBody);
+      const reply = canonicalBody.reply === undefined ? undefined : asRecord(canonicalBody.reply);
+      const sourcePostId = reply?.in_reply_to_tweet_id;
+      if (typeof sourcePostId === "string") {
+        const verification = verifyXSummonAttestation(
+          input.summonAttestation,
+          {
+            audience: process.env.STEWARD_X_SUMMON_ATTESTATION_AUDIENCE ?? "",
+            tenantId,
+            workspaceId: input.workspaceId,
+            actorAgentId,
+            providerAccountId: account.id,
+            sourcePostId,
+            idempotencyKeyHash: input.idempotencyKeyHash,
+          },
+          process.env.STEWARD_X_SUMMON_ATTESTATION_PUBLIC_KEYS,
+          providerPolicyClockForTests?.() ?? new Date(),
+        );
+        if (verification.ok) {
+          authenticatedXSummoned = true;
+          xSummonAttestationDigest = verification.digest;
+          build = {
+            ...build,
+            safeSummary: {
+              ...build.safeSummary,
+              summoned: true,
+              xSummonAttestation: verification.attestation,
+            },
+          } as ConcreteProviderActionBuild;
+        }
+      }
     }
 
     // Compute the canonical action digest + request envelope/hash up-front (they
@@ -814,15 +1097,16 @@ class ProviderActionService {
       // policy inputs that authorized it. requestedAt/nonce differ per call, so
       // requestHash itself is not the replay key. New bindings persist the
       // policy-input digest inside their immutable, request-hash-bound envelope.
-      // Legacy envelopes have no such member and retain the historical
-      // action-only replay behavior; this is a bounded compatibility path for
-      // pre-rollout rows, never used by a newly-created binding.
-      const persistedPolicyInputDigest = (priorBinding.requestEnvelope as Record<string, unknown>)
-        .policyInputDigest;
+      // Version-1 envelopes have no such member and retain action-only replay
+      // behavior; newly created bindings always include the digest.
+      const persistedEnvelope = priorBinding.requestEnvelope as Record<string, unknown>;
+      const persistedPolicyInputDigest = persistedEnvelope.policyInputDigest;
+      const persistedXSummonAttestationDigest = persistedEnvelope.xSummonAttestationDigest;
       if (
         priorBinding.actionDigest !== actionDigest ||
         (persistedPolicyInputDigest !== undefined &&
-          persistedPolicyInputDigest !== policyInputDigest)
+          persistedPolicyInputDigest !== policyInputDigest) ||
+        persistedXSummonAttestationDigest !== xSummonAttestationDigest
       ) {
         return {
           kind: "replay_conflict",
@@ -833,7 +1117,22 @@ class ProviderActionService {
       return await this.outcomeFromBinding(priorBinding);
     }
 
-    const intentId = `pa_${randomUUID()}`;
+    await providerCreateAfterOptimisticReplayLookupForTests?.();
+
+    // Reservation identity must survive a process death after Redis admission
+    // but before PostgreSQL commit. Derive the intent from the already-scoped
+    // idempotency identity; the transaction advisory lock below serializes
+    // concurrent copies, while an actual crash releases the lock and lets the
+    // retry reuse (rather than double-debit) each stable Redis member.
+    const createIdentity = jcsStringify({
+      domain: "steward.provider-action-create.v2",
+      tenantId,
+      workspaceId: input.workspaceId,
+      actorAgentId,
+      operationId: operation.id,
+      idempotencyKeyHash: input.idempotencyKeyHash,
+    });
+    const intentId = stableProviderActionId(createIdentity);
 
     // ── Step 2: single transaction — reload the account + operation, evaluate
     // access + policy against that fresh tx snapshot, and persist intent + binding
@@ -845,11 +1144,12 @@ class ProviderActionService {
     // Outer-scope handles the tx fills so the post-commit branching can read them.
     let access!: { effect: "allow" | "deny"; doc: PersistedAccessDecisionV1 };
     let policy: PolicyResult | null = null;
-    // #206: hoisted so the catch/drain-failure paths can reclaim reservations
+    // Hoisted so catch and drain-failure paths can reclaim reservations
     // even where TS narrows `policy` to never inside the tx-callback flow.
     let cumulativeSpendReservations: CumulativeSpendReservationHandle[] = [];
     let windowedInvokeReservation: WindowedInvokeReservationHandle | undefined;
     let requestHash = "";
+    let transactionReplay: typeof providerActionBindings.$inferSelect | null = null;
     const effects: {
       access: "allow" | "deny";
       policy: "not_evaluated" | "hard_deny" | "approval_required" | "allow";
@@ -858,6 +1158,34 @@ class ProviderActionService {
 
     try {
       await this.db().transaction(async (tx) => {
+        // PGLite is a single-connection test harness and has no advisory-lock
+        // function. Production Postgres must serialize this identity before the
+        // locked replay check below.
+        if (process.env.STEWARD_PGLITE_MEMORY !== "true") {
+          await tx.execute(
+            sql`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-action-create:${createIdentity}`}, 0))`,
+          );
+        }
+        // The optimistic lookup above may race another replica. Re-read only
+        // after taking the identity lock; if the other request committed, this
+        // invocation is a replay and must not touch Redis at all.
+        const [lockedPrior] = await tx
+          .select()
+          .from(providerActionBindings)
+          .where(
+            and(
+              eq(providerActionBindings.tenantId, tenantId),
+              eq(providerActionBindings.workspaceId, input.workspaceId),
+              eq(providerActionBindings.actorAgentId, actorAgentId),
+              eq(providerActionBindings.operationId, operation.id),
+              eq(providerActionBindings.idempotencyKeyHash, input.idempotencyKeyHash),
+            ),
+          )
+          .limit(1);
+        if (lockedPrior) {
+          transactionReplay = lockedPrior;
+          return;
+        }
         // Reload the account + operation by identity INSIDE the tx so access,
         // policy, and the persisted operation revision all read the SAME snapshot.
         // If either was concurrently deleted, the tx-scoped scope is gone: deny as
@@ -898,6 +1226,7 @@ class ProviderActionService {
           operationRevision: txOperation.revision,
           actionDigest,
           policyInputDigest,
+          xSummonAttestationDigest,
         });
         requestHash = sha256HexPrefixed(jcsStringify(this.envelopeObject(envelope)));
 
@@ -930,10 +1259,19 @@ class ProviderActionService {
                 // scope resolves to "" and the composer fails closed if a rule
                 // aggregates over grant without one.
                 grantId: access.doc.matchedGrantIds[0] ?? null,
+                authenticatedXSummoned,
               })
             : null;
         cumulativeSpendReservations = policy?.cumulativeSpendReservations ?? [];
         windowedInvokeReservation = policy?.windowedInvokeReservation;
+        if (
+          decisionReservationCrashForTests &&
+          (cumulativeSpendReservations.length > 0 || windowedInvokeReservation !== undefined)
+        ) {
+          throw new SimulatedDecisionReservationCrash(
+            "simulated process death after Redis reserve",
+          );
+        }
 
         effects.access = access.effect;
         effects.policy =
@@ -967,9 +1305,9 @@ class ProviderActionService {
           expiresAt: new Date(input.expiresAt),
         });
 
-        // PR3 (§6.3): for the approval-required arm, build the exact approval
+        // For the approval-required arm (§6.3), build the exact approval
         // commitment + queue row inside THIS create transaction (AFTER the intent
-        // insert the queue FK references). A missing PR1 execution dependency
+        // insert the queue FK references). A missing execution dependency
         // (route/credential) throws ApprovalArmError => creation fails closed.
         let approvalQueueId: string | null = null;
         let approvalCommitmentHash: string | null = null;
@@ -994,7 +1332,7 @@ class ProviderActionService {
             policyRevisionHash: (policy as PolicyResult).doc.policyRevisionHash,
             evaluatorVersion: EVALUATOR_VERSION,
             requesterSeparation: extractRequesterSeparation(txOperation.requestProfile),
-            // #205: read + fail-closed-validate the quorum config from the same
+            // Read and fail-closed-validate the quorum config from the same
             // request-profile source. A malformed quorum throws ApprovalArmError
             // (creation fails closed); absent quorum => single-approver path.
             quorum: extractQuorumConfig(txOperation.requestProfile),
@@ -1060,8 +1398,8 @@ class ProviderActionService {
         }
 
         // Required audit intent -> transactional outbox (drained post-commit).
-        // PR5 C1: correlated lifecycle events set resource_type='provider_action'
-        // and resource_id=intents.id (not the operation id) so PR5 can correlate
+        // Correlated lifecycle events set resource_type='provider_action' and
+        // resource_id=intents.id (not the operation id) so case assembly can correlate
         // online by the lifecycle root.
         await tx.insert(providerActionAuditOutbox).values({
           tenantId,
@@ -1075,13 +1413,14 @@ class ProviderActionService {
           resourceType: "provider_action",
           resourceId: intentId,
           metadata: {
-            // PR5 C1: metadata.intentId is the offline-authoritative correlation
+            // metadata.intentId is the offline-authoritative correlation
             // key (inside the signed eventsDigest).
             intentId,
             actorAgentId,
             operationKey: input.operationKey,
             actionDigest,
             requestHash,
+            xSummonAttestationDigest: xSummonAttestationDigest ?? null,
             accessDecisionId,
             accessDecisionHash,
             accessEffect: effects.access,
@@ -1117,18 +1456,20 @@ class ProviderActionService {
         }
       });
     } catch (e) {
-      // #206: the decision transaction failed to persist, so the action WILL NOT
+      // The decision transaction failed to persist, so the action will not
       // execute (the stub is never reached). Reclaim any cumulative-spend
       // reservations taken during eval so a persistence failure does not leak
       // budget. This is a KNOWN non-execution (distinct from the stub-threw
       // outcome_unknown), so release is correct + fail-closed on the deny side.
-      await this.finalizeCumulativeSpend(cumulativeSpendReservations, "failure");
-      await this.finalizeWindowedInvoke(windowedInvokeReservation, "failure");
-      // A missing PR1 execution dependency (route/credential) fails approval
+      if (!(e instanceof SimulatedDecisionReservationCrash)) {
+        await this.finalizeCumulativeSpend(cumulativeSpendReservations, "failure");
+        await this.finalizeWindowedInvoke(windowedInvokeReservation, "failure");
+      }
+      // A missing execution dependency (route or credential) fails approval
       // creation CLOSED (spec §5.2) — surfaced as an evidence failure so no
       // partial approval arm is ever visible.
       if (e instanceof ApprovalArmError) {
-        // A malformed #205 quorum config fails creation CLOSED at store time
+        // A malformed quorum config fails creation closed at store time
         // (spec §7) and surfaces its specific code so the misconfig is
         // observable; a missing execution dependency (route/credential) uses
         // the generic evidence-failure code (spec §5.2). No partial approval
@@ -1155,10 +1496,30 @@ class ProviderActionService {
       };
     }
 
+    if (transactionReplay) {
+      const replay = transactionReplay as typeof providerActionBindings.$inferSelect;
+      const persistedEnvelope = replay.requestEnvelope as Record<string, unknown>;
+      const persistedPolicyInputDigest = persistedEnvelope.policyInputDigest;
+      const persistedXSummonAttestationDigest = persistedEnvelope.xSummonAttestationDigest;
+      if (
+        replay.actionDigest !== actionDigest ||
+        (persistedPolicyInputDigest !== undefined &&
+          persistedPolicyInputDigest !== policyInputDigest) ||
+        persistedXSummonAttestationDigest !== xSummonAttestationDigest
+      ) {
+        return {
+          kind: "replay_conflict",
+          code: "REPLAY_IDEMPOTENCY_CONFLICT",
+          httpStatus: 409,
+        };
+      }
+      return await this.outcomeFromBinding(replay);
+    }
+
     // ── Step 3: drain the required-audit outbox before the stub can run. ──
     const drained = await this.drainAuditOutbox(tenantId, intentId).catch(() => false);
     if (!drained) {
-      // #206 (codex P1): the binding ALREADY committed. If its status is an
+      // The binding has already committed. If its status is an
       // allow-committed `allowed_stub`, a later idempotent replay WILL execute it
       // via outcomeFromBinding WITHOUT re-evaluating or re-reserving. Releasing
       // the reservations here would then let that replay bypass the spend/count
@@ -1194,7 +1555,7 @@ class ProviderActionService {
       };
     }
     if (effects.policy === "hard_deny") {
-      // #206: reclaim any cumulative-spend reservations this decision holds. A
+      // Reclaim any cumulative-spend reservations this decision holds. A
       // spend-cap breach already released its own reservations during eval; this
       // covers a deny for a DIFFERENT reason where a cumulativeSpend rule had
       // passed and reserved - the action will not execute, so free its budget.
@@ -1211,25 +1572,9 @@ class ProviderActionService {
       };
     }
     if (effects.policy === "approval_required") {
-      // #206 KNOWN LIMITATION (codex P1, honest gap): a cumulativeSpend / maxCalls
-      // cap combined with an approval rule is NOT enforced across the approval
-      // lifecycle by THIS lane. The action does not execute now (it awaits a human
-      // decision + a separate execute path in provider-approval.ts, which is
-      // OUTSIDE this lane's scope fence and does NOT re-run evaluatePolicy or
-      // re-reserve). Two imperfect create-time choices exist, neither correct
-      // without touching the approval-execute path:
-      //   - KEEP the reservation: it is pinned to DECISION time and ages out at
-      //     the window edge, so an approval executed near/after that edge is
-      //     UNDER-counted (allow-side error).
-      //   - RELEASE the reservation: the queued action consumes no budget, and
-      //     the execute path re-reserves nothing, so the cap is not enforced on
-      //     the approval path AT ALL.
-      // We RELEASE here so an action that is ultimately rejected/expired never
-      // holds phantom budget that would wrongly DENY unrelated invokes
-      // (over-enforcement of the immediate plane is the worse day-to-day failure).
-      // Correct enforcement requires the approval-execute path to re-reserve at
-      // EXECUTION time; that is a documented follow-up filed against the approval
-      // plane (provider-approval.ts). See the PR honest-gaps section.
+      // A queued action has not executed, so release its decision-time budget.
+      // provider-approval re-evaluates policy and reserves against authoritative
+      // execution-time aggregates before a resumed action can run.
       await this.reconcilePolicyReservations(tenantId, intentId);
       return {
         kind: "approval_required",
@@ -1246,7 +1591,7 @@ class ProviderActionService {
     try {
       stub = await executeProviderActionStub(intentId);
     } catch {
-      // #206: OUTCOME_UNKNOWN. The stub threw AFTER we admitted + reserved; we
+      // OUTCOME_UNKNOWN: the stub threw after admission and reservation; we
       // cannot prove the action did or did not spend. Deliberately DO NOT release
       // the spend OR the maxCalls reservation - both age out at the window edge.
       // Fail closed: never free a slot/budget that may have really been consumed
@@ -1288,7 +1633,7 @@ class ProviderActionService {
           ),
         );
     });
-    // #240: status is the durable outcome source. Reconcile only AFTER the
+    // Status is the durable outcome source. Reconcile only after the
     // terminal transition so a crash at any instruction boundary is retryable.
     await this.reconcilePolicyReservations(tenantId, intentId);
 
@@ -1304,7 +1649,7 @@ class ProviderActionService {
   }
 
   /**
-   * #201: finalize a deferred generic-http build against the resolved
+   * Finalize a deferred generic-http build against the resolved
    * operation's operator-authored descriptor. The descriptor is read from
    * `requestProfile.operationDescriptor`, STRICTLY validated
    * (`validateGenericHttpDescriptor`, fail-closed), and the caller-supplied
@@ -1374,6 +1719,49 @@ class ProviderActionService {
       throw new CanonError(
         "CANON_ORIGIN_NOT_ALLOWED",
         "generic action is outside its exact governed credential route binding",
+      );
+    }
+  }
+
+  private async assertAwsCredentialRouteBinding(
+    actorAgentId: string,
+    account: typeof providerAccounts.$inferSelect,
+    operation: typeof providerOperations.$inferSelect,
+    build: AwsActionBuild,
+  ): Promise<void> {
+    if (!operation.secretRouteId || !account.credentialSecretId) {
+      throw new CanonError("CANON_ORIGIN_NOT_ALLOWED", "AWS operation has no credential route");
+    }
+    const [route] = await this.db()
+      .select()
+      .from(secretRoutes)
+      .where(
+        and(
+          eq(secretRoutes.id, operation.secretRouteId),
+          eq(secretRoutes.tenantId, operation.tenantId),
+        ),
+      )
+      .limit(1);
+    const targetHost = new URL(build.action.origin).hostname;
+    const config = route?.injectionConfig as { service?: unknown; region?: unknown } | undefined;
+    if (
+      !route ||
+      !route.enabled ||
+      route.authorityMode !== "governed_v2" ||
+      route.providerOperationId !== operation.id ||
+      route.secretId !== account.credentialSecretId ||
+      route.agentId !== actorAgentId ||
+      route.injectionStrategy !== "sigv4" ||
+      config?.service !== "ec2" ||
+      typeof config.region !== "string" ||
+      route.hostPattern !== targetHost ||
+      targetHost !== `ec2.${config.region}.amazonaws.com` ||
+      route.pathPattern !== "/" ||
+      route.method?.toUpperCase() !== "POST"
+    ) {
+      throw new CanonError(
+        "CANON_ORIGIN_NOT_ALLOWED",
+        "AWS action is outside its exact governed SigV4 route binding",
       );
     }
   }
@@ -1586,7 +1974,7 @@ class ProviderActionService {
   }
 
   /**
-   * #206: atomically reserve this invoke's spend for every governing
+   * Atomically reserve this invoke's spend for every governing
    * cumulativeSpend rule, and return the per-scope prior sums to feed the policy
    * composer.
    *
@@ -1607,6 +1995,7 @@ class ProviderActionService {
    * invoke never leaks budget.
    */
   private async reserveCumulativeSpendForInvoke(input: {
+    tenantId: string;
     rules: ProviderPolicyRule[];
     intentId: string;
     operationKey: string;
@@ -1643,7 +2032,7 @@ class ProviderActionService {
 
     // Compute the bucket key (scope+window+max+currency) the COMPOSER reads for a
     // given cap, and the STREAM key (scope+scopeKey+currency) the Redis reservation
-    // uses (codex P1: history keyed by stream, not cap threshold).
+    // uses; history is keyed by stream, not cap threshold.
     const scopeKeyOf = (scope: "operation" | "agent" | "grant") =>
       scope === "operation" ? input.operationKey : scope === "grant" ? (input.grantId ?? "") : "";
     const bucketKeyOf = (g: (typeof governing)[number]) =>
@@ -1665,7 +2054,7 @@ class ProviderActionService {
       return { contextSums: sums, reservations: [] };
     }
 
-    // FAIL CLOSED on a grant-scoped cap with NO grant identity (codex P1): access
+    // Fail closed on a grant-scoped cap with no grant identity: access
     // can be allowed via a role binding with an empty matchedGrantIds, in which
     // case a `grant`-scoped rule has no grant to scope to. Reserving against a
     // shared empty scopeKey would let unrelated agents share one fake bucket and
@@ -1687,12 +2076,13 @@ class ProviderActionService {
     // GROUP caps by STREAM (scope+scopeKey+currency). A single invoke governed by
     // several caps on the same stream (e.g. a 1h AND a 24h cap, or two rules) is
     // reserved ONCE against that stream with ALL its caps checked atomically (the
-    // invoke is counted once, never double-counted; codex P2). priorSums come back
+    // invoke is counted once, never double-counted). priorSums come back
     // per cap in the order supplied, which we map to each cap's bucket key.
     const streams = new Map<
       string,
       {
         stream: {
+          tenantId: string;
           agentId: string;
           scope: "operation" | "agent" | "grant";
           scopeKey: string;
@@ -1708,6 +2098,7 @@ class ProviderActionService {
       if (!entry) {
         entry = {
           stream: {
+            tenantId: input.tenantId,
             agentId: input.agentId,
             scope: g.aggregateOver,
             scopeKey,
@@ -1724,66 +2115,45 @@ class ProviderActionService {
       }
     }
 
-    let anyDeny = false;
-    for (const { stream, caps } of streams.values()) {
-      let reserved: Awaited<ReturnType<typeof reserveCumulativeSpend>>;
-      try {
-        reserved = await reserveCumulativeSpend({
+    const entries = [...streams.values()];
+    let reserved: Awaited<ReturnType<typeof reserveCumulativeSpendBatch>>;
+    try {
+      reserved = await reserveCumulativeSpendBatch({
+        groups: entries.map(({ stream, caps }) => ({
           stream,
           caps: caps.map((c) => ({ windowSeconds: c.windowSeconds, max: c.max })),
           amount: thisSpend,
           reservationId: sha256HexPrefixed(
             jcsStringify({
-              domain: "steward.provider-reservation.v1",
+              domain: "steward.provider-reservation.v2",
+              tenantId: input.tenantId,
               intentId: input.intentId,
               generation: input.reservationGeneration,
               kind: "cumulativeSpend",
               stream,
             }),
           ),
-        });
-      } catch {
-        // Redis/parse failure => deny for every cap on this stream (missing
-        // signal). Feed cap+1 so the composer denies with CAP_EXCEEDED.
-        for (const c of caps) sums[c.bucketKey] = c.max + 1;
-        anyDeny = true;
-        continue;
-      }
-      // Map each cap's prior sum back to its bucket key.
-      caps.forEach((c, i) => {
-        sums[c.bucketKey] = reserved.priorSums[i] ?? c.max + 1;
+        })),
+      });
+    } catch {
+      // Redis/parse failure is a hard missing signal for every applicable cap.
+      for (const { caps } of entries) for (const cap of caps) sums[cap.bucketKey] = cap.max + 1;
+      return { contextSums: sums, reservations: [] };
+    }
+    entries.forEach(({ stream, caps }, groupIndex) => {
+      caps.forEach((cap, capIndex) => {
+        const prior = reserved.priorSums[groupIndex]?.[capIndex] ?? cap.max + 1;
+        sums[cap.bucketKey] = !reserved.ok && prior + thisSpend > cap.max ? cap.max + 1 : prior;
       });
       if (reserved.ok) {
         reservations.push({
           stream,
-          reservationId: reserved.reservationId as string,
+          reservationId: reserved.reservationIds?.[groupIndex] as string,
           amount: thisSpend,
         });
-      } else {
-        // Rejected: at least one cap on this stream breached. Force those buckets
-        // over their cap so the composer denies.
-        caps.forEach((c, i) => {
-          const prior = reserved.priorSums[i] ?? c.max + 1;
-          if (prior + thisSpend > c.max) sums[c.bucketKey] = c.max + 1;
-        });
-        anyDeny = true;
       }
-    }
-
-    // If ANY stream denied, release the reservations we DID take so a denied
-    // invoke never leaks budget.
-    if (anyDeny && reservations.length > 0) {
-      await Promise.all(
-        reservations.map((r) =>
-          releaseCumulativeSpend({
-            stream: r.stream,
-            reservationId: r.reservationId,
-            amount: r.amount,
-          }).catch(() => undefined),
-        ),
-      );
-      return { contextSums: sums, reservations: [] };
-    }
+    });
+    if (!reserved.ok) return { contextSums: sums, reservations: [] };
 
     return { contextSums: sums, reservations };
   }
@@ -1825,6 +2195,7 @@ class ProviderActionService {
     if (!reservation) return;
     if (outcome === "success") return; // keep the slot counted for its windows
     await releaseWindowedInvoke({
+      ...(reservation.tenantId ? { tenantId: reservation.tenantId } : {}),
       agentId: reservation.agentId,
       operationKey: reservation.operationKey,
       reservationId: reservation.reservationId,
@@ -1958,6 +2329,7 @@ class ProviderActionService {
       if (!group) {
         group = {
           stream: {
+            tenantId: input.tenantId,
             agentId: input.agentId,
             scope: "agent",
             scopeKey: `budget:${scope}:${row.dimension}`,
@@ -1975,63 +2347,39 @@ class ProviderActionService {
     const results: AgentBudgetResult[] = [];
     const exhausted: AgentBudgetResult[] = [];
     let unavailable = false;
-    const grouped = [...groups.entries()];
-    if (grouped.length === 0) {
-      return { reservations, results, exhausted, unavailable, autoFreeze: false, snapshots };
-    }
-    let reserved: Awaited<ReturnType<typeof reserveCumulativeSpendBatch>>;
+    const entries = [...groups.entries()];
+    let reserved: Awaited<ReturnType<typeof reserveCumulativeSpendBatch>> | null = null;
     try {
-      reserved = await reserveCumulativeSpendBatch(
-        grouped.map(([groupKey, group]) => ({
-          stream: group.stream,
-          caps: group.budgets.map((budget) => ({
-            windowSeconds: budget.windowSeconds,
-            max: budget.max,
+      if (entries.length > 0)
+        reserved = await reserveCumulativeSpendBatch({
+          groups: entries.map(([groupKey, group]) => ({
+            stream: { ...group.stream, tenantId: input.tenantId },
+            caps: group.budgets.map((budget) => ({
+              windowSeconds: budget.windowSeconds,
+              max: budget.max,
+            })),
+            amount: group.amount,
+            reservationId: sha256HexPrefixed(
+              jcsStringify({
+                domain: "steward.provider-agent-budget.v2",
+                tenantId: input.tenantId,
+                intentId: input.intentId,
+                generation: input.generation,
+                groupKey,
+              }),
+            ),
           })),
-          amount: group.amount,
-          reservationId: sha256HexPrefixed(
-            jcsStringify({
-              domain: "steward.provider-agent-budget.v1",
-              intentId: input.intentId,
-              generation: input.generation,
-              groupKey,
-            }),
-          ),
-        })),
-      );
+        });
     } catch {
       unavailable = true;
-      for (const [, group] of grouped) {
-        for (const budget of group.budgets) {
-          results.push({
-            budgetId: budget.id,
-            revision: budget.revision,
-            dimension: budget.dimension as "count" | "notional",
-            workspaceId: budget.workspaceId,
-            windowSeconds: budget.windowSeconds,
-            max: budget.max,
-            currency: budget.currency,
-            amount: group.amount,
-            outcome: "unavailable",
-            prior: null,
-          });
-        }
-      }
-      return {
-        reservations,
-        results,
-        exhausted,
-        unavailable,
-        autoFreeze: false,
-        snapshots,
-      };
     }
-    grouped.forEach(([, group], groupIndex) => {
-      const groupPriors = reserved.priorSums[groupIndex] ?? [];
+    entries.forEach(([groupKey, group], groupIndex) => {
       group.budgets.forEach((budget, index) => {
-        const prior = groupPriors[index];
+        const prior = reserved?.priorSums[groupIndex]?.[index];
         const breached =
-          !reserved.ok && (typeof prior !== "number" || prior + group.amount > budget.max);
+          reserved !== null &&
+          !reserved.ok &&
+          (typeof prior !== "number" || prior + group.amount > budget.max);
         const result: AgentBudgetResult = {
           budgetId: budget.id,
           revision: budget.revision,
@@ -2041,16 +2389,24 @@ class ProviderActionService {
           max: budget.max,
           currency: budget.currency,
           amount: group.amount,
-          outcome: breached ? "exhausted" : "pass",
+          outcome: unavailable ? "unavailable" : breached ? "exhausted" : "pass",
           prior: typeof prior === "number" ? prior : null,
         };
         results.push(result);
         if (breached) exhausted.push(result);
       });
-      if (reserved.ok) {
+      if (reserved?.ok) {
         reservations.push({
-          stream: group.stream,
-          reservationId: reserved.reservationIds?.[groupIndex] as string,
+          stream: { ...group.stream, tenantId: input.tenantId },
+          reservationId: sha256HexPrefixed(
+            jcsStringify({
+              domain: "steward.provider-agent-budget.v2",
+              tenantId: input.tenantId,
+              intentId: input.intentId,
+              generation: input.generation,
+              groupKey,
+            }),
+          ),
           amount: group.amount,
         });
       }
@@ -2081,6 +2437,8 @@ class ProviderActionService {
     /** Append-only reservation generation. Stable identities derived from this
      * make an approval retry idempotent across the Redis-before-PG crash gap. */
     reservationGeneration?: number;
+    /** Verified independently at this evaluation boundary. */
+    authenticatedXSummoned?: boolean;
   }): Promise<{
     doc: PersistedPolicyDecisionV1;
     evaluation: ProviderPolicyEvaluationV1;
@@ -2100,7 +2458,7 @@ class ProviderActionService {
     const { operation, build } = args;
 
     // The capability-intent rules that govern this operation come from the
-    // operation's request profile. PR2 reads the enabled capability-intent rules
+    // operation's request profile. The service reads enabled capability-intent rules
     // declared on the provider operation's request_profile.policyRules; absent =>
     // no governing rules (default deny).
     const rules = extractCapabilityIntentRules(operation.requestProfile);
@@ -2111,7 +2469,7 @@ class ProviderActionService {
     // policyText, so this is undefined and any content-pattern rule fails closed.
     const policyText = "policyText" in build ? build.policyText : undefined;
 
-    // -- #206: cumulative-spend aggregate wiring + atomic reservation. --
+    // Cumulative-spend aggregate wiring and atomic reservation.
     // Resolve the operation's declared spend field/currency and, for each
     // governing cumulativeSpend rule, ATOMICALLY reserve this invoke's spend
     // against the trailing-window cap. The reservation is the authoritative,
@@ -2140,19 +2498,30 @@ class ProviderActionService {
     let windowedInvokeReservation: WindowedInvokeReservationHandle | undefined;
     try {
       if (agentBudgets.autoFreeze) {
+        const autoFreezeBudgetId = agentBudgets.exhausted
+          .filter((result) =>
+            agentBudgets.snapshots.some(
+              (snapshot) => snapshot.id === result.budgetId && snapshot.autoFreeze === true,
+            ),
+          )
+          .map((result) => result.budgetId)
+          .sort()[0];
         await (args.db ?? this.db())
           .insert(vaultSigningFreezes)
           .values({
             tenantId: args.tenantId,
             scopeType: "agent",
             agentId: args.actorAgentId,
-            reason: "provider agent budget exhausted",
+            reason: autoFreezeBudgetId
+              ? `provider agent budget exhausted; budgetId=${autoFreezeBudgetId}`
+              : "provider agent budget exhausted",
             createdByType: "system",
             createdById: "provider-budget-enforcer",
           })
           .onConflictDoNothing();
       }
       cumulative = await this.reserveCumulativeSpendForInvoke({
+        tenantId: args.tenantId,
         rules,
         intentId: args.intentId,
         operationKey: operation.operationKey,
@@ -2162,19 +2531,18 @@ class ProviderActionService {
         policyArgs: build.policyArgs,
         reservationGeneration: args.reservationGeneration ?? 1,
       });
-
-      // #206 configurable count cap (maxCalls + callWindow): ATOMICALLY reserve one
+      // For a configurable count cap (maxCalls and callWindow), atomically reserve one
       // invoke slot against the trailing-window count so concurrent invokes cannot
-      // collectively exceed maxCalls (single-winner, like the spend path; codex P2).
+      // collectively exceed maxCalls (single-winner, like the spend path).
       // The reserved priorCount is fed to the composer so its check agrees; a
       // REJECTED reservation feeds a count AT the cap so the composer denies. Absent
       // reservation (no governing maxCalls rule, or a Redis failure) leaves
       // windowedInvokeCount undefined => a maxCalls rule fails closed
       // (POLICY_INPUT_UNAVAILABLE). The slot is settled (kept) on a known-success
       // allow and released on any deny/failure below.
-      // #206 configurable count caps: ATOMICALLY reserve ONE invoke slot against
+      // Atomically reserve one invoke slot against
       // ALL count windows at once (a single invoke is counted ONCE across an hourly
-      // AND a daily cap; codex P2). Each window's count is fed to the composer keyed
+      // and a daily cap). Each window's count is fed to the composer keyed
       // by its own bucket. A rejection on ANY window denies (no slot taken); a
       // Redis failure feeds every cap AT its max so the composer fails closed.
       const govMaxCalls = extractGoverningMaxCalls(rules, operation.operationKey);
@@ -2183,6 +2551,7 @@ class ProviderActionService {
         const counts: Record<string, number> = {};
         windowedInvokeCounts = counts;
         const wr = await reserveWindowedInvoke({
+          tenantId: args.tenantId,
           agentId: args.actorAgentId,
           operationKey: operation.operationKey,
           caps: govMaxCalls.map((c) => ({ windowSeconds: c.windowSeconds, max: c.max })),
@@ -2209,6 +2578,7 @@ class ProviderActionService {
         });
         if (wr.ok && wr.reservationId !== undefined) {
           windowedInvokeReservation = {
+            tenantId: args.tenantId,
             agentId: args.actorAgentId,
             operationKey: operation.operationKey,
             reservationId: wr.reservationId,
@@ -2228,14 +2598,14 @@ class ProviderActionService {
         host: hostFromOrigin(build.action.origin),
         path: build.action.normalizedPath,
         evaluatedAt: decidedAt,
-        // Trailing-hour count is not wired in PR2; rules that require it will
+        // The generic trailing-hour count is unavailable; rules that require it
         // fail closed (POLICY_INPUT_UNAVAILABLE) exactly as specified.
         invokeCount1h: undefined,
-        // #206 configurable count caps: per-cap trailing-window counts (undefined
+        // Per-cap trailing-window counts (undefined
         // when unwired => a maxCalls rule fails closed).
         ...(windowedInvokeCounts !== undefined ? { windowedInvokeCounts } : {}),
         ...(policyText !== undefined ? { policyText } : {}),
-        // #206 cumulative-spend aggregate + declaration. spendDeclaration absent =>
+        // Cumulative-spend aggregate and declaration. spendDeclaration absent means
         // a cumulativeSpend rule fails closed (NO_SPEND_FIELD). cumulativeSpend
         // carries the reserved priorSum per scope; absent scope => fail closed
         // (INPUT_UNAVAILABLE). See reserveCumulativeSpendForInvoke.
@@ -2244,13 +2614,17 @@ class ProviderActionService {
           ? { cumulativeSpend: cumulative.contextSums }
           : {}),
         // Permissioned-X authoritative inputs (post count / accumulated spend /
-        // now-minute) are NOT wired into the service in Phase 1 — exactly the same
-        // posture as invokeCount1h above. A permissioned-X rule that REQUIRES one
+        // now-minute) are not supplied by this service, matching invokeCount1h.
+        // A permissioned-X rule that requires one
         // of these inputs (maxPostsPerWindow / spendPolicy / quietHours) therefore
         // fails closed (POLICY_INPUT_UNAVAILABLE) until the trailing-window
         // accumulator lands. Content/reply/URL rules need no external input and are
         // fully live now.
-        x: undefined,
+        // SEC-182: only adapter-DERIVED content signals are wired. The caller's
+        // `summoned` assertion is intentionally not promoted to this trusted
+        // channel; a summoned-only rule denies until an authenticated adapter
+        // attestation is available.
+        x: xPolicySignalsFrom(build.policyArgs, args.authenticatedXSummoned === true),
       };
 
       const ruleEvaluation = composeProviderActionPolicyDecision(rules, context);
@@ -2367,8 +2741,10 @@ class ProviderActionService {
     actionDigest: string;
     canonicalActionBytes: Uint8Array;
     safeSummary: Record<string, unknown>;
+    expectedXSummonAttestationDigest: unknown;
     matchedGrantIds: string[];
     priorGeneration: number;
+    idempotencyKeyHash: string;
   }): Promise<
     | {
         ok: true;
@@ -2403,6 +2779,51 @@ class ProviderActionService {
       return { ok: false, code: "APPROVAL_ACTION_INTEGRITY_FAILED", httpStatus: 409 };
     }
 
+    // Re-verify the frozen provider attestation at safe-resume and bind it to
+    // the digest captured in the immutable request envelope. A signature that
+    // expired during human approval, a rotated/removed adapter key, or any
+    // substitution must fail before an approval is consumed, even when the
+    // current policy would no longer require summoned-only provenance.
+    let authenticatedXSummoned = false;
+    if (args.operation.operationKey === "x.tweet.create") {
+      const canonicalBody = asRecord(build.action.canonicalBody);
+      const reply = canonicalBody.reply === undefined ? undefined : asRecord(canonicalBody.reply);
+      const sourcePostId = reply?.in_reply_to_tweet_id;
+      const persistedAttestation = args.safeSummary.xSummonAttestation;
+      const expectedDigest = args.expectedXSummonAttestationDigest;
+      if (persistedAttestation !== undefined || expectedDigest !== undefined) {
+        if (
+          typeof sourcePostId !== "string" ||
+          persistedAttestation === undefined ||
+          typeof expectedDigest !== "string" ||
+          !/^sha256:[0-9a-f]{64}$/.test(expectedDigest)
+        ) {
+          return { ok: false, code: "APPROVAL_SUMMON_ATTESTATION_INVALID", httpStatus: 409 };
+        }
+        const verification = verifyXSummonAttestation(
+          persistedAttestation,
+          {
+            audience: process.env.STEWARD_X_SUMMON_ATTESTATION_AUDIENCE ?? "",
+            tenantId: args.tenantId,
+            workspaceId: args.workspaceId,
+            actorAgentId: args.actorAgentId,
+            providerAccountId: args.operation.providerAccountId,
+            sourcePostId,
+            idempotencyKeyHash: args.idempotencyKeyHash,
+          },
+          process.env.STEWARD_X_SUMMON_ATTESTATION_PUBLIC_KEYS,
+          providerPolicyClockForTests?.() ?? new Date(),
+        );
+        if (!verification.ok) {
+          return { ok: false, code: "APPROVAL_SUMMON_ATTESTATION_INVALID", httpStatus: 409 };
+        }
+        if (verification.digest !== expectedDigest) {
+          return { ok: false, code: "APPROVAL_ACTION_INTEGRITY_FAILED", httpStatus: 409 };
+        }
+        authenticatedXSummoned = true;
+      }
+    }
+
     const policy = await this.evaluatePolicy({
       db: args.db,
       tenantId: args.tenantId,
@@ -2415,6 +2836,7 @@ class ProviderActionService {
       actionDigest: args.actionDigest,
       grantId: args.matchedGrantIds[0] ?? null,
       reservationGeneration: generation,
+      authenticatedXSummoned,
     });
     if (policy.doc.effect === "hard_deny") {
       await this.releasePolicyReservationHandles(
@@ -2424,6 +2846,7 @@ class ProviderActionService {
           generation,
           "execution",
         ),
+        args.tenantId,
       );
       const code = primaryPolicyDenialReason(policy.doc);
       return {
@@ -2450,11 +2873,11 @@ class ProviderActionService {
     };
   }
 
-  async releasePolicyReservationHandles(handles: unknown): Promise<void> {
+  async releasePolicyReservationHandles(handles: unknown, expectedTenantId: string): Promise<void> {
     if (handles === null) return;
-    const parsed = parsePersistedReservationHandles(handles);
+    const parsed = parsePersistedReservationHandles(handles, expectedTenantId);
     if (!parsed) throw new Error("invalid persisted policy reservation handles");
-    await this.applyPersistedReservationHandles(parsed, "released");
+    await this.applyPersistedReservationHandles(parsed, "released", expectedTenantId);
   }
 
   /**
@@ -2467,9 +2890,11 @@ class ProviderActionService {
    * This sweeper drains every undelivered outbox row for the tenant (optionally
    * scoped to one intent). It is safe to run repeatedly and concurrently: the
    * drain marks `delivered_at` per row after the signed append, and
-   * `writeAuditEvent` is itself per-tenant serialized, so a signed event is
-   * produced EXACTLY ONCE per outbox row. Call it opportunistically (any read
-   * path) and/or from a periodic job; a killed drain is always recoverable.
+   * `writeAuditEvent` is itself process-locally serialized, so repeated drains
+   * in one process avoid duplicate signed events. Cross-replica recovery is
+   * best effort because the audit lookup and append are not one unique DB
+   * transaction. Call it opportunistically (any read path) and/or from a
+   * periodic job; an undelivered row remains recoverable.
    *
    * Returns the number of rows delivered in this pass.
    */
@@ -2488,14 +2913,13 @@ class ProviderActionService {
       );
     let delivered = 0;
     for (const row of rows) {
-      // Crash-safe exactly-once (codex P1). The SOURCE OF TRUTH for "is this
+      // Process-local idempotent recovery. The source of truth for "is this
       // event signed?" is the audit chain itself, keyed by the deterministic
       // correlation (tenant, resource_id=intentId, action). `delivered_at` is
       // only an optimization. We serialize the whole check+sign+mark per tenant
       // (same queue writeAuditEvent uses) so two in-process sweeps cannot both
-      // sign, and if a prior sweep crashed AFTER signing but BEFORE marking, this
-      // sweep observes the existing signed event and just marks the row — never
-      // a duplicate, never a permanently-unsigned intent.
+      // sign. A cross-replica race can still duplicate the signed event because
+      // the audit table has no matching unique constraint.
       const signedNow = await withTenantAuditQueue(row.tenantId, async () => {
         const existing = await this.db().execute(
           sql`SELECT 1 FROM audit_events
@@ -2535,7 +2959,7 @@ class ProviderActionService {
         .returning({ id: providerActionAuditOutbox.id });
       if (marked.length > 0 && signedNow) delivered += 1;
     }
-    // #240 extends the same C2 pass to durable policy reservations. Audit and
+    // The same recovery pass covers durable policy reservations. Audit and
     // reservation recovery are independently idempotent; a Redis outage leaves
     // the reservation pending and fail-closed for the next sweep.
     await this.reconcilePolicyReservations(tenantId, intentId);
@@ -2591,7 +3015,7 @@ class ProviderActionService {
         .from(providerActionBindings)
         .where(eq(providerActionBindings.intentId, row.intentId))
         .limit(1);
-      const handles = parsePersistedReservationHandles(row.handles);
+      const handles = parsePersistedReservationHandles(row.handles, row.tenantId);
       if (!handles || handles.generation !== row.generation || handles.phase !== row.phase) {
         const message = "malformed immutable reservation generation";
         await this.recordReservationFailure(row, claimId, message, true);
@@ -2599,7 +3023,10 @@ class ProviderActionService {
         // Draining is best effort here; a signer outage cannot erase the durable
         // attention row or outbox event and normal C2 recovery will retry it.
         await this.recoverUnsignedIntents(row.tenantId, row.intentId).catch((error) =>
-          console.error("[provider-reservations] malformed-generation audit drain failed:", error),
+          console.error(
+            "[provider-reservations] malformed-generation audit drain failed",
+            redactedThrownDiagnostics(error),
+          ),
         );
         continue;
       }
@@ -2619,14 +3046,15 @@ class ProviderActionService {
       try {
         if (reservationReconciliationFaultForTests === "before_apply")
           throw new Error("injected crash before reservation reconciliation");
-        await this.applyPersistedReservationHandles(handles, target);
+        await this.applyPersistedReservationHandles(handles, target, row.tenantId);
         if (reservationReconciliationFaultForTests === "after_apply")
           throw new Error("injected crash after reservation reconciliation");
       } catch (error) {
-        const message = (error instanceof Error ? error.message : String(error)).slice(0, 1000);
-        await this.recordReservationFailure(row, claimId, message, false);
+        const failure = "reservation reconciliation failed";
+        await this.recordReservationFailure(row, claimId, failure, false);
         console.error(
-          `[provider-reservations] reconciliation failed intent=${row.intentId} generation=${handles.generation}: ${message}`,
+          `[provider-reservations] reconciliation failed intent=${row.intentId} generation=${handles.generation}`,
+          redactedThrownDiagnostics(error),
         );
         continue;
       }
@@ -2711,28 +3139,46 @@ class ProviderActionService {
   private async applyPersistedReservationHandles(
     handles: PersistedPolicyReservationHandlesV1,
     target: ReservationReconciliationTarget,
+    generationTenantId?: string,
   ): Promise<void> {
     await Promise.all(
       handles.cumulativeSpend.map((r) =>
         target === "settled"
           ? settleCumulativeSpend({ stream: r.stream, reservationId: r.reservationId })
-          : releaseCumulativeSpend({
-              stream: r.stream,
-              reservationId: r.reservationId,
-              amount: r.amount,
-            }),
+          : handles.schemaVersion === "steward.provider-policy-reservations.v1" &&
+              !r.stream.tenantId &&
+              generationTenantId
+            ? releaseLegacyCumulativeSpendAfterCutover({
+                stream: { ...r.stream, tenantId: generationTenantId },
+                reservationId: r.reservationId,
+                amount: r.amount,
+              })
+            : releaseCumulativeSpend({
+                stream: r.stream,
+                reservationId: r.reservationId,
+                amount: r.amount,
+              }),
       ),
     );
     if (target === "released" && handles.windowedInvoke) {
-      await releaseWindowedInvoke(handles.windowedInvoke);
+      await (handles.schemaVersion === "steward.provider-policy-reservations.v1" &&
+      !handles.windowedInvoke.tenantId &&
+      generationTenantId
+        ? releaseLegacyWindowedInvokeAfterCutover({
+            tenantId: generationTenantId,
+            agentId: handles.windowedInvoke.agentId,
+            operationKey: handles.windowedInvoke.operationKey,
+            reservationId: handles.windowedInvoke.reservationId,
+          })
+        : releaseWindowedInvoke(handles.windowedInvoke));
     }
   }
 
   // ── Required-audit outbox drain (post-commit, pre-stub) ──
   private async drainAuditOutbox(tenantId: string, intentId: string): Promise<boolean> {
     // Delegate to the CAS-guarded recovery path so the inline drain and the
-    // crash-recovery sweeper share exactly-once semantics (spec §7.3). Any signer
-    // failure propagates (caller maps it to EVIDENCE_REQUIRED_AUDIT_UNAVAILABLE).
+    // crash-recovery sweeper share the same process-local idempotency path. Any
+    // signer failure propagates (caller maps it to EVIDENCE_REQUIRED_AUDIT_UNAVAILABLE).
     await this.recoverUnsignedIntents(tenantId, intentId);
     return true;
   }
@@ -2780,6 +3226,7 @@ class ProviderActionService {
       operationRevision: number;
       actionDigest: string;
       policyInputDigest: string;
+      xSummonAttestationDigest?: string;
     },
   ): ProviderRequestEnvelopeV1 {
     return {
@@ -2792,6 +3239,9 @@ class ProviderActionService {
       operationRevision: ids.operationRevision,
       actionDigest: ids.actionDigest,
       policyInputDigest: ids.policyInputDigest,
+      ...(ids.xSummonAttestationDigest !== undefined
+        ? { xSummonAttestationDigest: ids.xSummonAttestationDigest }
+        : {}),
       idempotencyKeyHash: input.idempotencyKeyHash,
       requestedAt: input.requestedAt,
       expiresAt: input.expiresAt,
@@ -2815,6 +3265,8 @@ class ProviderActionService {
       nonce: e.nonce,
     };
     if (e.policyInputDigest !== undefined) envelope.policyInputDigest = e.policyInputDigest;
+    if (e.xSummonAttestationDigest !== undefined)
+      envelope.xSummonAttestationDigest = e.xSummonAttestationDigest;
     return envelope;
   }
 
@@ -2834,7 +3286,7 @@ class ProviderActionService {
           requestHash: b.requestHash,
           actionDigest: b.actionDigest,
         };
-      const code = b.policyReasonCodes[0] ?? "POLICY_HARD_DENY";
+      const code = primaryPolicyDenialCode(b.policyReasonCodes);
       return {
         kind: "policy_denied",
         code,
@@ -2844,7 +3296,7 @@ class ProviderActionService {
         actionDigest: b.actionDigest,
       };
     }
-    // Approval-required lineage (PR3). A create-replay of a governed provider
+    // Approval-required lineage. A create replay of a governed provider
     // action must NEVER report POLICY_ALLOW/stub_succeeded (that would fabricate
     // an allow for an action that requires a human decision). The agent's create
     // contract is 202 APPROVAL_REQUIRED regardless of where the out-of-band
@@ -2999,7 +3451,7 @@ function extractCapabilityIntentRules(
 }
 
 /**
- * Extract the operation's DECLARED spend field (#206). The OPERATION - not the
+ * Extract the operation's declared spend field. The operation, not the
  * caller - declares which validated `policyArgs` field carries the per-invoke
  * spend amount and its currency, via
  * `request_profile.spendDeclaration: { field: string, currency: string }`.
@@ -3120,7 +3572,7 @@ function extractGoverningMaxCalls(
       continue;
     }
     // Each DISTINCT (window, max) is an independent count cap with its own count
-    // (codex P2). Dedupe identical caps.
+    // Dedupe identical caps.
     const key = `${windowSeconds}:${c.maxCalls}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -3166,12 +3618,9 @@ function parseIso8601DurationSecondsForApi(input: unknown): number | null {
 }
 
 /**
- * Extract the operation's requester-separation requirement (spec I10). PR1 does
- * not yet ship a structured approval-requirements field, so PR3 reads it from
- * `request_profile.approvalRequirements.requesterSeparation` when present
- * (forward-compatible) and defaults to false. Documented deviation: when PR1
- * lands a first-class approval-requirements field the commitment builder should
- * read that instead.
+ * Extract the operation's requester-separation requirement (spec I10) from
+ * `request_profile.approvalRequirements.requesterSeparation`. An absent value
+ * defaults to false.
  */
 export function extractRequesterSeparation(requestProfile: Record<string, unknown>): boolean {
   const reqs = (requestProfile as { approvalRequirements?: unknown }).approvalRequirements;
@@ -3180,8 +3629,8 @@ export function extractRequesterSeparation(requestProfile: Record<string, unknow
 }
 
 /**
- * Extract + FAIL-CLOSED-validate the operation's #205 quorum config from
- * `request_profile.approvalRequirements.quorum`, the same forward-compatible
+ * Extract and fail-closed-validate the operation's quorum config from
+ * `request_profile.approvalRequirements.quorum`, the same authoritative
  * source as {@link extractRequesterSeparation}. Returns:
  *   - `undefined` when no quorum is configured => single-approver legacy path.
  *   - `{ threshold, eligibleApproverUserIds }` when a well-formed quorum is set.

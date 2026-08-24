@@ -28,6 +28,7 @@ let handlePendingProxyRequest: typeof import("../handlers/release")["handlePendi
 let holdProxyApprovalRequest: typeof import("../handlers/approvals")["holdProxyApprovalRequest"];
 let setReleaseClaimBarrier: typeof import("../handlers/release")["__setReleaseClaimBarrierForTests"];
 let resetReleaseClaimBarrier: typeof import("../handlers/release")["__resetReleaseClaimBarrierForTests"];
+let setPendingProxyExecution: typeof import("../handlers/release")["__setPendingProxyExecutionForTests"];
 let setForwardProxyRequest: typeof import("../handlers/proxy")["__setForwardProxyRequestForTests"];
 let proxyMod: typeof import("../handlers/proxy");
 
@@ -58,6 +59,10 @@ beforeAll(async () => {
   process.env.STEWARD_PROXY_ALLOWED_HOSTS = "api.example.com";
   process.env.STEWARD_SECRET_ROUTE_ALLOWED_HOSTS = "api.example.com";
   process.env.STEWARD_ALLOW_BROAD_SECRET_ROUTES = "true";
+  // This suite exercises approval lifecycle state transitions rather than the
+  // independently covered signed-request contract. Opt into the explicit
+  // non-production proxy mode so mounted polls reach the lifecycle handler.
+  process.env.STEWARD_PROXY_DEV_MODE = "true";
 
   const { db, client } = await createPGLiteDb("memory://");
   setPGLiteOverride(db, async () => {
@@ -69,6 +74,7 @@ beforeAll(async () => {
     handlePendingProxyRequest,
     __setReleaseClaimBarrierForTests: setReleaseClaimBarrier,
     __resetReleaseClaimBarrierForTests: resetReleaseClaimBarrier,
+    __setPendingProxyExecutionForTests: setPendingProxyExecution,
   } = await import("../handlers/release"));
   ({ holdProxyApprovalRequest } = await import("../handlers/approvals"));
   proxyMod = await import("../handlers/proxy");
@@ -87,6 +93,7 @@ beforeAll(async () => {
 afterEach(() => {
   // Never let a barrier stub leak between tests.
   resetReleaseClaimBarrier();
+  setPendingProxyExecution(null);
   executions = 0;
 });
 
@@ -99,11 +106,23 @@ afterAll(async () => {
   delete process.env.STEWARD_PROXY_ALLOWED_HOSTS;
   delete process.env.STEWARD_SECRET_ROUTE_ALLOWED_HOSTS;
   delete process.env.STEWARD_ALLOW_BROAD_SECRET_ROUTES;
+  delete process.env.STEWARD_PROXY_DEV_MODE;
 });
 
 function buildApp() {
   const app = new Hono();
   app.use("*", authMiddleware);
+  app.get("/approvals/proxy/:id", handlePendingProxyRequest);
+  return app;
+}
+
+function buildReleaseHandlerApp(tenantId: string, agentId: string) {
+  const app = new Hono();
+  app.use("*", async (c, next) => {
+    c.set("tenantId" as never, tenantId as never);
+    c.set("agentId" as never, agentId as never);
+    await next();
+  });
   app.get("/approvals/proxy/:id", handlePendingProxyRequest);
   return app;
 }
@@ -410,6 +429,35 @@ describe("proxy approval lifecycle enforcement (PGLite)", () => {
         ),
       );
     expect(executedAudits.length).toBe(1);
+  });
+
+  it("does not persist or return an upstream execution exception", async () => {
+    const tenantId = `t-release-error-${crypto.randomUUID()}`;
+    const agentId = `a-${crypto.randomUUID()}`;
+    const canary = "Bearer release-exception-secret";
+    await ensureTenant(tenantId);
+    await ensureAgent(tenantId, agentId);
+    const held = await holdRequest(tenantId, agentId);
+    await getDb()
+      .update(pendingProxyRequests)
+      .set({ status: "approved", approvedAt: new Date(), approvedBy: "operator" })
+      .where(eq(pendingProxyRequests.id, held.id));
+    setPendingProxyExecution(async () => {
+      throw new Error(canary);
+    });
+
+    const response = await poll(buildReleaseHandlerApp(tenantId, agentId), held.id, "unused");
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as { error: string; data: { executionError?: string } };
+    expect(body.error).toBe("Approved proxy execution failed");
+    expect(JSON.stringify(body)).not.toContain(canary);
+
+    const [row] = await getDb()
+      .select()
+      .from(pendingProxyRequests)
+      .where(eq(pendingProxyRequests.id, held.id));
+    expect(row.executionError).toBe("Approved proxy execution failed");
+    expect(JSON.stringify(row)).not.toContain(canary);
   });
 
   it("never stores credentials in the pending row or audit log", async () => {

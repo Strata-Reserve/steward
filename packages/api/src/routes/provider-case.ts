@@ -1,5 +1,5 @@
 /**
- * PR5 correlated case-evidence routes.
+ * Correlated provider case-evidence routes.
  *
  *   GET /v2/provider-actions/:id/case      → ProviderCaseManifestV1 (manifest only)
  *   GET /v2/provider-actions/:id/evidence  → ProviderCaseEvidenceV1 (manifest + signed bundle)
@@ -14,13 +14,12 @@
  *
  * Scoping note (spec §5.2): the shared gate admits tenant `owner`/`admin`
  * sessions; those callers may read ANY workspace in their tenant, so we
- * authorize all tenant workspace ids. Workspace-scoped `workspace_admin` /
- * `workspace_auditor` session access is deferred ("if later added", §5.2) since
- * the session gate carries a tenant role, not a workspace role. Reported as a
- * design note in the PR body.
+ * authorize all tenant workspace ids. The session gate carries tenant roles,
+ * so workspace-scoped roles do not authorize these routes.
  */
 
 import { getDb, workspaces } from "@stwd/db";
+import { redactedThrownDiagnostics } from "@stwd/shared";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { auditOwnerAdminMfaGate } from "../middleware/audit-gate";
@@ -31,11 +30,13 @@ import {
   type AppVariables,
   setNoStoreHeaders,
   tenantAuth,
+  withAuthenticatedTenantDatabase,
 } from "../services/context";
 import {
   CaseRangeTooLargeError,
   getProviderCase,
-  getProviderCaseEvidence,
+  readProviderCaseEvidenceSnapshot,
+  signProviderCaseEvidenceSnapshot,
 } from "../services/provider-case";
 
 export const providerCaseRoutes = new Hono<{ Variables: AppVariables }>();
@@ -51,6 +52,10 @@ providerCaseRoutes.use("/provider-actions/:id/evidence", auditOwnerAdminMfaGate)
 // path-traversal / null-byte / control-char id (N37/N38/N39) is rejected before
 // any DB access and returns the SAME uniform 404 as a genuine miss.
 const CASE_ID_PATTERN = /^pa_[0-9a-fA-F-]{36}$/;
+const SNAPSHOT_CHARACTERISTICS = {
+  isolationLevel: "repeatable read" as const,
+  readOnly: true,
+};
 
 function isValidCaseId(id: string): boolean {
   return CASE_ID_PATTERN.test(id);
@@ -75,11 +80,25 @@ providerCaseRoutes.get("/provider-actions/:id/case", async (c) => {
 
   let manifestOrNull;
   try {
-    const authorized = await tenantWorkspaceIds(tenantId);
-    const assembly = await getProviderCase(tenantId, caseId, authorized);
+    const userId = c.get("userId");
+    if (!userId) return c.json<ApiResponse>({ ok: false, error: "Forbidden" }, 403);
+    const assembly = await withAuthenticatedTenantDatabase(
+      tenantId,
+      "provider-case-snapshot",
+      userId,
+      async () => {
+        const authorized = await tenantWorkspaceIds(tenantId);
+        return getProviderCase(tenantId, caseId, authorized);
+      },
+      userId,
+      SNAPSHOT_CHARACTERISTICS,
+    );
     manifestOrNull = assembly?.manifest ?? null;
   } catch (err) {
-    console.error(`[provider-case] /case read failed for ${tenantId}/${caseId}:`, err);
+    console.error(
+      `[provider-case] /case read failed for ${tenantId}/${caseId}`,
+      redactedThrownDiagnostics(err),
+    );
     return c.json<ApiResponse>({ ok: false, error: "CASE_CHAIN_UNAVAILABLE" }, 500);
   }
 
@@ -103,8 +122,20 @@ providerCaseRoutes.get("/provider-actions/:id/evidence", async (c) => {
 
   let evidence;
   try {
-    const authorized = await tenantWorkspaceIds(tenantId);
-    evidence = await getProviderCaseEvidence(tenantId, caseId, authorized);
+    const userId = c.get("userId");
+    if (!userId) return c.json<ApiResponse>({ ok: false, error: "Forbidden" }, 403);
+    const snapshot = await withAuthenticatedTenantDatabase(
+      tenantId,
+      "provider-case-snapshot",
+      userId,
+      async () => {
+        const authorized = await tenantWorkspaceIds(tenantId);
+        return readProviderCaseEvidenceSnapshot(tenantId, caseId, authorized);
+      },
+      userId,
+      SNAPSHOT_CHARACTERISTICS,
+    );
+    evidence = snapshot ? await signProviderCaseEvidenceSnapshot(snapshot) : null;
   } catch (err) {
     if (err instanceof AuditSigningKeyError) {
       return c.json<ApiResponse>({ ok: false, error: "CASE_EVIDENCE_SIGNING_DISABLED" }, 503);
@@ -117,7 +148,10 @@ providerCaseRoutes.get("/provider-actions/:id/evidence", async (c) => {
       // large to export as one signed bundle. /case still serves the manifest.
       return c.json<ApiResponse>({ ok: false, error: "CASE_RANGE_TOO_LARGE" }, 400);
     }
-    console.error(`[provider-case] /evidence read failed for ${tenantId}/${caseId}:`, err);
+    console.error(
+      `[provider-case] /evidence read failed for ${tenantId}/${caseId}`,
+      redactedThrownDiagnostics(err),
+    );
     return c.json<ApiResponse>({ ok: false, error: "CASE_CHAIN_UNAVAILABLE" }, 500);
   }
 
@@ -150,7 +184,7 @@ export function registerProviderCaseRoutes(app: Hono<{ Variables: AppVariables }
       setNoStoreHeaders(c);
       await next();
     });
-    app.use(p, (c, next) => tenantAuth(c, next));
+    app.use(p, (c, next) => tenantAuth(c, next, { bindTenantDatabase: false }));
   }
   app.route("/v2", providerCaseRoutes);
 }

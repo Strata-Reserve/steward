@@ -26,10 +26,14 @@ services:
     environment:
       PORT: "3200"
       STEWARD_BIND_HOST: "0.0.0.0"
+      # Explicit like the proxy service below: do not rely on the image's
+      # ENV NODE_ENV=production for fail-closed production behavior (SEC-161).
+      NODE_ENV: production
       DATABASE_URL: "${DATABASE_URL:-postgresql://steward:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@steward-db:5432/steward}"
+      STEWARD_ALLOW_UNVERIFIED_DB_TLS: "${STEWARD_ALLOW_UNVERIFIED_DB_TLS:-}"
       STEWARD_MASTER_PASSWORD: "${STEWARD_MASTER_PASSWORD:?Set STEWARD_MASTER_PASSWORD in .env}"
-      STEWARD_JWT_SECRET: "${STEWARD_JWT_SECRET:-}"
-      STEWARD_EXECUTION_AUTH_SECRET: "${STEWARD_EXECUTION_AUTH_SECRET:?Set STEWARD_EXECUTION_AUTH_SECRET in .env - PR4 governed provider actions fail closed if unset - generate: printf 'v1:%s' \"$(openssl rand -hex 32)\"}"
+      STEWARD_JWT_SECRET: "${STEWARD_JWT_SECRET:?Set STEWARD_JWT_SECRET in .env}"
+      STEWARD_EXECUTION_AUTH_SECRET: "${STEWARD_EXECUTION_AUTH_SECRET:?Set STEWARD_EXECUTION_AUTH_SECRET in .env - governed provider actions fail closed if unset - generate: printf 'v1:%s' \"$(openssl rand -hex 32)\"}"
       # The API writes required audit-chain events (approval / vault / policy
       # routes via writeAuditEvent / withTenantAuditedTransaction), so it needs
       # the same audit HMAC key as the proxy. Provisioned into .env by
@@ -47,6 +51,8 @@ services:
       STEWARD_EMAIL_CODE_SECRET: "${STEWARD_EMAIL_CODE_SECRET:-}"
       STEWARD_PLUGINS: "${STEWARD_PLUGINS:-}"
       WXMR_SOLANA_RPC_URL: "${WXMR_SOLANA_RPC_URL:-}"
+      X_CLIENT_ID: "${X_CLIENT_ID:-}"
+      X_CLIENT_SECRET: "${X_CLIENT_SECRET:-}"
     volumes:
       - steward-data:/app/data
     depends_on:
@@ -75,6 +81,7 @@ services:
     environment:
       STEWARD_PROXY_PORT: "8080"
       DATABASE_URL: "${DATABASE_URL:-postgresql://steward:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@steward-db:5432/steward}"
+      STEWARD_ALLOW_UNVERIFIED_DB_TLS: "${STEWARD_ALLOW_UNVERIFIED_DB_TLS:-}"
       STEWARD_MASTER_PASSWORD: "${STEWARD_MASTER_PASSWORD:?Set STEWARD_MASTER_PASSWORD in .env}"
       # JWT secret is required in production (auth verifyToken refuses dev fallback).
       STEWARD_JWT_SECRET: "${STEWARD_JWT_SECRET:?Set STEWARD_JWT_SECRET in .env}"
@@ -125,7 +132,10 @@ services:
       - "--maxmemory"
       - "256mb"
       - "--maxmemory-policy"
-      - "allkeys-lru"
+      # Enforcement counters must never be silently evicted. When the bound is
+      # reached, noeviction makes writes fail and the production proxy's
+      # Redis-required path fails closed.
+      - "noeviction"
     volumes:
       - steward-redis-data:/data
     healthcheck:

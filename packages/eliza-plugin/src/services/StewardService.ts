@@ -18,6 +18,7 @@ import {
   StewardApiError,
   StewardClient,
 } from "@stwd/sdk";
+import { redactedThrownDiagnostics } from "@stwd/shared";
 import type { StewardPluginConfig } from "../types.js";
 
 export interface HyperliquidSubmitOrderInput {
@@ -132,8 +133,7 @@ export class StewardService extends Service {
       if (err instanceof StewardApiError && err.status === 404 && this.pluginConfig.autoRegister) {
         await this.tryAutoRegister(runtime);
       } else {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[Steward] Could not connect: ${msg}`);
+        console.warn("[Steward] Could not connect", redactedThrownDiagnostics(err));
         if (this.pluginConfig.fallbackLocal) {
           console.info("[Steward] Falling back to local signing");
         }
@@ -148,8 +148,7 @@ export class StewardService extends Service {
       this._connected = true;
       console.info(`[Steward] Registered new wallet: ${this.agentIdentity.walletAddress}`);
     } catch (regErr) {
-      const msg = regErr instanceof Error ? regErr.message : String(regErr);
-      console.error(`[Steward] Failed to auto-register agent: ${msg}`);
+      console.error("[Steward] Failed to auto-register agent", redactedThrownDiagnostics(regErr));
     }
   }
 
@@ -386,6 +385,11 @@ export class StewardService extends Service {
     }
     assertSecureApiUrl(config.proxyUrl);
 
+    // StewardProxyClient signs whenever a signing secret is supplied; the
+    // regression suite pins that invariant even when explicit enforcement is
+    // off. This flag controls the separate fail-closed rule for deployments
+    // where a secret is mandatory but absent. Unsigned operation is reserved
+    // for local dev where no secret exists and enforcement is off.
     const signingRequired =
       process.env.NODE_ENV === "production" ||
       process.env.STEWARD_PROXY_REQUIRE_REQUEST_SIGNATURE === "true";

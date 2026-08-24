@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,9 +29,21 @@ type Config struct {
 	TenantID             string
 	RequestSigningSecret string
 	RequestSigningKeyID  string
-	HTTPClient           *http.Client
-	Now                  func() time.Time
-	NewID                func() string
+	// AllowInsecureBaseURL permits a plaintext non-loopback BaseURL (warns at
+	// construction). HTTPS is required by default so credentials never travel
+	// cleartext off-loopback (SEC-200).
+	AllowInsecureBaseURL bool
+	// HTTPClient, when set, REPLACES the default client — including its
+	// CheckRedirect hook, which strips Authorization / X-Steward-* credential
+	// and signing headers on cross-host or HTTPS-downgrade redirects
+	// (SEC-126). A custom client whose CheckRedirect does not re-apply that
+	// stripping silently re-enables credential exfiltration via open
+	// redirects / hostile proxies: net/http copies X-Steward-* headers to
+	// any redirect target. Either disable redirects or strip those headers
+	// on any host change (see stripStewardCredentialsOnCrossHostRedirect).
+	HTTPClient *http.Client
+	Now        func() time.Time
+	NewID      func() string
 }
 
 type Client struct {
@@ -83,28 +96,73 @@ var sensitivePrefixes = []string{
 	"/accounts",
 }
 
-var stewardCredentialHeaders = []string{
-	"Authorization",
-	"X-Steward-Key",
-	"X-Steward-Platform-Key",
-	"X-Steward-App-Id",
-	"X-Steward-Signature",
-	"X-Steward-Signing-Key-Id",
-	"X-Steward-Request-Timestamp",
-	"Idempotency-Key",
+func isLoopbackHost(hostname string) bool {
+	return hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
 }
 
-// stripStewardCredentialsOnCrossHostRedirect drops credential and signing
-// headers when a redirect targets a different host, so an open redirect or
-// hostile proxy cannot exfiltrate them (SEC-126).
-func stripStewardCredentialsOnCrossHostRedirect(req *http.Request, via []*http.Request) error {
+// Keep in lockstep with the equivalent check in EVERY other SDK (sdk, java,
+// python, ruby, rust, swift, csharp, flutter): these clients transmit API
+// keys, bearer tokens, and HMAC-signed credentials, none of which may travel
+// to a plaintext non-loopback endpoint (SEC-200, mirroring SEC-048).
+func assertSecureBaseURL(base *url.URL, allowInsecure bool) error {
+	if base.User != nil {
+		return errors.New("base URL must not embed credentials")
+	}
+	if base.Scheme != "http" && base.Scheme != "https" {
+		return errors.New("base URL must use HTTP or HTTPS")
+	}
+	if base.Scheme == "https" || (base.Scheme == "http" && isLoopbackHost(base.Hostname())) {
+		return nil
+	}
+	if allowInsecure {
+		log.Printf("[steward-sdk] WARNING: base URL is not HTTPS; credentials travel in cleartext. Use AllowInsecureBaseURL only on trusted private networks.")
+		return nil
+	}
+	return errors.New("base URL must use HTTPS unless it targets loopback (http://localhost, http://127.0.0.1, http://[::1]); set AllowInsecureBaseURL to override on trusted private networks")
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		return "80"
+	}
+	return ""
+}
+
+func sameOrigin(a *url.URL, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+// stewardRedirectPolicy permits only same-origin, credential-free redirect
+// targets. Merely stripping Steward headers is insufficient: following an
+// attacker-selected cross-origin Location turns server-side SDK consumers into
+// an SSRF primitive. Embedded URL credentials are also never accepted.
+func stewardRedirectPolicy(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
 	}
-	if !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
-		for _, header := range stewardCredentialHeaders {
-			req.Header.Del(header)
-		}
+	if req == nil || req.URL == nil || via[0] == nil || via[0].URL == nil {
+		return errors.New("refusing redirect with missing origin metadata")
+	}
+	return stewardRedirectPolicyFromOrigin(req, via[0].URL, len(via))
+}
+
+func stewardRedirectPolicyFromOrigin(req *http.Request, origin *url.URL, redirectCount int) error {
+	if redirectCount >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if req == nil || req.URL == nil || origin == nil {
+		return errors.New("refusing redirect with missing origin metadata")
+	}
+	if req.URL.User != nil || !sameOrigin(req.URL, origin) {
+		return fmt.Errorf("refusing cross-origin or credential-bearing redirect to %q", req.URL.Redacted())
 	}
 	return nil
 }
@@ -114,19 +172,46 @@ func NewClient(config Config) (*Client, error) {
 		return nil, errors.New("base URL is required")
 	}
 	base := strings.TrimRight(config.BaseURL, "/")
-	if _, err := url.ParseRequestURI(base); err != nil {
+	parsed, err := url.ParseRequestURI(base)
+	if err != nil {
 		return nil, fmt.Errorf("invalid base URL: %w", err)
+	}
+	if err := assertSecureBaseURL(parsed, config.AllowInsecureBaseURL); err != nil {
+		return nil, err
 	}
 	httpClient := config.HTTPClient
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Timeout: 30 * time.Second,
-			// Never forward Steward credential headers to a different host on
-			// redirect: net/http strips only Authorization/Cookie and copies
-			// X-Steward-* headers to any host (SEC-126).
-			CheckRedirect: stripStewardCredentialsOnCrossHostRedirect,
 		}
 	}
+	// Copy caller-owned clients instead of mutating them, then compose their
+	// redirect policy behind Steward's mandatory origin boundary.
+	configuredRedirect := httpClient.CheckRedirect
+	httpClientCopy := *httpClient
+	// Anchor every hop to construction-time configuration, not to via[0]. A
+	// caller callback can retain and mutate a prior hop's request before a later
+	// callback; deriving the origin from that mutable chain would make a
+	// multi-hop redirect compare against attacker-controlled state.
+	redirectOrigin := *parsed
+	httpClientCopy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := stewardRedirectPolicyFromOrigin(req, &redirectOrigin, len(via)); err != nil {
+			return err
+		}
+		if len(via) == 0 || via[0] == nil || via[0].URL == nil {
+			return errors.New("refusing redirect with missing origin metadata")
+		}
+		if configuredRedirect != nil {
+			if err := configuredRedirect(req, via); err != nil {
+				return err
+			}
+		}
+		// A caller policy is allowed to mutate req. Re-enforce Steward's mandatory
+		// boundary after it runs so mutation cannot redirect credentials or turn
+		// the client into an SSRF primitive after the initial check.
+		return stewardRedirectPolicyFromOrigin(req, &redirectOrigin, len(via))
+	}
+	httpClient = &httpClientCopy
 	now := config.Now
 	if now == nil {
 		now = time.Now

@@ -1,5 +1,5 @@
 /**
- * provider-case.ts — PR5 correlated case evidence assembler (PURE READ).
+ * provider-case.ts — correlated provider-case evidence assembler (pure read).
  *
  * Builds a deterministic, offline-verifiable case manifest for one governed
  * provider action and, on demand, packages it alongside the EXISTING signed
@@ -23,6 +23,7 @@ import {
   approvalQueue,
   executionAuthorizationNonces,
   getDb,
+  hasTenantTransactionDatabase,
   providerAccounts,
   providerActionBindings,
   providerOperations,
@@ -241,8 +242,8 @@ function resolveTerminalState(
       return "denied_policy";
     case "pending_approval":
       return "pending_approval";
-    // Non-approval "allowed" direct path executes via the PR2 stub. These are
-    // terminal for the pre-PR6 (fake-transport) slice; map to succeeded/failed
+    // The non-approval allowed path can execute via the in-process stub. These
+    // states are terminal for that fake-transport path; map to succeeded/failed
     // so completeness is honest against the stub outcome. (Full governed
     // execution uses the execution_ready→executing→terminal arm below.)
     case "allowed_stub":
@@ -315,9 +316,18 @@ export async function getProviderCase(
   caseId: string,
   authorizedWorkspaceIds: string[],
 ): Promise<ProviderCaseAssembly | null> {
-  return runInSnapshot((sdb) =>
+  return runInSnapshot(tenantId, (sdb) =>
     assembleWithinSnapshot(sdb, tenantId, caseId, authorizedWorkspaceIds),
   );
+}
+
+export interface ProviderCaseEvidenceSnapshot {
+  tenantId: string;
+  caseId: string;
+  assembly: ProviderCaseAssembly;
+  bundleData: AuditBundleData;
+  segmentFrom: number;
+  segmentTo: number;
 }
 
 /**
@@ -331,47 +341,54 @@ export async function getProviderCaseEvidence(
   caseId: string,
   authorizedWorkspaceIds: string[],
 ): Promise<ProviderCaseEvidenceV1 | null> {
-  // 1) Assemble the manifest + fix the segment bounds inside ONE read-only
-  //    snapshot (all correlation/verify reads coherent).
-  const assembly = await runInSnapshot((sdb) =>
-    assembleWithinSnapshot(sdb, tenantId, caseId, authorizedWorkspaceIds),
-  );
-  if (!assembly) return null;
+  const snapshot = await readProviderCaseEvidenceSnapshot(tenantId, caseId, authorizedWorkspaceIds);
+  return snapshot ? signProviderCaseEvidenceSnapshot(snapshot) : null;
+}
 
-  const { manifest, segmentFrom, segmentTo } = assembly;
-
-  // 2) Read the bundle segment + sign OUTSIDE the read-only snapshot. The
-  //    audit chain is append-only and immutable once written, so re-reading the
-  //    SAME fixed [segmentFrom, segmentTo] range returns byte-identical events;
-  //    doing the signing (which persists a checkpoint best-effort) outside the
-  //    snapshot avoids a write-inside-read-only-tx deadlock on PGLite's single
-  //    connection while preserving manifest↔bundle consistency (the manifest's
-  //    seq+hmac index already pins exactly which events belong to the case).
-  let bundle: SignedAuditBundle;
-  if (segmentFrom == null || segmentTo == null) {
-    const empty: AuditBundleData = {
-      head: null,
-      events: [],
-      bundleHeadHmac: null,
-      bundleHeadSeq: null,
-    };
-    bundle = await signAuditBundle(tenantId, 0, 0, empty);
-  } else {
-    // Enforce the segment cap BEFORE reading the range (codex P2): a case whose
-    // contiguous span exceeds MAX_CASE_SEGMENT_EVENTS (pathological same-tenant
-    // interleave, KC15) must NOT materialize/sign an unbounded range of
-    // unrelated audit rows via /evidence. Fail closed with a typed error the
-    // route maps to 400 CASE_RANGE_TOO_LARGE (§5.4); the manifest already
-    // carries `unknown` + a size-exceeded reason, and /case (manifest-only)
-    // still works for triage.
-    if (segmentTo - segmentFrom + 1 > MAX_CASE_SEGMENT_EVENTS) {
+/**
+ * Read every manifest and bundle input in one snapshot. Route callers end the
+ * read-only transaction before passing this immutable material to the signer,
+ * whose best-effort checkpoint persistence is intentionally a separate write.
+ */
+export async function readProviderCaseEvidenceSnapshot(
+  tenantId: string,
+  caseId: string,
+  authorizedWorkspaceIds: string[],
+): Promise<ProviderCaseEvidenceSnapshot | null> {
+  return runInSnapshot(tenantId, async (sdb) => {
+    const assembly = await assembleWithinSnapshot(sdb, tenantId, caseId, authorizedWorkspaceIds);
+    if (!assembly) return null;
+    const { segmentFrom, segmentTo } = assembly;
+    if (
+      segmentFrom != null &&
+      segmentTo != null &&
+      segmentTo - segmentFrom + 1 > MAX_CASE_SEGMENT_EVENTS
+    ) {
       throw new CaseRangeTooLargeError(
         `case segment [${segmentFrom},${segmentTo}] exceeds ${MAX_CASE_SEGMENT_EVENTS} events`,
       );
     }
-    const bundleData = await readAuditBundleData(tenantId, segmentFrom, segmentTo);
-    bundle = await signAuditBundle(tenantId, segmentFrom, segmentTo, bundleData);
-  }
+    const from = segmentFrom ?? 0;
+    const to = segmentTo ?? 0;
+    const bundleData =
+      segmentFrom == null || segmentTo == null
+        ? { head: null, events: [], bundleHeadHmac: null, bundleHeadSeq: null }
+        : await readAuditBundleData(tenantId, segmentFrom, segmentTo, sdb);
+    return { tenantId, caseId, assembly, bundleData, segmentFrom: from, segmentTo: to };
+  });
+}
+
+export async function signProviderCaseEvidenceSnapshot(
+  snapshot: ProviderCaseEvidenceSnapshot,
+): Promise<ProviderCaseEvidenceV1> {
+  const { tenantId, caseId, assembly, bundleData, segmentFrom, segmentTo } = snapshot;
+  const { manifest } = assembly;
+  const bundle: SignedAuditBundle = await signAuditBundle(
+    tenantId,
+    segmentFrom,
+    segmentTo,
+    bundleData,
+  );
 
   return {
     version: 1,
@@ -473,7 +490,7 @@ function buildManifest(args: BuildManifestArgs): ProviderCaseAssembly {
     action: ev.action,
     // Unknown/drifted actions map to `unclassified`, NEVER `genesis`, so a
     // corrupted or taxonomy-drifted event can never mis-satisfy a required role
-    // and falsely upgrade a case to `complete` (codex P2). Linkage is still
+    // and falsely upgrade a case to `complete`. Linkage is still
     // proven (the seq+hmac stays in the index).
     role: roleForAction(ev.action) ?? "unclassified",
     hmac: ev.hmac,
@@ -503,7 +520,7 @@ function buildManifest(args: BuildManifestArgs): ProviderCaseAssembly {
   };
 
   // Safe-summary re-validation (§3.3): redact then assert no sensitive key
-  // survives; omit-and-flag if a PR2 bug left one.
+  // survives; omit and flag any row that lacks one.
   let safeSummary: Record<string, unknown> | null = null;
   const rawSummary = binding.safeSummary ?? null;
   if (rawSummary && typeof rawSummary === "object") {
@@ -515,7 +532,7 @@ function buildManifest(args: BuildManifestArgs): ProviderCaseAssembly {
     }
   }
 
-  // Execution facts (PR4). providerIdempotencyKeyHash is derived from the RAW
+  // Execution facts. providerIdempotencyKeyHash is derived from the raw
   // nonce key by HASHING it here — the raw key NEVER enters the manifest (§3.4).
   let execution: ProviderCaseManifestV1["execution"] = null;
   if (nonce && nonce.version === 2) {
@@ -535,7 +552,7 @@ function buildManifest(args: BuildManifestArgs): ProviderCaseAssembly {
   // A case that WENT THROUGH approval has a non-null approvalQueueId. If that
   // referenced queue row failed to load (deleted / corrupted), flag it — do NOT
   // gate on `approvalQueueId == null`, which is the OPPOSITE (a case that never
-  // had a queue, e.g. the allowed-stub direct path). (codex P2)
+  // had a queue, such as the allowed-stub direct path.
   if (binding.approvalQueueId != null && !queue) {
     pushReasonList(reasons, PROVIDER_CASE_REASON.QUEUE_ROW_ABSENT_FOR_APPROVAL_PATH);
   }
@@ -841,20 +858,27 @@ async function loadAccount(
  * non-blocking (§4.1). The audit chain-verify + bundle read are threaded the tx
  * executor so they share this snapshot (KC06).
  */
-async function runInSnapshot<T>(fn: (sdb: SnapshotDb) => Promise<T>): Promise<T> {
+async function runInSnapshot<T>(tenantId: string, fn: (sdb: SnapshotDb) => Promise<T>): Promise<T> {
   const db = getDb();
+  // Mounted case routes deliberately establish this tenant-bound snapshot
+  // before entering the service. A nested Drizzle transaction would only be a
+  // savepoint, so reuse is permitted only when the tenant and transaction
+  // characteristics match exactly; ordinary READ COMMITTED reuse fails closed.
+  if (
+    hasTenantTransactionDatabase({
+      tenantId,
+      isolationLevel: "repeatable read",
+      readOnly: true,
+    })
+  ) {
+    return fn(db as SnapshotDb);
+  }
   try {
     return await db.transaction(async (tx) => {
       if (!isPGLiteRuntime()) {
-        try {
-          await (tx as unknown as AuditReadExecutor).execute(
-            sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`,
-          );
-        } catch {
-          // Some drivers set isolation only at BEGIN; a failure here is
-          // non-fatal — the reads are still coherent enough for a monotonic
-          // append-only chain. Never fail the read on this.
-        }
+        await (tx as unknown as AuditReadExecutor).execute(
+          sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`,
+        );
       }
       return await fn(tx as unknown as SnapshotDb);
     });

@@ -1,6 +1,6 @@
 /**
  * No-read-back property of the SecretVault custody plane (sovereign-custody
- * Pillar A / A2, converged from PR #245's sibling age store onto the EXISTING
+ * Sovereign-custody no-read-back enforcement uses the existing
  * plane).
  *
  * Bidirectional proof:
@@ -187,6 +187,7 @@ describe("SecretVault no-read-back: get is impossible", () => {
       "createRoute",
       "createRouteWithinTx",
       "createSecret",
+      "createSecretWithinTx",
       "decryptSecret",
       "decryptSecretRow",
       "deleteRoute",
@@ -198,6 +199,7 @@ describe("SecretVault no-read-back: get is impossible", () => {
       "getSecretById",
       "listRoutes",
       "listSecrets",
+      "migrateLegacyRootSecrets",
       "rotateSecret",
       "rotateSecretWithinTx",
       "toMetadata",
@@ -207,7 +209,9 @@ describe("SecretVault no-read-back: get is impossible", () => {
 
     // The plaintext-capable subset is exactly these two direct-return methods
     // plus the use-only exerciseSecret/exerciseSecretRow closures. Everything else
-    // returns metadata/routes.
+    // returns metadata/routes. (migrateLegacyRootSecrets handles plaintext
+    // internally but returns row COUNTS only — like rotateSecret, it never
+    // surfaces a value to its caller.)
     const plaintextCapable = [
       "decryptSecret",
       "decryptSecretRow",

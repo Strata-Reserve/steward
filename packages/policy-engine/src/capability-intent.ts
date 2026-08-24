@@ -13,7 +13,7 @@
  * WHY IT LIVES HERE (policy-engine) BUT LOOKS LIKE A PLUGIN CONTRIBUTION
  * ---------------------------------------------------------------------
  * it is authored AS a {@link PolicyRuleContribution} — the exact shape a plugin
- * registers via the Phase-2b registry — so W-1a's capability plugin can register
+ * registers via the provider-mode registry — so the capability plugin can register
  * it through the plugin host with ZERO rework. but the evaluator + config schema
  * + tests are a library export of `@stwd/policy-engine` (not a route, not a
  * package): W-1b ships the decision logic; the plugin package (W-1a) owns
@@ -60,10 +60,23 @@ import type {
   PolicyRuleContribution,
 } from "@stwd/shared";
 import { describeThrown } from "@stwd/shared";
+import { RE2 } from "re2-wasm";
 import type { EvaluatorContext } from "./evaluators";
 
 /** the contributed rule-type discriminator. */
 export const CAPABILITY_INTENT_RULE_TYPE = "capability-intent" as const;
+
+/**
+ * ReDoS blast-radius bounds for operator-supplied patterns (SEC-107).
+ * `argMatches` / X `blockedPatterns` regexes come from tenant-admin policy
+ * config and run against agent-influenced invoke args / tweet text. They are
+ * evaluated with RE2's linear-time engine; length caps remain defense in depth
+ * for compile/match cost and bound policy-controlled memory use.
+ */
+export const MAX_POLICY_PATTERN_LENGTH = 256;
+export const MAX_POLICY_PATTERN_INPUT_LENGTH = 8_192;
+const MAX_ARG_ARRAY_VALUES = 64;
+const MAX_ARG_ARRAY_VALUE_LENGTH = 512;
 
 // ─── Permissioned-X: per-post price table (versioned constant) ────────────────
 //
@@ -249,6 +262,12 @@ export interface CapabilityIntentConstraints {
    */
   readonly argMatches?: Record<string, string>;
   /**
+   * Every named arg must be a non-empty string array, and every element must
+   * belong to the configured allowlist. This is an array-subset check, not a
+   * string coercion; malformed, mixed-type, empty, or over-bounded arrays deny.
+   */
+  readonly argArraySubset?: Record<string, string[]>;
+  /**
    * X-only instance-level policy sub-block (permissioned X). ONLY valid on an
    * `x.*` operation — present on a non-X operation => config error (fail closed).
    * See {@link XConstraints} + docs/security/permissioned-x.mdx.
@@ -371,6 +390,7 @@ const ALLOWED_CONSTRAINT_KEYS: ReadonlySet<string> = new Set([
   "cumulativeSpend",
   "argEquals",
   "argMatches",
+  "argArraySubset",
   "timeWindow",
   "x",
 ]);
@@ -664,6 +684,12 @@ function parseXConstraints(rawInput: unknown): XConstraints | { error: string } 
           error:
             "capability-intent: `x.contentPolicy.blockedPatterns` must be a non-empty string[] of non-empty strings",
         };
+      // SEC-107: bound operator-supplied regexes at parse time (same cap as
+      // argMatches) so a pathological pattern fails closed as a config error.
+      if (cp.blockedPatterns.some((p) => (p as string).length > MAX_POLICY_PATTERN_LENGTH))
+        return {
+          error: `capability-intent: \`x.contentPolicy.blockedPatterns\` patterns must not exceed ${MAX_POLICY_PATTERN_LENGTH} chars`,
+        };
       content.blockedPatterns = cp.blockedPatterns as string[];
     }
     out.contentPolicy = content;
@@ -911,6 +937,23 @@ function parseConfig(rawInput: unknown): CapabilityIntentConfig | { error: strin
     if (c.argMatches !== undefined && !isStringRecord(c.argMatches)) {
       return { error: "capability-intent: `constraints.argMatches` must be Record<string,string>" };
     }
+    if (c.argArraySubset !== undefined && !isStringArrayRecord(c.argArraySubset)) {
+      return {
+        error: "capability-intent: `constraints.argArraySubset` must be Record<string,string[]>",
+      };
+    }
+    // SEC-107: bound operator-supplied regexes at store/parse time, not just at
+    // evaluation time, so a pathological pattern fails closed as a config error.
+    if (
+      c.argMatches !== undefined &&
+      Object.values(c.argMatches as Record<string, string>).some(
+        (p) => p.length > MAX_POLICY_PATTERN_LENGTH,
+      )
+    ) {
+      return {
+        error: `capability-intent: \`constraints.argMatches\` patterns must not exceed ${MAX_POLICY_PATTERN_LENGTH} chars`,
+      };
+    }
 
     let timeWindow: CapabilityTimeWindow | undefined;
     if (c.timeWindow !== undefined) {
@@ -943,6 +986,9 @@ function parseConfig(rawInput: unknown): CapabilityIntentConfig | { error: strin
         : {}),
       ...(c.argEquals !== undefined ? { argEquals: c.argEquals as Record<string, string> } : {}),
       ...(c.argMatches !== undefined ? { argMatches: c.argMatches as Record<string, string> } : {}),
+      ...(c.argArraySubset !== undefined
+        ? { argArraySubset: c.argArraySubset as Record<string, string[]> }
+        : {}),
       ...(timeWindow !== undefined ? { timeWindow } : {}),
       ...(xConstraints !== undefined ? { x: xConstraints } : {}),
     };
@@ -958,6 +1004,19 @@ function parseConfig(rawInput: unknown): CapabilityIntentConfig | { error: strin
 function isStringRecord(value: unknown): value is Record<string, string> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   return Object.values(value).every((v) => typeof v === "string");
+}
+
+function isStringArrayRecord(value: unknown): value is Record<string, string[]> {
+  if (!isPlainObject(value)) return false;
+  return Object.values(value).every(
+    (entry) =>
+      Array.isArray(entry) &&
+      entry.length <= MAX_ARG_ARRAY_VALUES &&
+      entry.every(
+        (item) =>
+          typeof item === "string" && item.length > 0 && item.length <= MAX_ARG_ARRAY_VALUE_LENGTH,
+      ),
+  );
 }
 
 /**
@@ -1010,10 +1069,19 @@ function evaluateConstraints(
   // compiled) regex. Invalid regex in config => deny (never throw).
   if (constraints.argMatches) {
     for (const [key, pattern] of Object.entries(constraints.argMatches)) {
-      let re: RegExp;
+      // SEC-107: cap the operator-supplied pattern length so a pathological
+      // regex cannot be smuggled in via config.
+      if (typeof pattern !== "string" || pattern.length > MAX_POLICY_PATTERN_LENGTH) {
+        return {
+          ...base,
+          passed: false,
+          reason: `capability-intent: regex for arg "${key}" missing or exceeds ${MAX_POLICY_PATTERN_LENGTH} chars`,
+        };
+      }
+      let re: RE2;
       try {
         // anchor full-string so a partial match can't slip a governed arg.
-        re = new RegExp(`^(?:${pattern})$`);
+        re = new RE2(`^(?:${pattern})$`, "u");
       } catch {
         return {
           ...base,
@@ -1029,11 +1097,44 @@ function evaluateConstraints(
         };
       }
       const value = args[key];
+      // SEC-107: cap the agent-controlled input the regex runs against; an
+      // oversized arg cannot be verified within the bound => deny.
+      if (typeof value === "string" && value.length > MAX_POLICY_PATTERN_INPUT_LENGTH) {
+        return {
+          ...base,
+          passed: false,
+          reason: `capability-intent: arg "${key}" exceeds the ${MAX_POLICY_PATTERN_INPUT_LENGTH}-char match input cap`,
+        };
+      }
       if (typeof value !== "string" || !re.test(value)) {
         return {
           ...base,
           passed: false,
           reason: `capability-intent: arg "${key}" does not match required pattern`,
+        };
+      }
+    }
+  }
+  if (constraints.argArraySubset) {
+    for (const [key, allowedValues] of Object.entries(constraints.argArraySubset)) {
+      const value = args[key];
+      const allowed = new Set(allowedValues);
+      if (
+        !Array.isArray(value) ||
+        value.length === 0 ||
+        value.length > MAX_ARG_ARRAY_VALUES ||
+        !value.every(
+          (item) =>
+            typeof item === "string" &&
+            item.length > 0 &&
+            item.length <= MAX_ARG_ARRAY_VALUE_LENGTH &&
+            allowed.has(item),
+        )
+      ) {
+        return {
+          ...base,
+          passed: false,
+          reason: `capability-intent: every value of arg "${key}" must belong to its configured allowlist`,
         };
       }
     }
@@ -1117,6 +1218,19 @@ export function evaluateCapabilityIntent(
   // 2. Config must be well-formed (fail closed).
   const parsed = parseConfig(rule.config);
   if ("error" in parsed) {
+    // SEC-181: same malformed-input precedence as both composers — a malformed
+    // rule whose selector is well-formed and provably scoped to a DIFFERENT
+    // capability is not governing this invoke and stays inert. Only a
+    // malformed GOVERNING rule, or one whose selector is unrecoverable
+    // (ambiguous scope), denies.
+    const sel = recoverSelectorMatch(rule.config, ctx.capability.name);
+    if (sel.recoverable && !sel.matches) {
+      return {
+        ...base,
+        passed: true,
+        reason: `capability "${ctx.capability.name}" not governed by this rule`,
+      };
+    }
     return { ...base, passed: false, reason: parsed.error };
   }
 
@@ -1164,7 +1278,7 @@ export function evaluateCapabilityIntent(
  * The composed decision over a set of `capability-intent` rules that GOVERN a
  * single invoked capability, in the canonical precedence order.
  *
- * CANONICAL COMPOSITION (master-plan §5.3 / PR2 canonicalization spec §6.3):
+ * Canonical provider-action composition:
  *   1. a malformed/unknown rule config that GOVERNS this capability, or whose
  *      SELECTOR is unrecoverable (ambiguous scope), or an unavailable policy
  *      input => HARD DENY
@@ -1348,7 +1462,7 @@ export const capabilityIntentContribution: PolicyRuleContribution<EvaluatorConte
   evaluate: evaluateCapabilityIntent,
 };
 
-// ─── Provider-action policy composition (PR2, Conflict 9 fix) ──────────────────
+// ─── Provider-action policy composition ───────────────────────────────────────
 //
 // The legacy invoke.ts loop lets a passing allow win even when another rule
 // simultaneously requires approval (origin/develop invoke.ts:288-311). That is
@@ -1442,6 +1556,19 @@ export interface ProviderPolicyContext {
     readonly accumulatedSpendMicros?: number;
     /** authoritative current minute-of-day UTC, 0..1439 (used by quietHours). */
     readonly nowMinuteUtc?: number;
+    /** adapter-derived "the post is a reply" signal (replyPolicy). PREFERRED
+     *  over the same-named `args` entry, which is caller-influenced (SEC-182). */
+    readonly isReply?: boolean;
+    /** authoritative "the user summoned the agent" signal (replyPolicy
+     *  summoned-only). It must come from an authenticated adapter lookup, not a
+     *  caller assertion (SEC-182). */
+    readonly summoned?: boolean;
+    /** adapter-derived "the post body contains a URL" signal (allowUrls /
+     *  spend / escalation policies). PREFERRED over `args` (SEC-182). */
+    readonly hasUrl?: boolean;
+    /** adapter-counted code-point length of the post text (maxLength).
+     *  PREFERRED over `args` (SEC-182). */
+    readonly textCodePointLength?: number;
   };
   /**
    * The operation's DECLARED spend field (#206). The operation - not the caller
@@ -1546,7 +1673,7 @@ export interface ProviderPolicyRule {
  * allow-over-approval precedence bug for the LEGACY invoke.ts plane, reusing
  * `ContributedPolicyRule`/`EvaluatorContext` and returning a
  * `CapabilityIntentCompositionResult`. This function is the AUTHORITY-plane analog
- * required by PR2 spec §6.2/§6.3: it returns the full `ProviderPolicyEvaluationV1`
+ * required by the provider-action contract: it returns the full `ProviderPolicyEvaluationV1`
  * document (per-rule results with configured effect / outcome / reason code) that
  * the provider-action service persists as an immutable policy decision. The two
  * are deliberately distinct exports; both enforce identical precedence
@@ -1584,6 +1711,14 @@ export function composeProviderActionPolicyDecision(
 
       const parsed = parseConfig(rule.config);
       if ("error" in parsed) {
+        // SEC-181: malformed-input precedence is scoped to GOVERNING rules,
+        // matching the legacy-plane composer (composeCapabilityIntentDecision)
+        // and master-plan §5.3. A well-formed selector provably scoped to a
+        // DIFFERENT operation stays inert even though the rest of the config
+        // is broken; only a malformed rule that governs THIS operation, or
+        // whose selector is unrecoverable (ambiguous scope), hard-denies.
+        const sel = recoverSelectorMatch(rule.config, context.operationKey);
+        if (sel.recoverable && !sel.matches) continue;
         sawHardDeny = true;
         reasonCodes.add(PROVIDER_POLICY_REASON.CONFIGURATION_INVALID);
         results.push({
@@ -1708,14 +1843,41 @@ function evaluateProviderConstraints(
   }
   if (constraints.argMatches) {
     for (const [key, pattern] of Object.entries(constraints.argMatches)) {
-      let re: RegExp;
+      // SEC-107: same ReDoS bounds as the legacy-plane evaluator.
+      if (typeof pattern !== "string" || pattern.length > MAX_POLICY_PATTERN_LENGTH) {
+        return PROVIDER_POLICY_REASON.CONFIGURATION_INVALID;
+      }
+      let re: RE2;
       try {
-        re = new RegExp(`^(?:${pattern})$`);
+        re = new RE2(`^(?:${pattern})$`, "u");
       } catch {
         return PROVIDER_POLICY_REASON.CONFIGURATION_INVALID;
       }
       const value = args[key];
+      if (typeof value === "string" && value.length > MAX_POLICY_PATTERN_INPUT_LENGTH) {
+        return PROVIDER_POLICY_REASON.HARD_DENY;
+      }
       if (typeof value !== "string" || !re.test(value)) return PROVIDER_POLICY_REASON.HARD_DENY;
+    }
+  }
+  if (constraints.argArraySubset) {
+    for (const [key, allowedValues] of Object.entries(constraints.argArraySubset)) {
+      const value = ctx.args[key];
+      const allowed = new Set(allowedValues);
+      if (
+        !Array.isArray(value) ||
+        value.length === 0 ||
+        value.length > MAX_ARG_ARRAY_VALUES ||
+        !value.every(
+          (item) =>
+            typeof item === "string" &&
+            item.length > 0 &&
+            item.length <= MAX_ARG_ARRAY_VALUE_LENGTH &&
+            allowed.has(item),
+        )
+      ) {
+        return PROVIDER_POLICY_REASON.HARD_DENY;
+      }
     }
   }
   if (constraints.timeWindow) {
@@ -1849,17 +2011,24 @@ export type XConstraintVerdict =
   | { kind: "escalate" };
 
 /**
- * Read a REQUIRED boolean policy arg. Returns the boolean value, or `undefined`
- * when the arg is absent or not a boolean. A permissioned-X policy that DEPENDS
- * on this signal must fail closed (POLICY_INPUT_UNAVAILABLE) on `undefined` — we
- * NEVER coerce a missing/mistyped signal to `false`, because that would let a
- * URL/reply gate silently pass on an operation whose build doesn't carry the
- * signal (e.g. x.tweet.delete / x.user.me.read, or a malformed context). This is
- * the content-shape fail-closed contract (codex P2, PR review).
+ * Read X security signals exclusively from the typed, server-populated channel.
+ * The generic args bag is caller-influenced, including when no typed channel is
+ * present, so it can never be an authority fallback (SEC-182).
  */
-function readBool(args: Record<string, unknown>, key: string): boolean | undefined {
-  const v = args[key];
-  return typeof v === "boolean" ? v : undefined;
+function xBoolSignal(
+  ctx: ProviderPolicyContext,
+  key: "isReply" | "summoned" | "hasUrl",
+): boolean | undefined {
+  const typed = ctx.x?.[key];
+  return typeof typed === "boolean" ? typed : undefined;
+}
+
+function xIntegerSignal(
+  ctx: ProviderPolicyContext,
+  key: "textCodePointLength",
+): number | undefined {
+  const typed = ctx.x?.[key];
+  return typeof typed === "number" && Number.isInteger(typed) ? typed : undefined;
 }
 
 /**
@@ -1885,14 +2054,12 @@ export function evaluateXConstraints(
     return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.CONFIGURATION_INVALID };
   }
 
-  const { args } = ctx;
-
   // ── replyPolicy ──
   // A replyPolicy DEPENDS on the `isReply` signal; absent/non-boolean => fail
   // closed (an operation whose build doesn't carry isReply must NOT slip a reply
   // gate). `summoned` is only required when we actually reach the summoned check.
   if (x.replyPolicy) {
-    const isReply = readBool(args, "isReply");
+    const isReply = xBoolSignal(ctx, "isReply");
     if (isReply === undefined) {
       return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.INPUT_UNAVAILABLE };
     }
@@ -1901,7 +2068,7 @@ export function evaluateXConstraints(
         return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.X_REPLY_FORBIDDEN };
       }
       if (x.replyPolicy.mode === "summoned-only") {
-        const summoned = readBool(args, "summoned");
+        const summoned = xBoolSignal(ctx, "summoned");
         if (summoned === undefined) {
           return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.INPUT_UNAVAILABLE };
         }
@@ -1921,7 +2088,7 @@ export function evaluateXConstraints(
   if (x.contentPolicy) {
     // allowUrls DEPENDS on the `hasUrl` signal; absent/non-boolean => fail closed.
     if (x.contentPolicy.allowUrls === false) {
-      const hasUrl = readBool(args, "hasUrl");
+      const hasUrl = xBoolSignal(ctx, "hasUrl");
       if (hasUrl === undefined) {
         return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.INPUT_UNAVAILABLE };
       }
@@ -1930,7 +2097,7 @@ export function evaluateXConstraints(
       }
     }
     if (x.contentPolicy.maxLength !== undefined) {
-      const len = args.textCodePointLength;
+      const len = xIntegerSignal(ctx, "textCodePointLength");
       // A content-length policy REQUIRES the length signal. Absent => fail closed.
       if (typeof len !== "number" || !Number.isInteger(len)) {
         return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.INPUT_UNAVAILABLE };
@@ -1946,10 +2113,20 @@ export function evaluateXConstraints(
       if (typeof text !== "string") {
         return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.INPUT_UNAVAILABLE };
       }
+      // SEC-107: cap the agent-controlled input the patterns run against; text
+      // too large to scan within the bound cannot be proven clean => deny.
+      if (text.length > MAX_POLICY_PATTERN_INPUT_LENGTH) {
+        return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.INPUT_UNAVAILABLE };
+      }
       for (const pattern of x.contentPolicy.blockedPatterns) {
-        let re: RegExp;
+        // SEC-107: cap the operator-supplied pattern length so a pathological
+        // regex cannot be smuggled in via config.
+        if (typeof pattern !== "string" || pattern.length > MAX_POLICY_PATTERN_LENGTH) {
+          return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.CONFIGURATION_INVALID };
+        }
+        let re: RE2;
         try {
-          re = new RegExp(pattern);
+          re = new RE2(pattern, "u");
         } catch {
           // Invalid regex in config => fail closed (never throw).
           return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.CONFIGURATION_INVALID };
@@ -1995,7 +2172,7 @@ export function evaluateXConstraints(
     x.escalation?.urlPostRequiresApproval === true;
   let hasUrl: boolean | undefined;
   if (needsHasUrl) {
-    hasUrl = readBool(args, "hasUrl");
+    hasUrl = xBoolSignal(ctx, "hasUrl");
     if (hasUrl === undefined) {
       return { kind: "deny", reasonCode: PROVIDER_POLICY_REASON.INPUT_UNAVAILABLE };
     }
