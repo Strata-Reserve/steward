@@ -458,7 +458,14 @@ export interface TenantControlPlaneConfig {
   approvalConfig: ApprovalConfig;
   featureFlags: TenantFeatureFlags;
   theme?: TenantTheme;
-  /** Allowed CORS origins for this tenant. Empty array = wildcard (*) in dev mode. */
+  /**
+   * Allowed CORS origins for this tenant.
+   *
+   * STRATA-1115: an empty array means DENY ALL cross-origin readers — it is NOT
+   * a dev-mode wildcard. To permit every origin a tenant must say so explicitly
+   * with `["*"]`. The previous comment described the fail-OPEN behaviour that
+   * #16 removed; leaving it would have invited someone to restore the defect.
+   */
   allowedOrigins?: string[];
   createdAt?: Date;
   updatedAt?: Date;

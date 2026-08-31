@@ -63,6 +63,7 @@
 import { getDb, tenantConfigs as tenantConfigsTable } from "@stwd/db";
 import { eq } from "drizzle-orm";
 import type { Context, Next } from "hono";
+import { DEFAULT_TENANT_CONFIGS } from "../defaults/tenant-configs";
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
@@ -85,6 +86,31 @@ const originsCache = new Map<string, CacheEntry>();
  *
  * Failures are NOT cached — a transient error must not pin a tenant into a
  * degraded state for the rest of the TTL.
+ *
+ * ─── STRATA-1115 FOLLOW-UP: ABSENT ROW FALLS BACK TO THE CODE DEFAULT ────────
+ *
+ * Resolution order is: DB row → `DEFAULT_TENANT_CONFIGS` → `[]` (deny).
+ *
+ * A PRESENT row always wins, INCLUDING when its `allowed_origins` is empty. An
+ * operator who saved an empty allowlist decided "no cross-origin reader", and
+ * that decision must not be silently overridden by a code default. This is why
+ * the row's EXISTENCE is tested separately from its contents below rather than
+ * collapsing both into `row?.allowedOrigins ?? []` as before — that expression
+ * cannot tell "no row" from "row saying nothing".
+ *
+ * The fallback is NOT a fail-open path, for three reasons:
+ *   1. The DB read SUCCEEDED. "No row exists" is a fact we positively learned,
+ *      not an absence of information. The throw path — where we learned nothing
+ *      — still denies, unchanged.
+ *   2. A committed entry in DEFAULT_TENANT_CONFIGS is an EXPLICIT operator
+ *      decision: reviewed, versioned, attributable in git. It is the same class
+ *      of deliberate choice as the explicit `"*"` an operator writes into their
+ *      own allowlist, which #16 preserved on exactly this reasoning. The defect
+ *      #16 fixed was INFERRING permission from absence or from an error; reading
+ *      it from checked-in configuration is the opposite of inferring.
+ *   3. It widens nothing by itself. A tenant with no row and no default still
+ *      resolves to `[]` and is denied, and a default is matched by the very same
+ *      allowlist comparison as a DB row — it grants only the origins it names.
  */
 async function getTenantOrigins(tenantId: string): Promise<string[]> {
   const now = Date.now();
@@ -97,7 +123,12 @@ async function getTenantOrigins(tenantId: string): Promise<string[]> {
     .from(tenantConfigsTable)
     .where(eq(tenantConfigsTable.tenantId, tenantId));
 
-  const origins: string[] = row?.allowedOrigins ?? [];
+  // Note the deliberate `row ?` — presence of the row, not truthiness of its
+  // contents. An empty allowlist on a real row is a policy, not a gap.
+  const origins: string[] = row
+    ? (row.allowedOrigins ?? [])
+    : (DEFAULT_TENANT_CONFIGS[tenantId]?.allowedOrigins ?? []);
+
   originsCache.set(tenantId, { origins, expiresAt: now + CACHE_TTL_MS });
   return origins;
 }
