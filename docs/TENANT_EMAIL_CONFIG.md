@@ -43,6 +43,53 @@ curl -X PATCH "$API_BASE/platform/tenants/elizacloud/email-config" \
   }'
 ```
 
+#### Merge semantics (STRATA-1218)
+
+PATCH **merges**: fields you supply are overwritten, fields you omit are
+preserved. This means the non-secret magic-link routing fields can be set
+without holding — or destroying — the tenant's Resend secret.
+
+```bash
+# Set only the magic-link target. apiKeyEncrypted / provider / from /
+# templateId / subjectOverride are all left exactly as they were.
+curl -X PATCH "$API_BASE/platform/tenants/strata/email-config" \
+  -H "Content-Type: application/json" \
+  -H "X-Steward-Platform-Key: $STEWARD_PLATFORM_KEY" \
+  -d '{
+    "magicLinkBaseUrl": "https://app.stratareserve.co",
+    "magicLinkCallbackPath": "/auth/callback"
+  }'
+```
+
+Notes:
+
+- `apiKey` and `from` are **not** required unless the request is establishing a
+  provider config. A magic-link-only tenant (no per-tenant Resend key) is
+  legal and falls back to the global `RESEND_API_KEY`.
+- `from` is required whenever an API key is present (stored or supplied).
+- An empty body `{}` is rejected (400): it would rewrite the row and evict the
+  auth cache while changing nothing.
+- All supplied fields must be non-empty strings; empty strings are not a way to
+  clear a field. Use DELETE to clear the whole config.
+- The per-tenant `EmailAuth` cache is evicted on every successful write, so the
+  next magic link uses the new values immediately.
+
+#### Magic-link field validation
+
+The magic link carries a login token in its query string, so these fields are
+validated strictly:
+
+- `magicLinkBaseUrl` must be an **https origin** with no path, query, fragment,
+  or embedded credentials (e.g. `https://app.stratareserve.co`). A trailing
+  slash is stripped.
+- `magicLinkCallbackPath` must be an **absolute same-app path** beginning with
+  `/` (e.g. `/auth/callback`). Values that would retarget another origin —
+  `https://evil.com/x`, protocol-relative `//evil.com/x`, or backslash variants
+  — are rejected, because the link is built as `new URL(callbackPath, baseUrl)`.
+
+With the two values above, magic links resolve to
+`https://app.stratareserve.co/auth/callback?token=...&email=...`.
+
 ### Read config
 
 ```bash
