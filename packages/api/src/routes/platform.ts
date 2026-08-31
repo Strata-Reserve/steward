@@ -114,6 +114,48 @@ function isOptionalString(value: unknown): value is string | undefined {
   return value === undefined || isNonEmptyString(value);
 }
 
+/**
+ * Magic-link base URL validator.
+ *
+ * The magic link is the one URL a signed-out human is asked to click, so the
+ * accepted shape is deliberately narrow: an HTTPS ORIGIN and nothing else. A
+ * path prefix, query, fragment, or userinfo here would be silently carried into
+ * every sign-in email, and `new URL(callbackPath, baseUrl)` would resolve the
+ * callback against it in ways the operator did not intend.
+ */
+function isValidMagicLinkBaseUrl(value: unknown): value is string {
+  if (!isNonEmptyString(value)) return false;
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:") return false;
+  if (url.username !== "" || url.password !== "") return false;
+  if (url.search !== "" || url.hash !== "") return false;
+  if (url.pathname !== "" && url.pathname !== "/") return false;
+  return url.hostname.length > 0;
+}
+
+/**
+ * Magic-link callback path validator.
+ *
+ * Must be a same-origin absolute path. `//evil.example` is rejected because
+ * `new URL("//evil.example", base)` is PROTOCOL-RELATIVE and silently retargets
+ * the link to another host — the open-redirect shape this check exists to stop.
+ */
+function isValidMagicLinkCallbackPath(value: unknown): value is string {
+  if (!isNonEmptyString(value)) return false;
+  const path = value.trim();
+  if (path.length > 512) return false;
+  if (!path.startsWith("/")) return false;
+  if (path.startsWith("//")) return false;
+  if (path.includes("://")) return false;
+  if (path.includes("?") || path.includes("#")) return false;
+  return !/\s/.test(path);
+}
+
 async function getTenantOr404(tenantId: string) {
   const db = getDb();
   const [tenant] = await db
@@ -353,18 +395,41 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
   }
 
   const body = await safeJsonParse<{
-    apiKey: string;
-    from: string;
+    apiKey?: string;
+    from?: string;
     replyTo?: string;
     templateId?: string;
     subjectOverride?: string;
+    magicLinkBaseUrl?: string;
+    magicLinkCallbackPath?: string;
   }>(c);
 
   if (!body) {
     return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
   }
 
-  if (!isNonEmptyString(body.apiKey) || !isNonEmptyString(body.from)) {
+  // Read the CURRENT config before deciding anything: this route is a MERGE,
+  // not a replace, so every unspecified field — including the encrypted
+  // provider secret — has to survive verbatim.
+  const [existingRow] = await db
+    .select({ emailConfig: tenantConfigs.emailConfig })
+    .from(tenantConfigs)
+    .where(eq(tenantConfigs.tenantId, tenantId));
+  const existing = existingRow?.emailConfig ?? undefined;
+
+  // Two modes, discriminated by whether the caller mentioned a credential field
+  // AT ALL (not by whether it is valid):
+  //
+  //   credential mode  — apiKey and/or from present. Historic strict validation
+  //                      applies UNCHANGED: both are required together.
+  //   callback-only    — neither present. The caller is re-pointing the
+  //                      magic-link target and must NOT have to re-supply the
+  //                      Resend secret to do it. This is the whole point of the
+  //                      route split: an operator can fix sign-in routing
+  //                      without ever handling the provider credential.
+  const credentialUpdate = body.apiKey !== undefined || body.from !== undefined;
+
+  if (credentialUpdate && (!isNonEmptyString(body.apiKey) || !isNonEmptyString(body.from))) {
     return c.json<ApiResponse>({ ok: false, error: "apiKey and from are required" }, 400);
   }
 
@@ -379,22 +444,86 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
     );
   }
 
-  const encryptedApiKey = JSON.stringify(platformKeyStore().encrypt(body.apiKey.trim()));
-  const emailConfig = {
-    provider: "resend" as const,
-    apiKeyEncrypted: encryptedApiKey,
-    from: body.from.trim(),
+  if (body.magicLinkBaseUrl !== undefined && !isValidMagicLinkBaseUrl(body.magicLinkBaseUrl)) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error:
+          "magicLinkBaseUrl must be an https origin with no userinfo, path, query, or fragment",
+      },
+      400,
+    );
+  }
+
+  if (
+    body.magicLinkCallbackPath !== undefined &&
+    !isValidMagicLinkCallbackPath(body.magicLinkCallbackPath)
+  ) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error:
+          "magicLinkCallbackPath must be a same-origin absolute path (leading '/', no '//', scheme, query, or fragment)",
+      },
+      400,
+    );
+  }
+
+  if (
+    !credentialUpdate &&
+    body.magicLinkBaseUrl === undefined &&
+    body.magicLinkCallbackPath === undefined
+  ) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error:
+          "Provide apiKey + from to set provider credentials, or magicLinkBaseUrl/magicLinkCallbackPath to update callback routing",
+      },
+      400,
+    );
+  }
+
+  // `magicLinkCallbackPath` has NO EFFECT unless a base URL is set (see
+  // TenantEmailConfig): createEmailAuthForTenant only reads the path when
+  // magicLinkBaseUrl is present. Accepting a lone path would return 200 while
+  // changing nothing observable — a silent no-op is worse than a refusal.
+  const effectiveBaseUrl = body.magicLinkBaseUrl ?? existing?.magicLinkBaseUrl;
+  if (body.magicLinkCallbackPath !== undefined && !effectiveBaseUrl) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: "magicLinkCallbackPath requires magicLinkBaseUrl to be set on this tenant",
+      },
+      400,
+    );
+  }
+
+  // The existing encrypted secret is carried across as an OPAQUE STRING. It is
+  // never decrypted, re-encrypted, logged, or returned on the callback-only
+  // path — the only way apiKeyEncrypted changes is an explicit credential
+  // update, which re-encrypts a caller-supplied key.
+  const emailConfig: NonNullable<typeof existing> = {
+    ...(existing ?? {}),
+    ...(credentialUpdate
+      ? {
+          provider: "resend" as const,
+          apiKeyEncrypted: JSON.stringify(
+            platformKeyStore().encrypt((body.apiKey as string).trim()),
+          ),
+          from: (body.from as string).trim(),
+        }
+      : {}),
     ...(body.replyTo ? { replyTo: body.replyTo.trim() } : {}),
     ...(body.templateId ? { templateId: body.templateId.trim() } : {}),
     ...(body.subjectOverride ? { subjectOverride: body.subjectOverride.trim() } : {}),
+    ...(body.magicLinkBaseUrl ? { magicLinkBaseUrl: body.magicLinkBaseUrl.trim() } : {}),
+    ...(body.magicLinkCallbackPath
+      ? { magicLinkCallbackPath: body.magicLinkCallbackPath.trim() }
+      : {}),
   };
 
-  const [existingConfig] = await db
-    .select({ tenantId: tenantConfigs.tenantId })
-    .from(tenantConfigs)
-    .where(eq(tenantConfigs.tenantId, tenantId));
-
-  if (existingConfig) {
+  if (existingRow) {
     await db
       .update(tenantConfigs)
       .set({ emailConfig, updatedAt: new Date() })
@@ -406,6 +535,8 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
     });
   }
 
+  // Per-tenant EmailAuth is memoised in-process; without this eviction the new
+  // callback routing would not take effect until the next restart.
   invalidateEmailAuthForTenant(tenantId);
 
   trackAuditEvent({
@@ -414,28 +545,38 @@ platform.patch("/tenants/:tenantId/email-config", async (c) => {
     action: "tenant.email_config.update",
     resourceType: "tenant",
     resourceId: tenantId,
-    metadata: { from: emailConfig.from, hasReplyTo: !!emailConfig.replyTo },
+    metadata: {
+      credentialUpdated: credentialUpdate,
+      from: emailConfig.from,
+      hasReplyTo: !!emailConfig.replyTo,
+      magicLinkBaseUrl: emailConfig.magicLinkBaseUrl,
+      magicLinkCallbackPath: emailConfig.magicLinkCallbackPath,
+    },
     ...auditCtx(c),
   });
 
   return c.json<
     ApiResponse<{
-      provider: "resend";
-      from: string;
+      provider?: "resend";
+      from?: string;
       replyTo?: string;
       templateId?: string;
       subjectOverride?: string;
-      hasApiKey: true;
+      magicLinkBaseUrl?: string;
+      magicLinkCallbackPath?: string;
+      hasApiKey: boolean;
     }>
   >({
     ok: true,
     data: {
-      provider: "resend",
+      provider: emailConfig.provider,
       from: emailConfig.from,
       replyTo: emailConfig.replyTo,
       templateId: emailConfig.templateId,
       subjectOverride: emailConfig.subjectOverride,
-      hasApiKey: true,
+      magicLinkBaseUrl: emailConfig.magicLinkBaseUrl,
+      magicLinkCallbackPath: emailConfig.magicLinkCallbackPath,
+      hasApiKey: Boolean(emailConfig.apiKeyEncrypted),
     },
   });
 });

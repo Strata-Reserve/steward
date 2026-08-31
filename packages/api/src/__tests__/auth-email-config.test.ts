@@ -180,4 +180,39 @@ describe("getEmailAuthForTenant", () => {
     await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
     invalidateEmailAuthForTenant(TEST_TENANT_ID);
   });
+
+  it("resolves the Strata production callback routing end to end (STRATA auth callback fix)", async () => {
+    clearEmailAuthTenantCacheForTests();
+
+    // The exact pair the production PATCH will set for tenant `strata`. This is
+    // the assertion that actually matters for human sign-in: it proves the
+    // magic link is built against the Strata SPA origin AND the one callback
+    // path the SPA router registers (`/auth/callback`), instead of Steward's
+    // DEFAULT_CALLBACK `/auth/callback/email`, which the SPA does not route and
+    // which therefore bounced every login back to /login.
+    const encrypted = new KeyStore(MASTER_PASSWORD).encrypt("tenant-resend-key");
+    const dbHandle = getDb();
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    await dbHandle.insert(tenantConfigs).values({
+      tenantId: TEST_TENANT_ID,
+      emailConfig: {
+        provider: "resend",
+        apiKeyEncrypted: JSON.stringify(encrypted),
+        from: "Strata <login@stratareserve.co>",
+        magicLinkBaseUrl: "https://app.stratareserve.co",
+        magicLinkCallbackPath: "/auth/callback",
+      },
+    });
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+
+    const auth = await getEmailAuthForTenant(TEST_TENANT_ID);
+
+    expect((auth as any).baseUrl).toBe("https://app.stratareserve.co");
+    expect((auth as any).callbackPath).toBe("/auth/callback");
+    // Explicitly NOT the Steward default that caused the outage.
+    expect((auth as any).callbackPath).not.toBe("/auth/callback/email");
+
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+  });
 });
