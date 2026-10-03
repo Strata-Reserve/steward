@@ -587,9 +587,26 @@ export const transactions = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     signedAt: timestamp("signed_at", { withTimezone: true }),
     confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+    /**
+     * Caller-supplied stable execution reference (STRATA-1486). Opaque to
+     * Steward. Only populated for requests that carried one; legacy rows are
+     * NULL. Uniqueness is scoped to (tenant_id, agent_id, execution_ref) so a
+     * duplicate request can never create a second executable action.
+     */
+    tenantId: varchar("tenant_id", { length: 64 }),
+    executionRef: varchar("execution_ref", { length: 128 }),
   },
   (table) => ({
     agentIdIdx: index("transactions_agent_id_idx").on(table.agentId),
+    tenantAgentExecutionRefIdx: uniqueIndex("transactions_tenant_agent_execution_ref_idx").on(
+      table.tenantId,
+      table.agentId,
+      table.executionRef,
+    ),
+    executionRefChk: check(
+      "transactions_execution_ref_chk",
+      sql`${table.executionRef} IS NULL OR (${table.tenantId} IS NOT NULL AND length(${table.executionRef}) BETWEEN 1 AND 128)`,
+    ),
   }),
 );
 
