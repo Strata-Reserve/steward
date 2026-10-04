@@ -691,18 +691,33 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
       data: { txId, txHash },
     });
   } catch (e: unknown) {
-    // Revert the atomic claim so the approval can be retried
-    await db
-      .update(approvalQueue)
-      .set({ status: "pending", resolvedAt: null, resolvedBy: null })
-      .where(and(eq(approvalQueue.txId, txId), eq(approvalQueue.agentId, agentId)));
-
     const requestId = c.get("requestId") || "unknown";
     const rawMessage = e instanceof Error ? e.message : "Unknown error";
     console.error(`[${requestId}] Approve transaction failed for agent ${agentId}, tx ${txId}:`, e);
 
+    // STRATA-1499: fail closed. The approval claim has been consumed and the
+    // broadcaster was invoked; an RPC can accept a transaction and still
+    // throw, so a thrown error here is NOT proof that nothing was broadcast.
+    // The claim is therefore never released back to `pending` and the row is
+    // bound to a terminal, hashless `failed` state that only lookup /
+    // reconciliation reads. A second approval hits the 409 claim guard and a
+    // /sign replay under the same executionRef reports `failed`; neither can
+    // sign. There is no provable pre-broadcast boundary inside this try: the
+    // vault call is a single opaque step that may have reached the RPC, and
+    // every earlier step is a DB read/decrypt we cannot distinguish from here.
+    // The status update is a CAS on `pending` so a row the vault already
+    // upserted with a hash is never downgraded to failed-without-hash.
+    await db
+      .update(transactions)
+      .set({ status: "failed" })
+      .where(and(eq(transactions.id, txId), eq(transactions.status, "pending")))
+      .catch((updateErr) =>
+        console.error(`[${requestId}] Failed to mark approved tx ${txId} failed:`, updateErr),
+      );
+
     dispatchWebhook(tenantId, agentId, "tx_failed", {
       txId,
+      ...(transaction.executionRef ? { executionRef: transaction.executionRef } : {}),
       error: rawMessage,
       requestId,
     });
