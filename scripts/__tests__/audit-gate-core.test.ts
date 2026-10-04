@@ -477,16 +477,16 @@ describe("the REAL shipped registry", () => {
     expect(validity).toEqual([]);
   });
 
-  it("keeps image-size as CLASS B with the non-reachability disposition", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "image-size");
+  it("keeps braces as CLASS B with the non-reachability disposition", () => {
+    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
     expect(e).toBeDefined();
     expect(e?.reachabilityClass).toBe("B");
     expect(e?.disposition).toBe("accepted_present_but_not_imported_by_runtime");
     expect(e?.qualifiers).toContain("no_fix_available");
   });
 
-  it("keeps vite and next as CLASS A absent-from-closure", () => {
-    for (const pkg of ["vite", "next"]) {
+  it("keeps vite as CLASS A absent-from-closure", () => {
+    for (const pkg of ["vite"]) {
       const e = AUDIT_EXCEPTIONS.find((x) => x.package === pkg);
       expect(e?.reachabilityClass).toBe("A");
       expect(e?.disposition).toBe("accepted_absent_from_production_closure");
@@ -499,25 +499,26 @@ describe("the REAL shipped registry", () => {
     }
   });
 
-  it("gives image-size the shorter 30-day-class review window", () => {
-    const img = AUDIT_EXCEPTIONS.find((x) => x.package === "image-size");
+  it("gives braces the shorter 30-day-class review window", () => {
+    const img = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
     const vite = AUDIT_EXCEPTIONS.find((x) => x.package === "vite");
     const days = (e?: AuditException) =>
       e ? (Date.parse(e.reviewBy) - Date.parse(e.acceptedOn)) / 86_400_000 : Number.NaN;
     expect(days(img)).toBeLessThanOrEqual(31);
     expect(days(img)).toBeLessThan(days(vite));
   });
-  it("requires image-size to name its four mandatory reconsideration triggers", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "image-size");
+  it("requires braces to name its four mandatory reconsideration triggers", () => {
+    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
     const joined = (e?.reconsiderIf ?? []).join(" | ").toLowerCase();
-    expect(joined).toContain("fixed image-size release");
+    expect(joined).toContain("braces release");
+    expect(joined).toContain("patched");
     expect(joined).toContain("@stwd/react");
     expect(joined).toContain("composition changes");
     expect(joined).toContain("reachability checker");
   });
 
-  it("does not describe image-size with absence language in its rationale", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "image-size");
+  it("does not describe braces with absence language in its rationale", () => {
+    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
     expect(e?.rationale ?? "").toMatch(/IS PRESENT/);
     expect(e?.rationale ?? "").not.toMatch(/\bis absent\b/i);
   });
@@ -531,8 +532,8 @@ describe("R2 F4 — CLASS B entry workspace is explicit, not parsed from prose",
     }
   });
 
-  it("image-size names @stwd/react explicitly, independent of entryPath word order", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "image-size");
+  it("braces names @stwd/react explicitly, independent of entryPath word order", () => {
+    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
     expect(e?.entryWorkspace).toBe("@stwd/react");
     // The prose mentions several other scoped packages FIRST; the old regex
     // captured whichever came first, so word order silently chose the subject.
