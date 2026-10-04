@@ -471,6 +471,7 @@ claim. Do not read "accepted" as "not installed".
 | Package | CVE / advisory | Disposition | Class | Owner | Accepted | Review by |
 |---|---|---|---|---|---|---|
 | `vite` (>=7.0.0 <=7.3.4) | GHSA-fx2h-pf6j-xcff — `server.fs.deny` bypass on Windows alternate paths | `accepted_unreachable_dependency_risk` | A | JJ Joseph | 2026-08-11 | 2026-11-11 |
+| `braces` (<=3.0.3) | GHSA-vfj7-8cjw-p6xm — stack-exhaustion DoS through deeply nested glob patterns | `accepted_unreachable_dependency_risk` + `no_fix_available` | B | JJ Joseph | 2026-10-04 | 2026-11-03 |
 
 #### `vite` — CLASS A
 
@@ -483,6 +484,62 @@ claim. Do not read "accepted" as "not installed".
   ever included in the production runtime; the runtime-image composition changes
   materially; or the dependency path changes.
 
+#### `braces` — CLASS B (TEMPORARY, STRATA-1494)
+
+Approved by JJ in #development on 2026-10-04 as a temporary CLASS B exception.
+**This exception does not authorize other unpatched dependencies.**
+
+- **No fix available**: the vulnerable range is `<= 3.0.3` and 3.0.3 is the latest published
+  `braces`; there is no release to upgrade or override to. `micromatch` 4.x hard-depends on
+  `braces`. Nothing was changed in the tree.
+- **Dependency paths** (from `bun pm why braces`; the proximate parents are `micromatch` and
+  `chokidar@3`, and `braces` is not a direct dependency of any Steward workspace package):
+  - Production-closure chain (the one the acceptance rests on): `@stwd/react → wagmi →
+    @wagmi/connectors → porto` (optional peer `react-native`), or `@stwd/react →
+    @solana/wallet-adapter-react → @solana-mobile/wallet-adapter-mobile |
+    @solana-mobile/wallet-standard-mobile` (optional), or `@trezor/env-utils` (optional
+    peer), or `@walletconnect/keyvaluestorage → @react-native-async-storage/async-storage`
+    (optional peer) `→ react-native → @react-native/community-cli-plugin → metro-config →
+    metro → metro-file-map → micromatch → braces`.
+  - Dev-only chain: `@stwd/web (devDependencies) → tailwindcss@3 → micromatch | fast-glob →
+    micromatch | chokidar@3 → braces`. `web` is stubbed in the runtime stage and
+    `tailwindcss` is not in the production closure; this chain contributes nothing to the
+    deployed image.
+- **Reachability evidence (non-runtime)**:
+  - Import-reachability from the 12 runtime-shipped roots, using the same lockfile graph
+    `scripts/verify-production-reachability.ts` uses: `braces`, `micromatch`, `chokidar`,
+    `fast-glob`, `tailwindcss`, `metro`, `metro-file-map`, `react-native` → all
+    **not reachable**.
+  - Production closure (scratch `--production` install, web stubbed): `braces@3.0.3`,
+    `micromatch@4.0.8`, `metro`, `metro-file-map` and `react-native` are **PRESENT**, because
+    `@stwd/react` is not stubbed and its optional-peer subtree is installed. That is why this
+    is CLASS B and cannot honestly be filed as CLASS A. "Accepted" here means "installed but
+    nothing shipped imports it", not "not installed".
+  - Exposure requires an attacker-supplied glob pattern. tailwind and metro only ever see
+    developer-authored patterns from their config files, at build time (tailwind) or never
+    (metro is the react-native bundler; nothing in Steward invokes it). No Steward API
+    accepts a glob pattern from a client.
+- **Compensating controls**: the CLASS B check in `scripts/verify-production-reachability.ts`
+  re-verifies on every run that no runtime-shipped root imports `braces`
+  (`entryWorkspace: @stwd/react`) and fails if the runtime composition pin changes; the
+  runtime image package allowlist is parsed from the `Dockerfile`, so adding `web` or `react`
+  output to the image fails the gate; `bun audit` keeps reporting the advisory and the
+  exception is bound to this single GHSA id, so the gate forces cleanup the moment the
+  advisory stops being reported.
+- **Upstream remediation trigger**: a `braces` release `> 3.0.3` marked as the first patched
+  version for GHSA-vfj7-8cjw-p6xm, OR `micromatch`/`chokidar@3` releases that drop `braces`,
+  OR tailwindcss 4 adoption in `web` PLUS `packages/react` being stubbed out of the runtime
+  stage (the standing remediation option that would move the whole react-native/metro
+  subtree out of the closure and let this be re-filed as CLASS A). Re-review IMMEDIATELY on
+  a fixed `braces` release; do not wait for expiry.
+- **Expiry / review**: accepted 2026-10-04, review by 2026-11-03 (30 days; CLASS B with no
+  fix gets the same short leash `image-size` had). **Mandatory re-review if**: a fixed
+  `braces` release appears; the reachability classification changes (`@stwd/react` or its
+  chain becomes imported by a runtime-copied package); Steward begins executing tailwind or
+  metro tooling, or any runtime code path imports the chain; any endpoint begins accepting
+  glob patterns from clients; the runtime image or package composition changes; the
+  reachability checker changes or fails; or the review date passes.
+
 ## Changelog
 
 - 2026-04-24 — Initial version.
@@ -493,3 +550,6 @@ claim. Do not read "accepted" as "not installed".
   Removal, not re-dating, per JJ in #development 2026-10-03. Advisory ids are deliberately
   not repeated here: the prose-binding gate treats any id after the accepted-CVE anchor as a
   claimed acceptance.
+- 2026-10-04 — STRATA-1494: added a temporary CLASS B `no_fix_available` acceptance for
+  `braces` (one advisory), approved by JJ in #development 2026-10-04. Review by 2026-11-03.
+  Not an authorization to normalize other unpatched dependencies.

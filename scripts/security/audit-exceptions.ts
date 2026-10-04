@@ -137,4 +137,52 @@ export const AUDIT_EXCEPTIONS: readonly AuditException[] = [
     ],
     expectedAbsentFromAudit: false,
   },
+  {
+    // STRATA-1494. TEMPORARY CLASS B acceptance approved by JJ (#development,
+    // 2026-10-04). This exception does NOT authorize other unpatched dependencies.
+    package: "braces",
+    advisories: ["GHSA-vfj7-8cjw-p6xm"],
+    authorizesSeverity: ["high"],
+    reachabilityClass: "B",
+    disposition: "accepted_present_but_not_imported_by_runtime",
+    qualifiers: ["no_fix_available"],
+    owner: OWNER_JJ,
+    rationale:
+      "Stack-exhaustion DoS when braces expands an attacker-controlled glob pattern with deep " +
+      "nesting. No patched release exists at any version (latest is 3.0.3, vulnerable range " +
+      "<= 3.0.3), so there is nothing to upgrade or override to. braces reaches the tree only " +
+      "through build/tooling parents: tailwindcss@3 (devDependency of @stwd/web, stubbed out of " +
+      "the runtime stage, ABSENT from the production closure) and metro-file-map via the " +
+      "react-native subtree pulled in by optional peers of @stwd/react's wallet connectors. The " +
+      "metro chain IS PRESENT in the production closure (hence CLASS B, not A), but no " +
+      "runtime-shipped package imports braces, micromatch, metro or react-native " +
+      "(import-reachability from the 12 runtime roots: not reachable, verified by " +
+      "scripts/verify-production-reachability.ts). Nothing in Steward executes metro or " +
+      "tailwind at runtime, and no Steward API accepts a glob pattern from a client, so there " +
+      "is no attacker-controlled input to the vulnerable function. Standing remediation: stub " +
+      "packages/react out of the runtime image stage (separate hardening ticket), which would " +
+      "move the whole react-native/metro subtree out of the closure.",
+    entryPath:
+      "@stwd/react -> wagmi -> @wagmi/connectors -> porto (optional peer react-native) | " +
+      "@stwd/react -> @solana/wallet-adapter-react -> @solana-mobile/wallet-adapter-mobile | " +
+      "@solana-mobile/wallet-standard-mobile (optional) | @trezor/env-utils (optional peer) | " +
+      "@walletconnect/keyvaluestorage -> @react-native-async-storage/async-storage (optional peer) " +
+      "-> react-native -> @react-native/community-cli-plugin -> metro-config -> metro -> " +
+      "metro-file-map -> micromatch -> braces; " +
+      "plus dev-only @stwd/web -> tailwindcss@3 -> micromatch | fast-glob -> micromatch | " +
+      "chokidar@3 -> braces (devDependency edge only, not in the production closure)",
+    entryWorkspace: "@stwd/react",
+    acceptedOn: "2026-10-04",
+    reviewBy: "2026-11-03",
+    reconsiderIf: [
+      "a braces release marked as the first patched version for GHSA-vfj7-8cjw-p6xm appears (re-review IMMEDIATELY; do not wait for expiry)",
+      "the reachability classification changes: @stwd/react or any package on its chain becomes import-reachable from a runtime-shipped package",
+      "Steward begins executing tailwind or metro tooling at runtime, or any runtime code path imports micromatch/braces",
+      "any Steward endpoint begins accepting glob patterns from clients",
+      "the runtime image or package composition changes (including packages/react being stubbed, which should re-class this as A or remove it)",
+      "the reachability checker changes or fails",
+      "expiry (reviewBy) is reached without a fixed release",
+    ],
+    expectedAbsentFromAudit: false,
+  },
 ];
