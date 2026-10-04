@@ -138,61 +138,50 @@ export const AUDIT_EXCEPTIONS: readonly AuditException[] = [
     expectedAbsentFromAudit: false,
   },
   {
-    package: "next",
-    advisories: ["GHSA-89xv-2m56-2m9x", "GHSA-m99w-x7hq-7vfj", "GHSA-p9j2-gv94-2wf4"],
-    authorizesSeverity: ["high"],
-    reachabilityClass: "A",
-    disposition: "accepted_absent_from_production_closure",
-    qualifiers: [],
-    owner: OWNER_JJ,
-    rationale:
-      "SSRF in Server Actions on custom servers, DoS in the App Router, and SSRF in rewrites. " +
-      "Next.js enters solely through the `web` workspace, which the runtime stage STUBS rather " +
-      "than ships. Next is ABSENT from the production dependency closure and no web application " +
-      "output is deployed with the signing service. Verified mechanically by " +
-      "scripts/verify-production-reachability.ts.",
-    entryPath: "workspace `web` -> next (web is stubbed in the runtime image stage)",
-    entryWorkspace: "@stwd/web",
-    acceptedOn: "2026-08-11",
-    reviewBy: "2026-11-11",
-    reconsiderIf: [
-      "@stwd/web, Next.js, or web build output is added to the production image",
-      "next appears in the production dependency closure for any reason",
-      "the runtime image package allowlist changes",
-      "the reachability checker changes or fails",
-    ],
-    expectedAbsentFromAudit: false,
-  },
-  {
-    package: "image-size",
-    advisories: ["GHSA-w3rx-r6r6-pgpr", "GHSA-5p2g-fcmc-qvqq"],
+    // STRATA-1494. TEMPORARY CLASS B acceptance approved by JJ (#development,
+    // 2026-10-04). This exception does NOT authorize other unpatched dependencies.
+    package: "braces",
+    advisories: ["GHSA-vfj7-8cjw-p6xm"],
     authorizesSeverity: ["high"],
     reachabilityClass: "B",
     disposition: "accepted_present_but_not_imported_by_runtime",
     qualifiers: ["no_fix_available"],
     owner: OWNER_JJ,
     rationale:
-      "Denial of service via infinite loops in the ICNS and JXL/HEIF parsers. This is a CLASS B " +
-      "acceptance and the distinction is material: image-size IS PRESENT in the production " +
-      "dependency closure at 1.2.1 — it is NOT absent. No patched release exists at any version " +
-      "(the advisory covers <=2.0.2 and the latest published version IS 2.0.2), so there is " +
-      "nothing to upgrade to. The acceptance rests on NON-REACHABILITY BY RUNTIME IMPORT: no " +
-      "package whose build output is copied into the runtime image has any import path, direct " +
-      "or transitive, to the workspace that pulls image-size in. Steward's signing service " +
-      "decodes no images, and both advisories require attacker-controlled image input.",
+      "Stack-exhaustion DoS when braces expands an attacker-controlled glob pattern with deep " +
+      "nesting. No patched release exists at any version (latest is 3.0.3, vulnerable range " +
+      "<= 3.0.3), so there is nothing to upgrade or override to. braces reaches the tree only " +
+      "through build/tooling parents: tailwindcss@3 (devDependency of @stwd/web, stubbed out of " +
+      "the runtime stage, ABSENT from the production closure) and metro-file-map via the " +
+      "react-native subtree pulled in by optional peers of @stwd/react's wallet connectors. The " +
+      "metro chain IS PRESENT in the production closure (hence CLASS B, not A), but no " +
+      "runtime-shipped package imports braces, micromatch, metro or react-native " +
+      "(import-reachability from the 12 runtime roots: not reachable, verified by " +
+      "scripts/verify-production-reachability.ts). Nothing in Steward executes metro or " +
+      "tailwind at runtime, and no Steward API accepts a glob pattern from a client, so there " +
+      "is no attacker-controlled input to the vulnerable function. Standing remediation: stub " +
+      "packages/react out of the runtime image stage (separate hardening ticket), which would " +
+      "move the whole react-native/metro subtree out of the closure.",
     entryPath:
-      "@stwd/react -> wagmi | @solana/wallet-adapter-* | @rainbow-me/rainbowkit -> " +
-      "(porto | @walletconnect/keyvaluestorage | @trezor/env-utils) -> react-native -> " +
-      "@react-native/community-cli-plugin -> metro -> image-size. The proximate parent is " +
-      "`metro`, the React Native bundler; image-size is not a direct wagmi/Solana dependency.",
+      "@stwd/react -> wagmi -> @wagmi/connectors -> porto (optional peer react-native) | " +
+      "@stwd/react -> @solana/wallet-adapter-react -> @solana-mobile/wallet-adapter-mobile | " +
+      "@solana-mobile/wallet-standard-mobile (optional) | @trezor/env-utils (optional peer) | " +
+      "@walletconnect/keyvaluestorage -> @react-native-async-storage/async-storage (optional peer) " +
+      "-> react-native -> @react-native/community-cli-plugin -> metro-config -> metro -> " +
+      "metro-file-map -> micromatch -> braces; " +
+      "plus dev-only @stwd/web -> tailwindcss@3 -> micromatch | fast-glob -> micromatch | " +
+      "chokidar@3 -> braces (devDependency edge only, not in the production closure)",
     entryWorkspace: "@stwd/react",
-    acceptedOn: "2026-08-11",
-    reviewBy: "2026-09-11",
+    acceptedOn: "2026-10-04",
+    reviewBy: "2026-11-03",
     reconsiderIf: [
-      "a fixed image-size release appears (re-review IMMEDIATELY, do not wait for expiry)",
-      "@stwd/react or its dependency chain becomes imported by a runtime-copied package",
-      "runtime image or package composition changes",
+      "a braces release marked as the first patched version for GHSA-vfj7-8cjw-p6xm appears (re-review IMMEDIATELY; do not wait for expiry)",
+      "the reachability classification changes: @stwd/react or any package on its chain becomes import-reachable from a runtime-shipped package",
+      "Steward begins executing tailwind or metro tooling at runtime, or any runtime code path imports micromatch/braces",
+      "any Steward endpoint begins accepting glob patterns from clients",
+      "the runtime image or package composition changes (including packages/react being stubbed, which should re-class this as A or remove it)",
       "the reachability checker changes or fails",
+      "expiry (reviewBy) is reached without a fixed release",
     ],
     expectedAbsentFromAudit: false,
   },

@@ -22,7 +22,7 @@
     "@stwd/shared": "workspace:*",
     "@tanstack/react-query": "^5.90.21",
     "framer-motion": "^12.36.0",
-    "next": "^15.5.16",
+    "next": "^15.5.24",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "viem": "^2.50.4",
@@ -35,6 +35,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
+    "@types/bun": "latest",
     "@types/node": "25.5.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
