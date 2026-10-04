@@ -136,11 +136,12 @@ export function toPolicyRule(policy: Policy): DbPolicyRule {
 export function toSignRequest(transaction: Transaction): SignRequest {
   return {
     agentId: transaction.agentId,
-    tenantId: "",
+    tenantId: transaction.tenantId ?? "",
     to: transaction.toAddress,
     value: transaction.value,
     data: transaction.data ?? undefined,
     chainId: transaction.chainId,
+    ...(transaction.executionRef ? { executionRef: transaction.executionRef } : {}),
   };
 }
 
@@ -155,5 +156,6 @@ export function toTxRecord(transaction: Transaction): DbTxRecord {
     createdAt: transaction.createdAt,
     signedAt: transaction.signedAt ?? undefined,
     confirmedAt: transaction.confirmedAt ?? undefined,
+    executionRef: transaction.executionRef ?? undefined,
   };
 }

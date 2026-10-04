@@ -266,6 +266,13 @@ export interface SignRequest {
   nonce?: number;
   gasLimit?: string;
   broadcast?: boolean; // default true — set false to return signed tx without broadcasting
+  /**
+   * Optional caller-supplied stable execution reference (STRATA-1486).
+   * Opaque to Steward. Scoped unique per (tenant, agent). A replay with the
+   * same reference and payload returns the existing action instead of signing
+   * again; a different payload under the same reference is rejected (409).
+   */
+  executionRef?: string;
 }
 
 /**
@@ -337,6 +344,7 @@ export interface TxRecord {
   createdAt: Date;
   signedAt?: Date;
   confirmedAt?: Date;
+  executionRef?: string;
 }
 
 export interface PolicyResult {
