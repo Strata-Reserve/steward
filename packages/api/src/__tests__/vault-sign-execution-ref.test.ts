@@ -377,6 +377,94 @@ describe.serial("vault sign executionRef (STRATA-1486)", () => {
     }
   });
 
+  it("STRATA-1499: an approval that fails after invoking the broadcaster is terminal — no second approval or replay can sign", async () => {
+    signCalls = [];
+    const ref = "strata:intent-approval-ambiguous:step-1";
+    const policyId = "exec-ref-auto-approve-ambiguous";
+    await getDb()
+      .insert(policies)
+      .values({
+        id: policyId,
+        agentId: AGENT_A,
+        type: "auto-approve-threshold",
+        enabled: true,
+        config: { threshold: "0" },
+      });
+    try {
+      const first = await sign(basePayload(ref));
+      expect(first.status).toBe(202);
+      const b1 = (await first.json()) as { data: { txId: string; status: string } };
+      expect(b1.data.status).toBe("pending_approval");
+      expect(signCalls).toHaveLength(0);
+
+      // Broadcaster is invoked (RPC may have accepted the tx) but the call
+      // throws before any hash is persisted → ambiguous outcome.
+      signSpy.mockImplementationOnce(async (request: SignRequest) => {
+        signCalls.push(request);
+        throw new Error("request timed out waiting for RPC response");
+      });
+      const approve = await app.request(`/vault/${AGENT_A}/approve/${b1.data.txId}`, {
+        method: "POST",
+        headers: headers(TENANT_A, keyA),
+        body: "{}",
+      });
+      expect([500, 502]).toContain(approve.status);
+      expect(signCalls).toHaveLength(1);
+
+      // Claim stays consumed; the action is terminal and hashless.
+      const queue = await getDb()
+        .select()
+        .from(approvalQueue)
+        .where(eq(approvalQueue.txId, b1.data.txId));
+      expect(queue).toHaveLength(1);
+      expect(queue[0]?.status).not.toBe("pending");
+      const rows = await rowsForRef(TENANT_A, AGENT_A, ref);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.status).toBe("failed");
+      expect(rows[0]?.txHash).toBeNull();
+
+      // A second human approval cannot sign.
+      const approveAgain = await app.request(`/vault/${AGENT_A}/approve/${b1.data.txId}`, {
+        method: "POST",
+        headers: headers(TENANT_A, keyA),
+        body: "{}",
+      });
+      expect(approveAgain.status).toBe(409);
+      expect(signCalls).toHaveLength(1);
+
+      // A /sign replay under the same ref cannot sign either.
+      const replay = await sign(basePayload(ref));
+      expect(replay.status).toBe(500);
+      const b2 = (await replay.json()) as {
+        data: { txId: string; status: string; txHash?: string; replayed: boolean };
+      };
+      expect(b2.data.txId).toBe(b1.data.txId);
+      expect(b2.data.status).toBe("failed");
+      expect(b2.data.txHash).toBeUndefined();
+      expect(b2.data.replayed).toBe(true);
+      expect(signCalls).toHaveLength(1);
+
+      // Lookup shows the hashless, non-retryable state.
+      const lookup = await app.request(`/vault/${AGENT_A}/actions/by-ref/${ref}`, {
+        headers: headers(TENANT_A, keyA),
+      });
+      expect(lookup.status).toBe(200);
+      const lb = (await lookup.json()) as { data: { status: string; txHash?: string } };
+      expect(lb.data.status).toBe("failed");
+      expect(lb.data.txHash).toBeUndefined();
+
+      const after = await getDb()
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, b1.data.txId));
+      expect(after).toHaveLength(1);
+      expect(after[0]?.status).toBe("failed");
+      expect(after[0]?.txHash).toBeNull();
+    } finally {
+      await getDb().delete(policies).where(eq(policies.id, policyId));
+    }
+  });
+
   it("binds a policy rejection to the reference and replays it as 403 without re-evaluating", async () => {
     signCalls = [];
     const ref = "strata:intent-rejected:step-1";
