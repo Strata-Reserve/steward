@@ -179,7 +179,10 @@ export function sanitizeErrorMessage(error: unknown): string {
       "Unsupported chain",
       "RPC endpoint not configured",
     ];
-    if (safe.some((s) => error.message.includes(s))) return error.message;
+    // REVIEW-STEWARD-28-R4 N1 follow-up: even an allowlisted message is run
+    // through the RPC redactor so a configured endpoint (host/path/key) that
+    // was interpolated into it can never reach an HTTP body.
+    if (safe.some((s) => error.message.includes(s))) return redactRpcMessage(error.message);
   }
   return "Internal server error";
 }
