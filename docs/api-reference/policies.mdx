@@ -65,7 +65,7 @@ Replaces all policies for an agent.
 PUT /agents/:agentId/policies
 ```
 
-**Auth:** Tenant API key or agent JWT
+**Auth:** Owner/admin session (dashboard/session JWT with tenant role `owner` or `admin`). Tenant API keys are rejected unless `STEWARD_ALLOW_API_KEY_POLICY_WRITES=true` is explicitly set; agent JWTs are never permitted (STRATA-1499).
 
 <Warning>
   This endpoint **replaces** the entire policy set. Always send the complete list of policies you want the agent to have.

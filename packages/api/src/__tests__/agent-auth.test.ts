@@ -277,6 +277,10 @@ describe.skipIf(SKIP)("POST /vault/:agentId/import", () => {
   });
 
   it("rejects import from agent-scoped token", async () => {
+    // Agent tokens are never permitted to import key material, even with the
+    // STEWARD_ALLOW_API_KEY_POLICY_WRITES opt-in (which re-permits the tenant
+    // key only). The CI server runs with that opt-in, so this proves the
+    // agent-token path still 403s regardless (STRATA-1499).
     const agentToken = await createAgentToken(IMPORT_AGENT_ID, TEST_TENANT_ID);
 
     const res = await fetch(`${BASE_URL}/vault/${IMPORT_AGENT_ID}/import`, {
@@ -290,7 +294,7 @@ describe.skipIf(SKIP)("POST /vault/:agentId/import", () => {
 
     expect(res.status).toBe(403);
     const json = (await res.json()) as any;
-    expect(json.error).toContain("tenant-level");
+    expect(json.error).toContain("owner/admin session");
   });
 
   it("rejects missing privateKey", async () => {

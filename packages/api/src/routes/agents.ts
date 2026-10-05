@@ -23,10 +23,12 @@ import {
   ensureAgentForTenant,
   isNonEmptyString,
   isValidAgentId,
+  POLICY_WRITE_FORBIDDEN_ERROR,
   type PolicyRule,
   parseAgentTokenScopes,
   policies,
   requireAgentAccess,
+  requirePolicyWriteAuthority,
   requireTenantLevel,
   safeJsonParse,
   sanitizeErrorMessage,
@@ -454,6 +456,13 @@ agentRoutes.post("/batch", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
   }
 
+  // Seeding policies during batch creation is a policy write: it requires
+  // owner/admin session authority (or the explicit api-key opt-in). Agent
+  // creation itself stays at tenant-level. Gate only when applyPolicies is set.
+  if (body.applyPolicies && body.applyPolicies.length > 0 && !requirePolicyWriteAuthority(c)) {
+    return c.json<ApiResponse>({ ok: false, error: POLICY_WRITE_FORBIDDEN_ERROR }, 403);
+  }
+
   if (!Array.isArray(body.agents) || body.agents.length === 0) {
     return c.json<ApiResponse>(
       { ok: false, error: "agents array is required and must not be empty" },
@@ -571,11 +580,18 @@ agentRoutes.get("/:agentId/policies", async (c) => {
 // ─── Update agent policies ────────────────────────────────────────────────────
 
 agentRoutes.put("/:agentId/policies", async (c) => {
+  // Preserve the cross-agent scope message for agent tokens targeting a
+  // different agent (the most severe escalation path), then enforce that
+  // policy writes need owner/admin session authority regardless of scope.
   if (!requireAgentAccess(c)) {
     return c.json<ApiResponse>(
       { ok: false, error: "Forbidden: token scope does not match agent" },
       403,
     );
+  }
+
+  if (!requirePolicyWriteAuthority(c)) {
+    return c.json<ApiResponse>({ ok: false, error: POLICY_WRITE_FORBIDDEN_ERROR }, 403);
   }
 
   const tenantId = c.get("tenantId");

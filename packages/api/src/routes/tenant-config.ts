@@ -20,7 +20,14 @@ import { Hono } from "hono";
 import { DEFAULT_TENANT_CONFIGS } from "../defaults/tenant-configs";
 import { invalidateTenantCorsCache } from "../middleware/tenant-cors";
 import { trackAuditEvent } from "../services/audit";
-import { type ApiResponse, type AppVariables, db, safeJsonParse } from "../services/context";
+import {
+  type ApiResponse,
+  type AppVariables,
+  db,
+  POLICY_WRITE_FORBIDDEN_ERROR,
+  requirePolicyWriteAuthority,
+  safeJsonParse,
+} from "../services/context";
 import { requireTenantId } from "./tenants";
 
 export const tenantConfigRoutes = new Hono<{ Variables: AppVariables }>();
@@ -202,6 +209,12 @@ tenantConfigRoutes.get("/:id/config/templates", requireTenantId, async (c) => {
 tenantConfigRoutes.post("/:id/config/templates/:name/apply", requireTenantId, async (c) => {
   const tenantId = c.req.param("id") as string;
   const templateName = c.req.param("name");
+
+  // Applying a template rewrites the target agent's policy rows — a policy
+  // write that needs owner/admin session authority, not just a tenant key.
+  if (!requirePolicyWriteAuthority(c)) {
+    return c.json<ApiResponse>({ ok: false, error: POLICY_WRITE_FORBIDDEN_ERROR }, 403);
+  }
 
   const body = await safeJsonParse<{
     agentId: string;

@@ -890,12 +890,59 @@ describe("PolicyEngine.evaluate()", () => {
     };
   }
 
-  it("no policies → auto-approved (approved=true, requiresManualApproval=false)", async () => {
+  it("no policies → denied (fail-closed, approved=false, requiresManualApproval=false)", async () => {
     const result = await engine.evaluate([], makeEngineCtx());
 
+    expect(result.approved).toBe(false);
+    expect(result.requiresManualApproval).toBe(false);
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0].passed).toBe(false);
+    expect(result.results[0].policyId).toBe("no-effective-policy");
+    expect(result.results[0].reason).toContain("No effective policy");
+  });
+
+  it("all policies disabled → denied (disabling rules is not allow-all)", async () => {
+    const policies: PolicyRule[] = [
+      {
+        id: "disabled-spend",
+        type: "spending-limit",
+        enabled: false,
+        config: { maxPerTx: "1", maxPerDay: "1", maxPerWeek: "1" },
+      },
+      {
+        id: "disabled-rate",
+        type: "rate-limit",
+        enabled: false,
+        config: { maxTxPerHour: 1, maxTxPerDay: 1 },
+      },
+    ];
+
+    const result = await engine.evaluate(policies, makeEngineCtx());
+
+    expect(result.approved).toBe(false);
+    expect(result.requiresManualApproval).toBe(false);
+    // Per-rule "Policy disabled" results are preserved, plus the sentinel deny.
+    expect(result.results.at(-1)?.policyId).toBe("no-effective-policy");
+    expect(result.results.at(-1)?.passed).toBe(false);
+  });
+
+  it("one enabled rule alongside a disabled rule still evaluates normally", async () => {
+    const policies: PolicyRule[] = [
+      {
+        id: "disabled-spend",
+        type: "spending-limit",
+        enabled: false,
+        config: { maxPerTx: "1", maxPerDay: "1", maxPerWeek: "1" }, // would fail if enabled
+      },
+      makeRateRule({ maxTxPerHour: 10, maxTxPerDay: 50 }),
+    ];
+
+    const result = await engine.evaluate(policies, makeEngineCtx());
+
+    // The enabled rate-limit passes and there is an effective policy, so approve.
     expect(result.approved).toBe(true);
     expect(result.requiresManualApproval).toBe(false);
-    expect(result.results).toHaveLength(0);
+    expect(result.results.some((r) => r.policyId === "no-effective-policy")).toBe(false);
   });
 
   it("all hard policies pass → approved", async () => {
@@ -1131,7 +1178,7 @@ describe("PolicyEngine.evaluate()", () => {
     expect(result.results.find((r) => r.type === "spending-limit")?.passed).toBe(true);
   });
 
-  it("disabled policy inside engine is skipped (treated as passed)", async () => {
+  it("disabled policy is skipped per-rule (passed=true) but a lone disabled rule denies the set", async () => {
     const policies: PolicyRule[] = [
       {
         id: "disabled",
@@ -1143,8 +1190,12 @@ describe("PolicyEngine.evaluate()", () => {
 
     const result = await engine.evaluate(policies, makeEngineCtx());
 
-    expect(result.approved).toBe(true);
+    // The per-rule evaluation is unchanged: a disabled rule reports as passed.
     expect(result.results[0].passed).toBe(true);
     expect(result.results[0].reason).toBe("Policy disabled");
+    // But with no enabled rule, the set carries no authority: deny (fail-closed).
+    expect(result.approved).toBe(false);
+    expect(result.requiresManualApproval).toBe(false);
+    expect(result.results.at(-1)?.policyId).toBe("no-effective-policy");
   });
 });

@@ -502,6 +502,61 @@ export function requireTenantLevel(c: Context<{ Variables: AppVariables }>): boo
 }
 
 /**
+ * Opt-in env flag that re-permits tenant API keys (and nothing else) to perform
+ * policy / key-material writes. Default OFF. Exists only so an operator who
+ * genuinely scripts policy seeding from a backend service with the tenant key
+ * can do so deliberately, rather than having that authority on by default.
+ *
+ * Read lazily (not captured at import) so tests can toggle it per-case.
+ */
+export function apiKeyPolicyWritesAllowed(): boolean {
+  return process.env.STEWARD_ALLOW_API_KEY_POLICY_WRITES === "true";
+}
+
+/**
+ * Authority gate for high-privilege configuration writes: an agent's policy set
+ * (`PUT /agents/:agentId/policies`, batch `applyPolicies`, tenant
+ * `defaultPolicies`, policy-template assignment) and key material
+ * (`/vault/:agentId/export`, `/vault/:agentId/import`).
+ *
+ * Finding SF-1: the tenant API key that signs via `/vault/:id/sign` could also
+ * rewrite or delete the minter's policies (and export its key), so a single
+ * leaked key is unbounded authority. These writes now require a human
+ * owner/admin **session** (session-jwt or dashboard-jwt with tenantRole
+ * owner|admin). Tenant API keys and agent tokens are rejected by default.
+ *
+ * The only escape hatch is the explicit, default-off
+ * `STEWARD_ALLOW_API_KEY_POLICY_WRITES=true` env opt-in, which re-permits the
+ * tenant API key (still never an agent token).
+ *
+ * Returns true if the caller may perform the write.
+ */
+export function requirePolicyWriteAuthority(c: Context<{ Variables: AppVariables }>): boolean {
+  const authType = c.get("authType");
+
+  // Human owner/admin session is always sufficient.
+  if (authType === "session-jwt" || authType === "dashboard-jwt") {
+    const tenantRole = c.get("tenantRole");
+    return tenantRole === "owner" || tenantRole === "admin";
+  }
+
+  // Tenant API key: only with the explicit env opt-in. Agent tokens never.
+  if (authType === "api-key") {
+    return apiKeyPolicyWritesAllowed();
+  }
+
+  return false;
+}
+
+/**
+ * Shared 403 payload for a rejected policy-write / key-material write.
+ */
+export const POLICY_WRITE_FORBIDDEN_ERROR =
+  "Policy and key-material writes require a tenant owner/admin session. " +
+  "Tenant API keys and agent tokens are not permitted unless " +
+  "STEWARD_ALLOW_API_KEY_POLICY_WRITES=true is explicitly set.";
+
+/**
  * dashboardAuthMiddleware
  * Accepts a session JWT (Bearer token) issued by the auth routes.
  * Extracts userId and tenantId, looks up the tenant, and sets context variables

@@ -110,6 +110,30 @@ beforeAll(async () => {
   await createAgent(TENANT_A, keyA, AGENT_A);
   await createAgent(TENANT_B, keyB, AGENT_B);
 
+  // Fail-closed (STRATA-1499): an agent with no policy set cannot sign. These
+  // execution-ref tests exercise the sign/replay state machine, not policy
+  // enforcement, so seed a permissive (always-pass) rule on both agents. Tests
+  // that assert a policy outcome insert their own rule and clean it up.
+  const MAX_UINT = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+  await getDb()
+    .insert(policies)
+    .values([
+      {
+        id: "exec-ref-permissive-a",
+        agentId: AGENT_A,
+        type: "spending-limit",
+        enabled: true,
+        config: { maxPerTx: MAX_UINT, maxPerDay: MAX_UINT, maxPerWeek: MAX_UINT },
+      },
+      {
+        id: "exec-ref-permissive-b",
+        agentId: AGENT_B,
+        type: "spending-limit",
+        enabled: true,
+        config: { maxPerTx: MAX_UINT, maxPerDay: MAX_UINT, maxPerWeek: MAX_UINT },
+      },
+    ]);
+
   // Fake signer: mirrors the real vault's "upsert row by txId, return hash"
   // contract without touching any RPC. Each call == one broadcast.
   signSpy = spyOn(vault, "signTransaction").mockImplementation(

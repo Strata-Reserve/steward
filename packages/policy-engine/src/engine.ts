@@ -84,6 +84,21 @@ export interface PolicyEvaluatedEvent {
 
 export type AuditHook = (event: PolicyEvaluatedEvent) => void | Promise<void>;
 
+/**
+ * Synthetic policy result emitted when a request is denied because the agent
+ * has no effective (enabled) policy. It is not tied to a stored policy row, so
+ * `policyId` is a sentinel; `type` reuses `approved-addresses` only to satisfy
+ * the `PolicyType` union — the `reason` is the signal. Surfaced to callers and
+ * persisted on the rejected transaction row so the deny is self-describing.
+ */
+export const NO_EFFECTIVE_POLICY_RESULT: PolicyResult = {
+  policyId: "no-effective-policy",
+  type: "approved-addresses",
+  passed: false,
+  reason:
+    "No effective policy is configured for this agent; signing is denied until a policy is set (fail-closed).",
+};
+
 export interface PolicyEngineOptions {
   /**
    * Sprint 4: optional sink for `policy.evaluated` audit events. Trade-
@@ -98,6 +113,8 @@ export interface PolicyEngineOptions {
  * Policy Engine — evaluates a set of policy rules against a transaction request.
  *
  * Logic:
+ * - Fail-closed: an empty policy set, or a set whose every rule is disabled,
+ *   denies the request (no effective policy = no authority to act).
  * - All enabled policies must pass for auto-approval
  * - If auto-approve-threshold fails but all other policies pass, tx is queued for manual approval
  * - If any hard policy (spending-limit, approved-addresses, rate-limit, time-window) fails, tx is rejected
@@ -118,9 +135,19 @@ export class PolicyEngine {
     policies: PolicyRule[],
     ctx: PolicyEvaluationContext & { correlationId?: string },
   ): Promise<EvaluationResult> {
+    // Fail-closed: an agent with no policy set has no authority to act. This is
+    // the deliberate inverse of the old "no policies => auto-approve" default,
+    // which made an unbounded tenant/agent key equivalent to a master key the
+    // moment its policy rows were absent (or deleted). Every signing request
+    // for a policy-less agent is now denied and audited.
     if (policies.length === 0) {
-      // No policies = everything auto-approved (dangerous but valid for testing)
-      return { approved: true, results: [], requiresManualApproval: false };
+      const evaluationResult: EvaluationResult = {
+        approved: false,
+        results: [NO_EFFECTIVE_POLICY_RESULT],
+        requiresManualApproval: false,
+      };
+      await this.emitAuditEvent(ctx, evaluationResult.results, evaluationResult);
+      return evaluationResult;
     }
 
     const evaluatorCtx: EvaluatorContext = {
@@ -139,6 +166,23 @@ export class PolicyEngine {
     const results: PolicyResult[] = await Promise.all(
       policies.map((policy) => evaluatePolicy(policy, evaluatorCtx)),
     );
+
+    // Fail-closed: a set whose every rule is disabled carries no effective
+    // constraint. A disabled rule returns passed=true ("Policy disabled"), so
+    // without this guard a set of all-disabled rules would aggregate to
+    // allHardPass=true and auto-approve — i.e. disabling the rules would be
+    // equivalent to deleting them (allow-all). Treat it the same as an empty
+    // set: deny.
+    const hasEnabledPolicy = policies.some((policy) => policy.enabled);
+    if (!hasEnabledPolicy) {
+      const evaluationResult: EvaluationResult = {
+        approved: false,
+        results: [...results, NO_EFFECTIVE_POLICY_RESULT],
+        requiresManualApproval: false,
+      };
+      await this.emitAuditEvent(ctx, evaluationResult.results, evaluationResult);
+      return evaluationResult;
+    }
 
     const hardPolicies = results.filter((r) => r.type !== "auto-approve-threshold");
     const autoApproveResult = results.find((r) => r.type === "auto-approve-threshold");

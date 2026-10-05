@@ -24,11 +24,13 @@ import {
   isValidAgentId,
   isValidAnyAddress,
   isValidSolanaAddress,
+  POLICY_WRITE_FORBIDDEN_ERROR,
   policyEngine,
   priceOracle,
   type RpcRequest,
   type RpcResponse,
   requireAgentAccess,
+  requirePolicyWriteAuthority,
   requireTenantLevel,
   type SignRequest,
   type SignTypedDataRequest,
@@ -1544,11 +1546,8 @@ vaultRoutes.get("/:agentId/addresses", async (c) => {
 // ─── Key Import ───────────────────────────────────────────────────────────────
 
 vaultRoutes.post("/:agentId/import", async (c) => {
-  if (!requireTenantLevel(c)) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "Key import requires tenant-level authentication" },
-      403,
-    );
+  if (!requirePolicyWriteAuthority(c)) {
+    return c.json<ApiResponse>({ ok: false, error: POLICY_WRITE_FORBIDDEN_ERROR }, 403);
   }
 
   const tenantId = c.get("tenantId");
@@ -1596,11 +1595,8 @@ vaultRoutes.post("/:agentId/import", async (c) => {
 // ─── Key Export ──────────────────────────────────────────────────────────
 
 vaultRoutes.post("/:agentId/export", async (c) => {
-  if (!requireTenantLevel(c)) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "Key export requires tenant-level authentication" },
-      403,
-    );
+  if (!requirePolicyWriteAuthority(c)) {
+    return c.json<ApiResponse>({ ok: false, error: POLICY_WRITE_FORBIDDEN_ERROR }, 403);
   }
 
   const tenantId = c.get("tenantId");
