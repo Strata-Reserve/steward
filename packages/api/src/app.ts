@@ -23,7 +23,8 @@ import { logger } from "hono/logger";
 import { requireAgentJwt } from "./middleware/agent-jwt";
 import { applicationPrincipalAuth } from "./middleware/application-principal";
 import { correlationId } from "./middleware/correlation";
-import { protectedAgentDispatch } from "./middleware/protected-agent";
+import { protectedAgentDispatch, protectedBearerGuard } from "./middleware/protected-agent";
+import { getProtectedQuarantine } from "./services/prod-minter-boundary";
 import { securityHeaders } from "./middleware/security-headers";
 import { tenantCors } from "./middleware/tenant-cors";
 import { agentRoutes } from "./routes/agents";
@@ -108,6 +109,14 @@ app.use(
   }),
 );
 
+// STRATA-1499 (REVIEW-STEWARD-28-R2 R2-3): GLOBAL protected-bearer guard.
+// Mounted on "*" ahead of every route prefix, including /auth, /platform,
+// /user, /application, /discovery, /health and /. A protected agent bearer
+// reaches only its own allowlist; everything else (public endpoints
+// included) is 403 before any handler runs. Public endpoints remain public
+// only when called without the protected bearer.
+app.use("*", (c, next) => protectedBearerGuard(c, next));
+
 // ─── Auth middleware per route group ──────────────────────────────────────────
 
 app.use("/application", (c, next) => applicationPrincipalAuth(c, next));
@@ -188,13 +197,16 @@ for (const prefix of [
 // ─── Health & root ────────────────────────────────────────────────────────────
 
 app.get("/", (c) => c.json({ name: "steward", version: API_VERSION, status: "running" }));
-app.get("/health", (c) =>
-  c.json({
-    status: "ok",
+app.get("/health", (c) => {
+  // STRATA-1499 N1: loud health flag for quarantined protected agents.
+  const protectedQuarantine = getProtectedQuarantine();
+  return c.json({
+    status: protectedQuarantine.length > 0 ? "degraded" : "ok",
     version: API_VERSION,
     uptime: Math.floor((Date.now() - startTime) / 1000),
-  }),
-);
+    ...(protectedQuarantine.length > 0 ? { protectedQuarantine } : {}),
+  });
+});
 
 // ─── Route modules ────────────────────────────────────────────────────────────
 

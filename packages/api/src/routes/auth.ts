@@ -84,7 +84,25 @@ import { generateNonce, SiweMessage } from "siwe";
 import { getAddress, verifyMessage as viemVerifyMessage } from "viem";
 import { trackAuditEvent } from "../services/audit";
 import { verifyEip1271 } from "../services/eip1271";
+import {
+  isPersistedProtectedAgent,
+  isProtectedMinterAgentId,
+} from "../services/prod-minter-boundary";
 import { getGracedSuccessor, rememberRotation } from "../services/refresh-rotation-grace";
+
+/**
+ * STRATA-1499 (REVIEW-STEWARD-28-R2 R2-3): /auth/session and /auth/logout
+ * must never handle the protected signer identity. The global bearer guard
+ * already 403s it before routing; this is the in-handler backstop.
+ */
+async function isProtectedAgentPayload(payload: {
+  scope?: unknown;
+  agentId?: unknown;
+}): Promise<boolean> {
+  if (payload.scope !== "agent" || typeof payload.agentId !== "string" || !payload.agentId)
+    return false;
+  return isProtectedMinterAgentId(payload.agentId) || (await isPersistedProtectedAgent(payload.agentId));
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1780,6 +1798,12 @@ auth.get("/session", async (c) => {
   const token = authHeader.slice(7);
   const payload = await verifySessionToken(token);
   if (!payload) return c.json({ authenticated: false });
+  if (await isProtectedAgentPayload(payload as { scope?: unknown; agentId?: unknown })) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: this credential has no session" },
+      403,
+    );
+  }
 
   return c.json({
     authenticated: true,
@@ -1805,7 +1829,15 @@ auth.post("/logout", async (c) => {
         exp?: number;
         userId?: string;
         tenantId?: string;
+        scope?: unknown;
+        agentId?: unknown;
       };
+      if (await isProtectedAgentPayload(payload)) {
+        return c.json<ApiResponse>(
+          { ok: false, error: "Protected signer: this credential cannot be logged out" },
+          403,
+        );
+      }
       if (typeof payload.jti === "string" && typeof payload.exp === "number") {
         await revocationStore.revokeToken(payload.jti, payload.exp);
         auditCtx = {

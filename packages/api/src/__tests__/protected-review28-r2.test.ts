@@ -317,3 +317,259 @@ describe.serial("R2-1: issuance consumes a durable single-use claim", () => {
     expect((await approve(q)).status).toBe(200);
   });
 });
+
+// ─── R2-2 / N1 ───────────────────────────────────────────────────────────────
+
+type Posture = { name: string; m: ReturnType<typeof manifest> | null };
+const postures = (): Posture[] => [
+  { name: "absent", m: null },
+  { name: "wrongTenant", m: { ...manifest(signerAddress), tenantId: "wrong" } },
+  { name: "wrongAgent", m: { ...manifest(signerAddress), agentId: "wrong" } },
+  { name: "wrongAddress", m: manifest(PLACEHOLDER) },
+];
+
+describe.serial("R2-2 + N1: coverage compares persisted address; uncovered agents are quarantined per agent", () => {
+  it("[R2-2] every inconsistent manifest gives the protected identity zero capability (reads, proposal, sign, approve)", async () => {
+    const failures: unknown[] = [];
+    try {
+      for (const { name, m } of postures()) {
+        boundary.installProtectedMinterManifest(m);
+        const jwt = await freshAgentJwt();
+        const read = await call("GET", `/vault/${AGENT}/addresses`, bearer(jwt));
+        const own = await call("GET", `/agents/${AGENT}`, bearer(jwt));
+        const byRef = await call("GET", `/vault/${AGENT}/actions/by-ref/none`, bearer(jwt));
+        const propose = await call("POST", `/vault/${AGENT}/sign`, bearer(jwt), proposal());
+        const rootSign = await call("POST", `/vault/${AGENT}/sign`, rootHeaders(), proposal());
+        const approveR = await call("POST", `/vault/${AGENT}/approve/none`, bearer(ownerToken), {
+          reviewDigest: `0x${"0".repeat(64)}`,
+        });
+        const signMsg = await call("POST", `/vault/${AGENT}/sign-message`, rootHeaders(), {
+          message: "x",
+        });
+        let direct = "";
+        try {
+          await vault.signMessage(TENANT, AGENT, "x");
+          direct = "SIGNED";
+        } catch (e) {
+          direct = String(e);
+        }
+        const obs = {
+          name,
+          read: read.status,
+          own: own.status,
+          byRef: byRef.status,
+          propose: propose.status,
+          rootSign: rootSign.status,
+          approve: approveR.status,
+          signMsg: signMsg.status,
+          direct: /Protected signer:/.test(direct) ? "refused" : direct,
+        };
+        if (
+          read.status !== 403 ||
+          own.status !== 403 ||
+          byRef.status !== 403 ||
+          propose.status !== 403 ||
+          rootSign.status !== 403 ||
+          approveR.status !== 403 ||
+          signMsg.status !== 403 ||
+          obs.direct !== "refused"
+        )
+          failures.push(obs);
+      }
+    } finally {
+      boundary.installProtectedMinterManifest(manifest(signerAddress));
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it("[R2-2] malformed manifest env refuses at parse (startup) and a correct manifest restores capability", async () => {
+    const envs = [
+      { STEWARD_PROTECTED_MINTER_AGENT: AGENT },
+      {
+        STEWARD_PROTECTED_MINTER_TENANT: TENANT,
+        STEWARD_PROTECTED_MINTER_AGENT: AGENT,
+        STEWARD_PROTECTED_MINTER_ADDRESS: "bad",
+      },
+      {
+        STEWARD_PROTECTED_MINTER_TENANT: TENANT,
+        STEWARD_PROTECTED_MINTER_AGENT: AGENT,
+        STEWARD_PROTECTED_MINTER_ADDRESS: signerAddress,
+        STEWARD_PROTECTED_MINTER_FACTORIES: "not-an-address",
+      },
+    ];
+    for (const env of envs) {
+      expect(() => boundary.manifestFromEnv(env as NodeJS.ProcessEnv)).toThrow();
+    }
+    boundary.installProtectedMinterManifest(manifest(signerAddress));
+    const jwt = await freshAgentJwt();
+    expect((await call("GET", `/vault/${AGENT}/addresses`, bearer(jwt))).status).toBe(200);
+  });
+
+  it("[N1] startup quarantines per agent (no throw), flags health, serves unrelated tenants; no usable window", async () => {
+    const failures: unknown[] = [];
+    try {
+      for (const { name, m } of postures()) {
+        boundary.installProtectedMinterManifest(m);
+        // BEFORE the startup hook runs: already zero capability (fencing is per request).
+        const jwtBefore = await freshAgentJwt();
+        const before = await call("GET", `/vault/${AGENT}/addresses`, bearer(jwtBefore));
+        const quarantined = await boundary.assertProtectedPostureAtStartup();
+        const health = await call("GET", "/health", { "Content-Type": "application/json" });
+        const healthBody = (await health.json()) as {
+          status: string;
+          protectedQuarantine?: Array<{ agentId: string }>;
+        };
+        const after = await call("GET", `/vault/${AGENT}/addresses`, bearer(await freshAgentJwt()));
+        // Unrelated tenant + ordinary agent in the same tenant still served.
+        const other = await call("GET", `/vault/${OTHER_AGENT}/addresses`, rootHeaders());
+        const otherTenant = await call("GET", "/agents", {
+          "Content-Type": "application/json",
+          "X-Steward-Tenant": OTHER_TENANT,
+          "X-Steward-Key": otherRootKey,
+        });
+        const obs = {
+          name,
+          before: before.status,
+          quarantined: quarantined.map((q) => `${q.agentId}:${q.reason}`),
+          health: healthBody.status,
+          healthFlag: healthBody.protectedQuarantine?.map((q) => q.agentId),
+          after: after.status,
+          other: other.status,
+          otherTenant: otherTenant.status,
+        };
+        if (
+          before.status !== 403 ||
+          quarantined.length !== 1 ||
+          quarantined[0]?.agentId !== AGENT ||
+          healthBody.status !== "degraded" ||
+          healthBody.protectedQuarantine?.[0]?.agentId !== AGENT ||
+          after.status !== 403 ||
+          other.status !== 200 ||
+          otherTenant.status !== 200
+        )
+          failures.push(obs);
+      }
+    } finally {
+      boundary.installProtectedMinterManifest(manifest(signerAddress));
+    }
+    expect(failures).toEqual([]);
+    // Covered: nothing quarantined, health ok, capability restored.
+    expect(await boundary.assertProtectedPostureAtStartup()).toEqual([]);
+    const h = (await (await call("GET", "/health", {})).json()) as { status: string };
+    expect(h.status).toBe("ok");
+    expect(
+      (await call("GET", `/vault/${AGENT}/addresses`, bearer(await freshAgentJwt()))).status,
+    ).toBe(200);
+  });
+});
+
+// ─── R2-3 ────────────────────────────────────────────────────────────────────
+
+describe.serial("R2-3: protected-bearer guard is global (fresh token per route)", () => {
+  it("[R2-3a] public endpoints are public without the bearer and 403 with it; /auth/session + /auth/logout refuse the protected identity", async () => {
+    const plain = { "Content-Type": "application/json" };
+    const cases: Array<[string, string, unknown?]> = [
+      ["GET", "/"],
+      ["GET", "/health"],
+      ["GET", "/auth/nonce"],
+      ["GET", "/auth/providers"],
+      ["GET", "/discovery/agents"],
+      ["GET", "/discovery/registries"],
+      ["GET", "/tenants/config"],
+      ["GET", "/auth/session"],
+      ["POST", "/auth/logout", {}],
+    ];
+    const failures: unknown[] = [];
+    for (const [method, path, body] of cases) {
+      const open = await call(method, path, plain, body);
+      const guarded = await call(method, path, bearer(await freshAgentJwt()), body);
+      if (open.status !== 200 || guarded.status !== 403)
+        failures.push({ method, path, open: open.status, guarded: guarded.status });
+    }
+    expect(failures).toEqual([]);
+    // Logout with the protected bearer must NOT have revoked anything: the
+    // original agent JWT still reaches its own allowlist afterwards.
+    expect((await call("GET", `/vault/${AGENT}/addresses`, bearer(agentJwt))).status).toBe(200);
+  });
+
+  it("[R2-3b] every mounted route: fresh protected token, valid route-specific payload, 403 except own allowlist", async () => {
+    type R = { method: string; path: string };
+    const routes = [
+      ...new Map(
+        (app as unknown as { routes: R[] }).routes
+          .filter((r) => r.method !== "ALL")
+          .map((r) => [`${r.method} ${r.path}`, r] as const),
+      ).values(),
+    ];
+    expect(routes.length).toBeGreaterThan(100);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      throw new Error("REVIEW_NETWORK_FORBIDDEN");
+    }) as typeof fetch;
+    const failures: unknown[] = [];
+    const bodies: Record<string, unknown> = {
+      "POST /auth/logout": {},
+      "POST /auth/refresh": { refreshToken: "x" },
+      "POST /auth/revoke": { refreshToken: "x" },
+      "POST /auth/email/send": { email: "a@b.test" },
+      "POST /platform/tenants": { id: "t2", name: "T2" },
+      "POST /agents": { id: "new-agent", name: "n" },
+      "POST /agents/batch": { agents: [{ id: "b1", name: "b1" }] },
+      "PUT /agents/:agentId/policies": { policies: [] },
+      "POST /webhooks": { url: "https://example.test", events: ["tx_signed"] },
+      "PUT /tenants/:id/webhook": { url: "https://example.test" },
+      "POST /secrets": { name: "s", value: "v" },
+      "POST /policies": { name: "p", rules: [] },
+      "POST /trade/sessions": { venue: "hyperliquid", agentId: AGENT },
+      "POST /v1/trade/sessions": { venue: "hyperliquid", agentId: AGENT },
+      "POST /approvals/:txId/approve": { reviewDigest: `0x${"0".repeat(64)}` },
+      "POST /approvals/:txId/deny": { reason: "no" },
+      "PUT /approvals/rules": { rules: [] },
+    };
+    try {
+      for (const route of routes) {
+        const namespace = route.path.split("/")[1];
+        const path = route.path.replace(/:([A-Za-z0-9_]+)/g, (_: string, param: string) => {
+          if (param === "agentId" || (param === "id" && ["agents", "vault"].includes(namespace)))
+            return AGENT;
+          if (
+            param === "tenantId" ||
+            (param === "id" && namespace === "tenants") ||
+            (param === "id" && namespace === "platform" && route.path.includes("/tenants/:id"))
+          )
+            return TENANT;
+          if (param === "executionRef") return "no-such-ref";
+          return "no-such-resource";
+        });
+        const key = `${route.method} ${route.path}`;
+        let body: unknown = bodies[key] ?? {};
+        if (path === `/vault/${AGENT}/sign`) body = proposal();
+        if (path === `/vault/${AGENT}/sign-message`) body = { message: "m" };
+        if (path === `/vault/${AGENT}/approve/no-such-resource`)
+          body = { reviewDigest: `0x${"0".repeat(64)}` };
+        // FRESH token per row: no shared state, no revocation poisoning.
+        const r = await call(route.method, path, bearer(await freshAgentJwt()), body);
+        const own =
+          (route.method === "POST" && path === `/vault/${AGENT}/sign`) ||
+          (route.method === "GET" &&
+            [
+              `/agents/${AGENT}`,
+              `/vault/${AGENT}/addresses`,
+              `/vault/${AGENT}/actions/by-ref/no-such-ref`,
+            ].includes(path));
+        const expected = own
+          ? path.endsWith("/sign")
+            ? 202
+            : path.includes("/by-ref/")
+              ? 404
+              : 200
+          : 403;
+        if (r.status !== expected)
+          failures.push({ route: key, path, expected, observed: r.status });
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(failures).toEqual([]);
+  }, 120000);
+});
