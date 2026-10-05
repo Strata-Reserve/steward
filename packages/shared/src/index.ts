@@ -179,7 +179,8 @@ export type PolicyType =
   | "reputation-threshold"
   | "reputation-scaling"
   | "venue-allowlist"
-  | "leverage-cap";
+  | "leverage-cap"
+  | "contract-allowlist";
 
 export interface PolicyRule {
   id: string;
@@ -243,6 +244,60 @@ export interface VenueAllowlistConfig {
  */
 export interface LeverageCapConfig {
   maxLeverage: number;
+}
+
+/**
+ * Per-selector constraints for a `contract-allowlist` entry (STRATA-1499).
+ *
+ * Which fields apply depends on the selector's decoder:
+ * - `maxAmount` / `recipientAllowlist`: `mint(address,uint256)`,
+ *   `transfer(address,uint256)`, `approve(address,uint256)`,
+ *   `transferFrom(address,address,uint256)`. The recipient is the `to`
+ *   argument (the `spender` for approve).
+ * - `adminAllowlist`: `createDealToken(string,string,address,bytes32)`.
+ *
+ * A constraint on a selector the engine cannot decode, or a field that does
+ * not apply to that selector, is rejected at write time and denies at
+ * evaluation time. Constraints are never silently ignored.
+ */
+export interface ContractAllowlistSelectorConstraints {
+  /** uint256 as a decimal string. Decoded amount must be <= this value. */
+  maxAmount?: string;
+  /** Recipient (or spender) must be one of these addresses. Case-insensitive. */
+  recipientAllowlist?: string[];
+  /** `createDealToken` admin argument must be one of these addresses. */
+  adminAllowlist?: string[];
+}
+
+export interface ContractAllowlistEntry {
+  /** Contract address (0x + 40 hex). Matched case-insensitively against `to`. */
+  address: string;
+  /** 4-byte selectors (0x + 8 hex) permitted on this contract. */
+  selectors: string[];
+  /** Optional per-selector constraints keyed by selector. */
+  constraints?: Record<string, ContractAllowlistSelectorConstraints>;
+}
+
+/**
+ * `contract-allowlist` policy config (STRATA-1499).
+ *
+ * Fail-closed transaction-shape policy for EVM signing:
+ * - `to` must match an entry in `contracts`
+ * - calldata must be well-formed and start with a listed selector
+ * - decoded arguments must satisfy that selector's constraints
+ * - `value` must be <= `maxNativeValueWei` (default "0")
+ * - empty calldata is denied unless `allowNativeTransfer` is true
+ */
+export interface ContractAllowlistConfig {
+  contracts: ContractAllowlistEntry[];
+  /**
+   * Permit plain value transfers (empty calldata) to listed addresses.
+   * Default false. Even when true, `value` is still capped by
+   * `maxNativeValueWei`, so a transfer-only entry needs that raised too.
+   */
+  allowNativeTransfer?: boolean;
+  /** Max `value` (wei, decimal string) on any request. Default "0". */
+  maxNativeValueWei?: string;
 }
 
 // ─── Transactions ───

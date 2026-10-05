@@ -1,4 +1,20 @@
 export type {
+  DecodedAmountCall,
+  DecodedCall,
+  DecodedCreateDealTokenCall,
+} from "./calldata";
+export {
+  decodeCalldata,
+  extractSelector,
+  isSupportedSelector,
+  SELECTOR_APPROVE,
+  SELECTOR_CREATE_DEAL_TOKEN,
+  SELECTOR_MINT,
+  SELECTOR_TRANSFER,
+  SELECTOR_TRANSFER_FROM,
+  SUPPORTED_SELECTORS,
+} from "./calldata";
+export type {
   AuditHook,
   PolicyEngineOptions,
   PolicyEvaluatedEvent,
@@ -10,6 +26,11 @@ export type {
 export { PolicyEngine } from "./engine";
 export type { EvaluatorContext } from "./evaluators";
 export { evaluatePolicy } from "./evaluators";
+export type { ContractAllowlistContext } from "./evaluators/contract-allowlist";
+export {
+  evaluateContractAllowlist,
+  validateContractAllowlistConfig,
+} from "./evaluators/contract-allowlist";
 export type { LeverageCapContext } from "./evaluators/leverage-cap";
 export { evaluateLeverageCap } from "./evaluators/leverage-cap";
 export type { ReputationScalingConfig } from "./evaluators/reputation-scaling";

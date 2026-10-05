@@ -29,7 +29,7 @@ import { KeyStore, Vault } from "@stwd/vault";
 import { and, count, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { trackAuditEvent } from "../services/audit";
-import { createAgentToken, parseAgentTokenScopes } from "../services/context";
+import { createAgentToken, parseAgentTokenScopes, validatePolicyConfig } from "../services/context";
 import { invalidateEmailAuthForTenant } from "./auth";
 
 function auditCtx(c: {
@@ -777,6 +777,9 @@ platform.put("/tenants/:id/policies", async (c) => {
     "allowed-chains",
     "reputation-threshold",
     "reputation-scaling",
+    "venue-allowlist",
+    "leverage-cap",
+    "contract-allowlist",
   ] as const;
 
   for (const rule of body) {
@@ -812,6 +815,10 @@ platform.put("/tenants/:id/policies", async (c) => {
         },
         400,
       );
+    }
+    const configError = validatePolicyConfig(rule);
+    if (configError) {
+      return c.json<ApiResponse>({ ok: false, error: configError }, 400);
     }
   }
 
@@ -966,6 +973,32 @@ platform.post("/tenants/:id/agents/batch", async (c) => {
     }
     if (!isNonEmptyString(spec.name)) {
       return c.json<ApiResponse>({ ok: false, error: `Agent "${spec.id}" is missing a name` }, 400);
+    }
+  }
+
+  if (body.applyPolicies !== undefined) {
+    if (!Array.isArray(body.applyPolicies)) {
+      return c.json<ApiResponse>({ ok: false, error: "applyPolicies must be an array" }, 400);
+    }
+    for (const policy of body.applyPolicies) {
+      if (!isNonEmptyString(policy?.type) || !isPersistedPolicyType(policy.type)) {
+        return c.json<ApiResponse>(
+          { ok: false, error: `Unknown policy type "${String(policy?.type)}" in applyPolicies` },
+          400,
+        );
+      }
+      if (
+        typeof policy.config !== "object" ||
+        policy.config === null ||
+        Array.isArray(policy.config)
+      ) {
+        return c.json<ApiResponse>(
+          { ok: false, error: `Policy "${policy.id || policy.type}": config must be an object` },
+          400,
+        );
+      }
+      const configError = validatePolicyConfig(policy);
+      if (configError) return c.json<ApiResponse>({ ok: false, error: configError }, 400);
     }
   }
 

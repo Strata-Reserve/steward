@@ -14,7 +14,7 @@ import {
   verifyToken,
 } from "@stwd/auth";
 import { getDb, policies, tenants, toPolicyRule, transactions, userTenants } from "@stwd/db";
-import { PolicyEngine } from "@stwd/policy-engine";
+import { PolicyEngine, validateContractAllowlistConfig } from "@stwd/policy-engine";
 import {
   type AgentIdentity,
   type ApiResponse,
@@ -146,6 +146,27 @@ export function isValidTenantId(id: unknown): id is string {
 
 export function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Type-specific config validation for policy writes (STRATA-1499).
+ *
+ * Runs after the generic shape checks (type known, enabled boolean, config
+ * object). Returns an error message or null. Only policy types with a strict
+ * schema are checked here; the rest keep their historical lenient handling.
+ * Disabled rules are validated too so a bad config cannot be smuggled in and
+ * flipped on later.
+ */
+export function validatePolicyConfig(policy: {
+  id?: string;
+  type: string;
+  config: unknown;
+}): string | null {
+  if (policy.type === "contract-allowlist") {
+    const err = validateContractAllowlistConfig(policy.config);
+    if (err) return `Policy "${policy.id || policy.type}": ${err}`;
+  }
+  return null;
 }
 
 export function isValidAddress(value: unknown): boolean {

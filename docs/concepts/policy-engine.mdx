@@ -121,6 +121,29 @@ Restricts which blockchain networks an agent can use:
 }
 ```
 
+### Contract Allowlist
+
+Restricts EVM signing to known contracts and function selectors, with optional per-selector argument constraints (max mint amount, recipient allowlist, admin allowlist). Fail-closed on unknown targets, unknown selectors, malformed calldata and native value. See [Configuring Policies](/guides/policies#contract-allowlist) for the schema and a deal-token minter example.
+
+```json
+{
+  "id": "minter-shape",
+  "type": "contract-allowlist",
+  "enabled": true,
+  "config": {
+    "contracts": [
+      {
+        "address": "0xdea1700000000000000000000000000000000d7e",
+        "selectors": ["0x40c10f19"],
+        "constraints": {
+          "0x40c10f19": { "maxAmount": "1000000000000", "recipientAllowlist": ["0x5afe00000000000000000000000000000000005a"] }
+        }
+      }
+    ]
+  }
+}
+```
+
 ## Evaluation Flow
 
 ```

@@ -173,7 +173,127 @@ Restricts which blockchain networks the agent can use.
 }
 ```
 
+### contract-allowlist
+
+Fail-closed transaction-shape control for EVM signing. Restricts the agent to a fixed set of (contract, function selector) pairs and, optionally, caps or allowlists decoded arguments. Use this for any key that can mint, deploy or move value on a specific contract.
+
+| Config Field | Type | Description |
+|-------------|------|-------------|
+| `contracts` | array | Non-empty list of allowlisted contracts (below) |
+| `contracts[].address` | string | Contract address (`0x` + 40 hex). Matched case-insensitively against `to` |
+| `contracts[].selectors` | string[] | 4-byte selectors (`0x` + 8 hex) permitted on this contract |
+| `contracts[].constraints` | object | Optional per-selector constraints keyed by selector |
+| `allowNativeTransfer` | boolean | Permit empty-calldata value transfers to listed addresses. Default `false` |
+| `maxNativeValueWei` | string (wei) | Max `value` on any request. Default `"0"` |
+
+Per-selector constraints (only valid on selectors the engine can decode):
+
+| Selector | Function | Constraints |
+|----------|----------|-------------|
+| `0x40c10f19` | `mint(address,uint256)` | `maxAmount`, `recipientAllowlist` |
+| `0xa9059cbb` | `transfer(address,uint256)` | `maxAmount`, `recipientAllowlist` |
+| `0x095ea7b3` | `approve(address,uint256)` | `maxAmount`, `recipientAllowlist` (the spender) |
+| `0x23b872dd` | `transferFrom(address,address,uint256)` | `maxAmount`, `recipientAllowlist` (the `to` arg) |
+| `0x0bab7086` | `createDealToken(string,string,address,bytes32)` | `adminAllowlist` (the `admin` arg) |
+
+`maxAmount` is a uint256 decimal string in the token's base units. Allowlists are case-insensitive address arrays.
+
+Every decision is deny-by-default:
+
+- `to` not in `contracts` → deny
+- calldata malformed or shorter than 4 bytes → deny
+- selector not listed for that contract → deny
+- constraint present but the calldata does not decode to the canonical ABI shape (truncated, trailing bytes, non-zero address padding, bad dynamic offsets) → deny. Constraints are never silently skipped
+- empty calldata → deny unless `allowNativeTransfer: true`
+- `value` above `maxNativeValueWei` → deny (default cap is `0`, so contract calls cannot carry ETH)
+- config fails validation → rejected with `400` on write, and denied at sign time if a bad config is already stored
+
+A selector listed **without** constraints is allowed regardless of its arguments; the engine does not need a decoder for it.
+
+```json
+{
+  "id": "minter-shape",
+  "type": "contract-allowlist",
+  "enabled": true,
+  "config": {
+    "contracts": [
+      {
+        "address": "0xfac70120000000000000000000000000000000f1",
+        "selectors": ["0x0bab7086"],
+        "constraints": {
+          "0x0bab7086": { "adminAllowlist": ["0x5afe00000000000000000000000000000000005a"] }
+        }
+      },
+      {
+        "address": "0xdea1700000000000000000000000000000000d7e",
+        "selectors": ["0x40c10f19"],
+        "constraints": {
+          "0x40c10f19": {
+            "maxAmount": "1000000000000",
+            "recipientAllowlist": ["0x5afe00000000000000000000000000000000005a"]
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+<Note>
+  The evaluator sees `to`, `value` and `data` exactly as submitted to `POST /vault/:agentId/sign`. It is not applied to `/sign-typed-data`, `/sign-solana` or proxy simulation, which have no EVM calldata to inspect. Combine it with `allowed-chains` so the same contract address cannot be targeted on another network.
+</Note>
+
 ## Common Patterns
+
+<Accordion title="Deal-token minter (factory + token, fixed admin, capped mint)">
+A production key that deploys deal tokens through a factory and mints them to a treasury Safe. The key can do exactly two things: call `createDealToken` with the Safe as admin, and `mint` at most `maxAmount` per transaction to the Safe. Anything else (other contracts, other functions, other recipients, larger amounts, ETH transfers) is rejected before signing.
+
+```typescript
+const FACTORY = "0x...";   // DealTokenFactory
+const DEAL_TOKEN = "0x..."; // DealTokenV1 instance (add one entry per live token)
+const TREASURY_SAFE = "0x...";
+
+const dealTokenMinter = [
+  {
+    id: "minter-shape", type: "contract-allowlist", enabled: true,
+    config: {
+      contracts: [
+        {
+          address: FACTORY,
+          selectors: ["0x0bab7086"], // createDealToken(string,string,address,bytes32)
+          constraints: { "0x0bab7086": { adminAllowlist: [TREASURY_SAFE] } },
+        },
+        {
+          address: DEAL_TOKEN,
+          selectors: ["0x40c10f19"], // mint(address,uint256)
+          constraints: {
+            "0x40c10f19": {
+              maxAmount: "1000000000000", // 1,000,000 units at 6 decimals
+              recipientAllowlist: [TREASURY_SAFE],
+            },
+          },
+        },
+      ],
+      // defaults, spelled out: no plain ETH transfers, no ETH on contract calls
+      allowNativeTransfer: false,
+      maxNativeValueWei: "0",
+    },
+  },
+  {
+    id: "chains", type: "allowed-chains", enabled: true,
+    config: { chains: ["eip155:8453"] }, // Base mainnet only
+  },
+  {
+    id: "rate", type: "rate-limit", enabled: true,
+    config: { maxTxPerHour: 20, maxTxPerDay: 100 },
+  },
+];
+
+await steward.setPolicies("prod-minter", dealTokenMinter);
+```
+
+When a new deal token is deployed, add its address as another `contracts` entry and resubmit the full set. The per-transaction `maxAmount` is a shape control, not a running total; pair it with an operational review of minted volume.
+</Accordion>
 
 <Accordion title="Conservative Trading Agent">
 ```typescript

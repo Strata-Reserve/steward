@@ -92,6 +92,11 @@ Array<{
 | `time-window` | Restrict to specific hours |
 | `rate-limit` | Max transactions per minute/hour |
 | `allowed-chains` | Restrict to specific chain IDs |
+| `reputation-threshold` | Require a minimum reputation score |
+| `reputation-scaling` | Scale limits with reputation score |
+| `venue-allowlist` | Restrict trades to named venues |
+| `leverage-cap` | Cap requested leverage |
+| `contract-allowlist` | Restrict EVM signing to listed contracts + selectors, with per-selector argument caps (see [Configuring Policies](/guides/policies#contract-allowlist)) |
 
 **Response:**
 
@@ -159,6 +164,7 @@ The API validates each policy:
 - `type` must be one of the valid types listed above
 - `enabled` must be a boolean
 - `config` must be a non-null object
+- `contract-allowlist` configs are schema-checked on write (addresses, selectors, constraint keys and uint256 strings). A malformed config returns `400` with the offending path, e.g. `Policy "minter-shape": contracts[1].constraints[0x40c10f19].maxAmount must be a uint256 decimal string`. This applies to `PUT /agents/:id/policies`, `applyPolicies` on batch creation and the platform default-policies route, and to disabled rules as well.
 
 Invalid policies return `400`:
 
