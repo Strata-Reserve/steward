@@ -119,14 +119,18 @@ describe.serial("Base sign/approve fail closed without RPC_URL_84532 (STRATA-149
     // Replay under the same ref: same action, still failed, no new row.
     const replay = await sign(ref);
     expect(replay.status).toBe(500);
-    const b2 = (await replay.json()) as { data: { txId: string; status: string; replayed: boolean } };
+    const b2 = (await replay.json()) as {
+      data: { txId: string; status: string; replayed: boolean };
+    };
     expect(b2.data.txId).toBe(txId);
     expect(b2.data.status).toBe("failed");
     expect(b2.data.replayed).toBe(true);
     expect(await rowsForRef(ref)).toHaveLength(1);
 
     // by-ref lookup returns the same action.
-    const lookup = await app.request(`/vault/${AGENT}/actions/by-ref/${ref}`, { headers: headers() });
+    const lookup = await app.request(`/vault/${AGENT}/actions/by-ref/${ref}`, {
+      headers: headers(),
+    });
     expect(lookup.status).toBe(200);
     const lb = (await lookup.json()) as { data: { txId: string; status: string; txHash?: string } };
     expect(lb.data.txId).toBe(txId);
@@ -182,21 +186,30 @@ describe.serial("Base sign/approve fail closed without RPC_URL_84532 (STRATA-149
 
       const replay = await sign(ref);
       expect(replay.status).toBe(500);
-      const rb = (await replay.json()) as { data: { txId: string; status: string; replayed: boolean } };
+      const rb = (await replay.json()) as {
+        data: { txId: string; status: string; replayed: boolean };
+      };
       expect(rb.data.txId).toBe(txId);
       expect(rb.data.status).toBe("failed");
       expect(rb.data.replayed).toBe(true);
       expect(calls).toBe(0);
 
-      const lookup = await app.request(`/vault/${AGENT}/actions/by-ref/${ref}`, { headers: headers() });
-      const lb = (await lookup.json()) as { data: { txId: string; status: string; txHash?: string } };
+      const lookup = await app.request(`/vault/${AGENT}/actions/by-ref/${ref}`, {
+        headers: headers(),
+      });
+      const lb = (await lookup.json()) as {
+        data: { txId: string; status: string; txHash?: string };
+      };
       expect(lb.data.txId).toBe(txId);
       expect(lb.data.status).toBe("failed");
       expect(lb.data.txHash).toBeUndefined();
 
       rows = await rowsForRef(ref);
       expect(rows).toHaveLength(1);
-      const queueAfter = await getDb().select().from(approvalQueue).where(eq(approvalQueue.txId, txId));
+      const queueAfter = await getDb()
+        .select()
+        .from(approvalQueue)
+        .where(eq(approvalQueue.txId, txId));
       expect(queueAfter).toHaveLength(1);
       expect(queueAfter[0]?.status).toBe("approved");
     } finally {

@@ -131,6 +131,21 @@ describe("resolveEvmRpcUrl (STRATA-1499)", () => {
     );
   });
 
+  it("non-Base chains resolve with BOTH RPC_URL_8453 and RPC_URL_84532 unset (boot/use not gated)", () => {
+    // Semantics: an explicit endpoint is required before USING Base, not for
+    // every deployment. With neither var set, every other EVM chain still
+    // resolves on the legacy path and nothing throws.
+    const config = { rpcUrl: undefined, chainRpcUrls: chainRpcUrlsFromEnv({}) };
+    expect(config.chainRpcUrls[8453]).toBeUndefined();
+    expect(config.chainRpcUrls[84532]).toBeUndefined();
+    for (const chainId of [1, 56, 97, 100, 137, 42161]) {
+      expect(() => resolveEvmRpcUrl(chainId, config)).not.toThrow();
+      expect(resolveEvmRpcUrl(chainId, config)).toMatch(/^https:\/\//);
+    }
+    // Vault construction itself never requires the Base keys.
+    expect(() => new Vault({ masterPassword: "x", chainId: 1 })).not.toThrow();
+  });
+
   it("chainRpcUrlsFromEnv reads only RPC_URL_8453 / RPC_URL_84532", () => {
     const env = {
       RPC_URL: "https://generic.example.com",

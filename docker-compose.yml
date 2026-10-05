@@ -42,6 +42,10 @@ services:
       STEWARD_DEFAULT_TENANT_KEY: "${STEWARD_DEFAULT_TENANT_KEY:-}"
       AGENT_TOKEN_EXPIRY: "${AGENT_TOKEN_EXPIRY:-24h}"
       RPC_URL: "${RPC_URL:-https://mainnet.base.org}"
+      # STRATA-1499: Base (8453 / 84532) requires an explicit https endpoint.
+      # No public default here: unset => Base sign/broadcast/balance fails closed.
+      RPC_URL_8453: "${RPC_URL_8453:-}"
+      RPC_URL_84532: "${RPC_URL_84532:-}"
       CHAIN_ID: "${CHAIN_ID:-8453}"
       REDIS_URL: "redis://redis:6379"
       RESEND_API_KEY: "${RESEND_API_KEY:-}"
