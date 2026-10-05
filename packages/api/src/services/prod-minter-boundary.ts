@@ -537,47 +537,132 @@ export function protectedReviewDigest(input: {
 }
 
 /**
- * REVIEW-STEWARD-28 F1(c): refuse to serve when any persisted-protected agent
- * exists and no manifest covers it. Called from index.ts after migrations;
- * throws so the process exits non-zero.
+ * REVIEW-STEWARD-28-R2 R2-2: a persisted-protected row is covered ONLY when
+ * the manifest names its tenant and agent AND pins exactly its persisted
+ * wallet address. A wrong-address manifest is not coverage.
  */
-export async function assertProtectedPostureAtStartup(): Promise<void> {
-  let rows: Array<{ id: string; tenantId: string }>;
+export function isProtectedMinterCovered(row: {
+  tenantId: string;
+  id: string;
+  walletAddress: string;
+}): boolean {
+  return (
+    isProtectedMinter(row.tenantId, row.id) &&
+    activeManifest !== null &&
+    lower(activeManifest.signerAddress) === lower(row.walletAddress)
+  );
+}
+
+export type ProtectedQuarantineReason = "no-manifest" | "tenant-or-agent-mismatch" | "address-mismatch";
+
+export interface ProtectedQuarantineEntry {
+  tenantId: string;
+  agentId: string;
+  reason: ProtectedQuarantineReason;
+}
+
+function quarantineReason(row: {
+  tenantId: string;
+  id: string;
+  walletAddress: string;
+}): ProtectedQuarantineReason | null {
+  if (activeManifest === null) return "no-manifest";
+  if (!isProtectedMinter(row.tenantId, row.id)) return "tenant-or-agent-mismatch";
+  if (lower(activeManifest.signerAddress) !== lower(row.walletAddress)) return "address-mismatch";
+  return null;
+}
+
+let startupQuarantine: ProtectedQuarantineEntry[] = [];
+
+/**
+ * REVIEW-STEWARD-28-R2 N1: per-agent quarantine instead of whole-process
+ * refusal. Steward boots and serves unrelated tenants; every persisted-
+ * protected agent that is not exactly covered (tenant, agent AND address)
+ * has zero capability. That fencing is enforced on every request by
+ * `protectedAgentDispatch` / the global bearer guard and inside the Vault
+ * (`assertProtectedPostureIntact`), all of which re-read the persisted row
+ * and compare it to the installed manifest at call time. This startup hook
+ * is therefore diagnostic only: it reports loudly and sets the health flag;
+ * there is no window in which an uncovered agent is usable, before or
+ * after it runs.
+ *
+ * A MALFORMED manifest (bad syntax / invalid values) still refuses startup:
+ * `manifestFromEnv()` throws at module load, so the process never serves.
+ *
+ * Returns the quarantine list (empty when every protected row is covered).
+ */
+export async function assertProtectedPostureAtStartup(): Promise<ProtectedQuarantineEntry[]> {
+  let rows: Array<{ id: string; tenantId: string; walletAddress: string }>;
   try {
     rows = await getDb()
-      .select({ id: agents.id, tenantId: agents.tenantId })
+      .select({ id: agents.id, tenantId: agents.tenantId, walletAddress: agents.walletAddress })
       .from(agents)
       .where(eq(agents.protected, true));
   } catch (e) {
     if (isUndefinedColumn(e)) {
       // Pre-0029 schema: marker column absent => no persisted-protected agent can exist.
       console.warn("[steward] agents.protected column absent (migration 0029 not applied)");
-      return;
+      startupQuarantine = [];
+      return [];
     }
     throw e;
   }
-  const uncovered = rows.filter((r) => !isProtectedMinter(r.tenantId, r.id));
-  if (uncovered.length > 0) {
-    throw new Error(
-      `protected minter: ${uncovered.length} persisted-protected agent(s) exist but no valid manifest covers them (${uncovered
-        .map((r) => `${r.tenantId}/${r.id}`)
-        .join(", ")}); refusing to start`,
+  const quarantined: ProtectedQuarantineEntry[] = [];
+  for (const r of rows) {
+    const reason = quarantineReason(r);
+    if (reason) quarantined.push({ tenantId: r.tenantId, agentId: r.id, reason });
+  }
+  startupQuarantine = quarantined;
+  if (quarantined.length > 0) {
+    console.error(
+      `[steward] PROTECTED POSTURE DEGRADED: ${quarantined.length} persisted-protected agent(s) are QUARANTINED (zero capability) because no valid manifest exactly covers them: ${quarantined
+        .map((q) => `${q.tenantId}/${q.agentId} (${q.reason})`)
+        .join(", ")}. Unrelated tenants continue to be served.`,
     );
+  }
+  return quarantined;
+}
+
+/** Health flag: quarantined protected agents as of the last startup posture check. */
+export function getProtectedQuarantine(): ProtectedQuarantineEntry[] {
+  return startupQuarantine;
+}
+
+/** Persisted-protected row for an agent id (any tenant), or null. */
+export async function persistedProtectedAgentRow(
+  agentId: string,
+): Promise<{ id: string; tenantId: string; walletAddress: string } | null> {
+  try {
+    const [row] = await getDb()
+      .select({
+        id: agents.id,
+        tenantId: agents.tenantId,
+        walletAddress: agents.walletAddress,
+        protected: agents.protected,
+      })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    if (row?.protected !== true) return null;
+    return { id: row.id, tenantId: row.tenantId, walletAddress: row.walletAddress };
+  } catch (e) {
+    if (isUndefinedColumn(e)) return null; // pre-0029 schema: marker cannot exist
+    throw e;
   }
 }
 
 /** Persisted-marker lookup for route guards (deny-by-default when manifest absent). */
 export async function isPersistedProtectedAgent(agentId: string): Promise<boolean> {
-  try {
-    const [row] = await getDb()
-      .select({ protected: agents.protected })
-      .from(agents)
-      .where(eq(agents.id, agentId));
-    return row?.protected === true;
-  } catch (e) {
-    if (isUndefinedColumn(e)) return false; // pre-0029 schema: marker cannot exist
-    throw e;
-  }
+  return (await persistedProtectedAgentRow(agentId)) !== null;
+}
+
+/**
+ * True when `agentId` is persisted-protected and NOT exactly covered by the
+ * installed manifest (tenant, agent and address). Such an agent has zero
+ * capability everywhere.
+ */
+export async function isQuarantinedProtectedAgent(agentId: string): Promise<boolean> {
+  const row = await persistedProtectedAgentRow(agentId);
+  return row !== null && !isProtectedMinterCovered(row);
 }
 
 // Startup: read env once. Fail closed on invalid configuration.

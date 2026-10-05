@@ -74,16 +74,27 @@ export function assertNotProtected(tenantId: string, agentId: string, operation:
  * it; a missing/invalid manifest therefore never un-protects a signer.
  */
 export async function isPersistedProtected(tenantId: string, agentId: string): Promise<boolean> {
+  return (await persistedProtectedRow(tenantId, agentId)) !== null;
+}
+
+/**
+ * The persisted-protected row (marker + wallet address) for (tenantId, agentId),
+ * or null when the row is absent or not protected.
+ */
+export async function persistedProtectedRow(
+  tenantId: string,
+  agentId: string,
+): Promise<{ walletAddress: string } | null> {
   try {
     const [row] = await getDb()
-      .select({ protected: agents.protected })
+      .select({ protected: agents.protected, walletAddress: agents.walletAddress })
       .from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
-    return row?.protected === true;
+    return row?.protected === true ? { walletAddress: row.walletAddress } : null;
   } catch (e) {
     // Pre-0029 schema: the marker column cannot exist, so no agent can be
     // persisted-protected. Any other error propagates (fail closed).
-    if (isUndefinedColumn(e)) return false;
+    if (isUndefinedColumn(e)) return null;
     throw e;
   }
 }
@@ -99,15 +110,27 @@ export function isUndefinedColumn(e: unknown): boolean {
   return false;
 }
 
+/**
+ * REVIEW-STEWARD-28-R2 R2-2: a persisted-protected row is "covered" only when
+ * the installed manifest names its tenant AND agent AND pins exactly its
+ * persisted wallet address. Anything less is zero capability.
+ */
 export async function assertProtectedPostureIntact(
   tenantId: string,
   agentId: string,
   operation: string,
 ): Promise<void> {
-  if (isProtectedSigner(tenantId, agentId)) return; // guard present; route/vault checks apply
-  if (await isPersistedProtected(tenantId, agentId)) {
+  const row = await persistedProtectedRow(tenantId, agentId);
+  if (!row) return; // ordinary agent (or not yet provisioned); route/vault checks apply
+  if (!isProtectedSigner(tenantId, agentId)) {
     throw new ProtectedSignerError(
       `${operation} refused: agent is persisted-protected but no valid manifest is installed`,
+    );
+  }
+  const expected = registeredGuard?.expectedAddress(tenantId, agentId) ?? null;
+  if (!expected || expected.toLowerCase() !== row.walletAddress.toLowerCase()) {
+    throw new ProtectedSignerError(
+      `${operation} refused: persisted wallet address does not match the manifest pin`,
     );
   }
 }

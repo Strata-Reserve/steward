@@ -156,10 +156,19 @@ if (shouldUsePGLite()) {
 // ─── Data retention scheduler (SOC2 CC2) ────────────────────────────────────
 
 if (migrationsRan) {
-  // STRATA-1499 F1(c): a persisted-protected agent with no manifest is fatal.
+  // STRATA-1499 F1(c) / R2 N1: a persisted-protected agent not exactly covered
+  // by the manifest is QUARANTINED (zero capability, enforced per request);
+  // the process still serves unrelated tenants. A malformed manifest already
+  // threw at module load of prod-minter-boundary (fatal). Only a DB failure
+  // during the check is fatal here.
   try {
     const { assertProtectedPostureAtStartup } = await import("./services/prod-minter-boundary");
-    await assertProtectedPostureAtStartup();
+    const quarantined = await assertProtectedPostureAtStartup();
+    if (quarantined.length > 0) {
+      console.error(
+        `[steward] ${quarantined.length} protected agent(s) quarantined; see /health protectedQuarantine`,
+      );
+    }
   } catch (err) {
     console.error("[steward] Protected posture check failed — cannot start:", err);
     process.exit(1);
