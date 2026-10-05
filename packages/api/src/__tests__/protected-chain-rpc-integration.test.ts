@@ -312,7 +312,12 @@ describe.serial("SF-1: readiness preflight sits above the protected permit consu
     // Human claim without signing (CAS only), then issue the one-use permit.
     const claim = await db
       .update(approvalQueue)
-      .set({ status: "approved", resolvedAt: new Date(), resolvedBy: `user:${OWNER_USER}` })
+      .set({
+        status: "approved",
+        approvedByUserId: OWNER_USER,
+        resolvedAt: new Date(),
+        resolvedBy: `user:${OWNER_USER}`,
+      })
       .where(eq(approvalQueue.txId, q.txId))
       .returning({ id: approvalQueue.id });
     expect(claim.length).toBe(1);
@@ -436,7 +441,12 @@ describe.serial("SF-1: readiness preflight sits above the protected permit consu
     expect(q.status).toBe(202);
     await db
       .update(approvalQueue)
-      .set({ status: "approved", resolvedAt: new Date(), resolvedBy: `user:${OWNER_USER}` })
+      .set({
+        status: "approved",
+        approvedByUserId: OWNER_USER,
+        resolvedAt: new Date(),
+        resolvedBy: `user:${OWNER_USER}`,
+      })
       .where(eq(approvalQueue.txId, q.txId));
     const permit = await vaultLib.issueProtectedSigningPermit({
       tenantId: TENANT,

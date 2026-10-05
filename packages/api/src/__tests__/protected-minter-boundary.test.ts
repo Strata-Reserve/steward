@@ -672,7 +672,12 @@ describe.serial("STRATA-1499 protected production minter", () => {
     // Simulate the CAS continuation having claimed the row, then issue.
     await getDb()
       .update(approvalQueue)
-      .set({ status: "approved", resolvedAt: new Date(), resolvedBy: "test" })
+      .set({
+        status: "approved",
+        approvedByUserId: ADMIN_USER,
+        resolvedAt: new Date(),
+        resolvedBy: `user:${ADMIN_USER}`,
+      })
       .where(and(eq(approvalQueue.txId, txId), eq(approvalQueue.status, "pending")));
     const permit = await issueProtectedSigningPermit({
       tenantId: TENANT,

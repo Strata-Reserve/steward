@@ -249,7 +249,12 @@ describe.serial("R2-1: issuance consumes a durable single-use claim", () => {
     // Claim the approval without signing (CAS only), then race the issuer.
     const claim = await db
       .update(approvalQueue)
-      .set({ status: "approved", resolvedAt: new Date(), resolvedBy: `user:${ADMIN_USER}` })
+      .set({
+        status: "approved",
+        approvedByUserId: ADMIN_USER,
+        resolvedAt: new Date(),
+        resolvedBy: `user:${ADMIN_USER}`,
+      })
       .where(eq(approvalQueue.txId, q.txId))
       .returning({ id: approvalQueue.id });
     expect(claim.length).toBe(1);
