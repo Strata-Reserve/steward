@@ -60,7 +60,10 @@ async function decideForProtectedScope(
   const isProtected = isProtectedMinterAgentId(scope) || (await isPersistedProtectedAgent(scope));
   if (!isProtected) return null;
   if (await isQuarantinedProtectedAgent(scope)) {
-    return refuse(c, "Protected signer: no valid manifest covers this agent; all operations refused");
+    return refuse(
+      c,
+      "Protected signer: no valid manifest covers this agent; all operations refused",
+    );
   }
   if (!protectedAgentAllowed(method, path, scope)) {
     return refuse(c, "Protected signer: this credential may only propose and read its own status");
@@ -116,7 +119,10 @@ export async function protectedAgentDispatch(
   if (m?.[1]) {
     const agentId = decodeURIComponent(m[1]);
     if (await isQuarantinedProtectedAgent(agentId)) {
-      return refuse(c, "Protected signer: no valid manifest covers this agent; all operations refused");
+      return refuse(
+        c,
+        "Protected signer: no valid manifest covers this agent; all operations refused",
+      );
     }
   }
   return next();

@@ -8,7 +8,7 @@
 
 import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { generateApiKey, signAccessToken, signAgentToken } from "@stwd/auth";
-import { agents, approvalQueue, closeDb, tenants, transactions, users, userTenants } from "@stwd/db";
+import { approvalQueue, closeDb, tenants, transactions, users, userTenants } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
 import { eq } from "drizzle-orm";
 import type { Hono } from "hono";
@@ -35,7 +35,6 @@ let rootKey: string;
 let otherRootKey: string;
 let signerAddress: string;
 let ownerToken: string;
-let adminToken: string;
 let agentJwt: string;
 let vault: Awaited<typeof import("../services/context")>["vault"];
 let boundary: typeof import("../services/prod-minter-boundary");
@@ -79,16 +78,22 @@ async function call(method: string, path: string, h: Record<string, string>, bod
   return app.request(path, {
     method,
     headers: h,
-    body: ["GET", "HEAD", "DELETE"].includes(method) && body === undefined
-      ? undefined
-      : JSON.stringify(body ?? {}),
+    body:
+      ["GET", "HEAD", "DELETE"].includes(method) && body === undefined
+        ? undefined
+        : JSON.stringify(body ?? {}),
   });
 }
 async function queue() {
   const p = proposal();
   const r = await call("POST", `/vault/${AGENT}/sign`, bearer(agentJwt), p);
   const b = (await r.json()) as { data?: { txId: string; reviewDigest: string } };
-  return { ...p, txId: b.data?.txId ?? "", reviewDigest: b.data?.reviewDigest ?? "", status: r.status };
+  return {
+    ...p,
+    txId: b.data?.txId ?? "",
+    reviewDigest: b.data?.reviewDigest ?? "",
+    status: r.status,
+  };
 }
 async function approve(q: { txId: string; reviewDigest: string }, h = bearer(ownerToken)) {
   return call("POST", `/vault/${AGENT}/approve/${q.txId}`, h, { reviewDigest: q.reviewDigest });
@@ -129,10 +134,6 @@ beforeAll(async () => {
 
   ownerToken = await signAccessToken(
     { address: `0x${"1".repeat(40)}`, tenantId: TENANT, userId: OWNER_USER } as never,
-    "1h",
-  );
-  adminToken = await signAccessToken(
-    { address: `0x${"2".repeat(40)}`, tenantId: TENANT, userId: ADMIN_USER } as never,
     "1h",
   );
   agentJwt = await freshAgentJwt();
@@ -264,7 +265,10 @@ describe.serial("R2-1: issuance consumes a durable single-use claim", () => {
     expect(q.status).toBe(202);
     // Mark approved + signed directly (simulates a completed or in-flight sign
     // whose outcome was lost by the caller).
-    await db.update(approvalQueue).set({ status: "approved" }).where(eq(approvalQueue.txId, q.txId));
+    await db
+      .update(approvalQueue)
+      .set({ status: "approved" })
+      .where(eq(approvalQueue.txId, q.txId));
     await db
       .update(transactions)
       .set({ status: "signed", txHash: `0x${"ab".repeat(32)}` })
@@ -328,140 +332,147 @@ const postures = (): Posture[] => [
   { name: "wrongAddress", m: manifest(PLACEHOLDER) },
 ];
 
-describe.serial("R2-2 + N1: coverage compares persisted address; uncovered agents are quarantined per agent", () => {
-  it("[R2-2] every inconsistent manifest gives the protected identity zero capability (reads, proposal, sign, approve)", async () => {
-    const failures: unknown[] = [];
-    try {
-      for (const { name, m } of postures()) {
-        boundary.installProtectedMinterManifest(m);
-        const jwt = await freshAgentJwt();
-        const read = await call("GET", `/vault/${AGENT}/addresses`, bearer(jwt));
-        const own = await call("GET", `/agents/${AGENT}`, bearer(jwt));
-        const byRef = await call("GET", `/vault/${AGENT}/actions/by-ref/none`, bearer(jwt));
-        const propose = await call("POST", `/vault/${AGENT}/sign`, bearer(jwt), proposal());
-        const rootSign = await call("POST", `/vault/${AGENT}/sign`, rootHeaders(), proposal());
-        const approveR = await call("POST", `/vault/${AGENT}/approve/none`, bearer(ownerToken), {
-          reviewDigest: `0x${"0".repeat(64)}`,
-        });
-        const signMsg = await call("POST", `/vault/${AGENT}/sign-message`, rootHeaders(), {
-          message: "x",
-        });
-        let direct = "";
-        try {
-          await vault.signMessage(TENANT, AGENT, "x");
-          direct = "SIGNED";
-        } catch (e) {
-          direct = String(e);
+describe.serial(
+  "R2-2 + N1: coverage compares persisted address; uncovered agents are quarantined per agent",
+  () => {
+    it("[R2-2] every inconsistent manifest gives the protected identity zero capability (reads, proposal, sign, approve)", async () => {
+      const failures: unknown[] = [];
+      try {
+        for (const { name, m } of postures()) {
+          boundary.installProtectedMinterManifest(m);
+          const jwt = await freshAgentJwt();
+          const read = await call("GET", `/vault/${AGENT}/addresses`, bearer(jwt));
+          const own = await call("GET", `/agents/${AGENT}`, bearer(jwt));
+          const byRef = await call("GET", `/vault/${AGENT}/actions/by-ref/none`, bearer(jwt));
+          const propose = await call("POST", `/vault/${AGENT}/sign`, bearer(jwt), proposal());
+          const rootSign = await call("POST", `/vault/${AGENT}/sign`, rootHeaders(), proposal());
+          const approveR = await call("POST", `/vault/${AGENT}/approve/none`, bearer(ownerToken), {
+            reviewDigest: `0x${"0".repeat(64)}`,
+          });
+          const signMsg = await call("POST", `/vault/${AGENT}/sign-message`, rootHeaders(), {
+            message: "x",
+          });
+          let direct = "";
+          try {
+            await vault.signMessage(TENANT, AGENT, "x");
+            direct = "SIGNED";
+          } catch (e) {
+            direct = String(e);
+          }
+          const obs = {
+            name,
+            read: read.status,
+            own: own.status,
+            byRef: byRef.status,
+            propose: propose.status,
+            rootSign: rootSign.status,
+            approve: approveR.status,
+            signMsg: signMsg.status,
+            direct: /Protected signer:/.test(direct) ? "refused" : direct,
+          };
+          if (
+            read.status !== 403 ||
+            own.status !== 403 ||
+            byRef.status !== 403 ||
+            propose.status !== 403 ||
+            rootSign.status !== 403 ||
+            approveR.status !== 403 ||
+            signMsg.status !== 403 ||
+            obs.direct !== "refused"
+          )
+            failures.push(obs);
         }
-        const obs = {
-          name,
-          read: read.status,
-          own: own.status,
-          byRef: byRef.status,
-          propose: propose.status,
-          rootSign: rootSign.status,
-          approve: approveR.status,
-          signMsg: signMsg.status,
-          direct: /Protected signer:/.test(direct) ? "refused" : direct,
-        };
-        if (
-          read.status !== 403 ||
-          own.status !== 403 ||
-          byRef.status !== 403 ||
-          propose.status !== 403 ||
-          rootSign.status !== 403 ||
-          approveR.status !== 403 ||
-          signMsg.status !== 403 ||
-          obs.direct !== "refused"
-        )
-          failures.push(obs);
+      } finally {
+        boundary.installProtectedMinterManifest(manifest(signerAddress));
       }
-    } finally {
-      boundary.installProtectedMinterManifest(manifest(signerAddress));
-    }
-    expect(failures).toEqual([]);
-  });
+      expect(failures).toEqual([]);
+    });
 
-  it("[R2-2] malformed manifest env refuses at parse (startup) and a correct manifest restores capability", async () => {
-    const envs = [
-      { STEWARD_PROTECTED_MINTER_AGENT: AGENT },
-      {
-        STEWARD_PROTECTED_MINTER_TENANT: TENANT,
-        STEWARD_PROTECTED_MINTER_AGENT: AGENT,
-        STEWARD_PROTECTED_MINTER_ADDRESS: "bad",
-      },
-      {
-        STEWARD_PROTECTED_MINTER_TENANT: TENANT,
-        STEWARD_PROTECTED_MINTER_AGENT: AGENT,
-        STEWARD_PROTECTED_MINTER_ADDRESS: signerAddress,
-        STEWARD_PROTECTED_MINTER_FACTORIES: "not-an-address",
-      },
-    ];
-    for (const env of envs) {
-      expect(() => boundary.manifestFromEnv(env as NodeJS.ProcessEnv)).toThrow();
-    }
-    boundary.installProtectedMinterManifest(manifest(signerAddress));
-    const jwt = await freshAgentJwt();
-    expect((await call("GET", `/vault/${AGENT}/addresses`, bearer(jwt))).status).toBe(200);
-  });
-
-  it("[N1] startup quarantines per agent (no throw), flags health, serves unrelated tenants; no usable window", async () => {
-    const failures: unknown[] = [];
-    try {
-      for (const { name, m } of postures()) {
-        boundary.installProtectedMinterManifest(m);
-        // BEFORE the startup hook runs: already zero capability (fencing is per request).
-        const jwtBefore = await freshAgentJwt();
-        const before = await call("GET", `/vault/${AGENT}/addresses`, bearer(jwtBefore));
-        const quarantined = await boundary.assertProtectedPostureAtStartup();
-        const health = await call("GET", "/health", { "Content-Type": "application/json" });
-        const healthBody = (await health.json()) as {
-          status: string;
-          protectedQuarantine?: Array<{ agentId: string }>;
-        };
-        const after = await call("GET", `/vault/${AGENT}/addresses`, bearer(await freshAgentJwt()));
-        // Unrelated tenant + ordinary agent in the same tenant still served.
-        const other = await call("GET", `/vault/${OTHER_AGENT}/addresses`, rootHeaders());
-        const otherTenant = await call("GET", "/agents", {
-          "Content-Type": "application/json",
-          "X-Steward-Tenant": OTHER_TENANT,
-          "X-Steward-Key": otherRootKey,
-        });
-        const obs = {
-          name,
-          before: before.status,
-          quarantined: quarantined.map((q) => `${q.agentId}:${q.reason}`),
-          health: healthBody.status,
-          healthFlag: healthBody.protectedQuarantine?.map((q) => q.agentId),
-          after: after.status,
-          other: other.status,
-          otherTenant: otherTenant.status,
-        };
-        if (
-          before.status !== 403 ||
-          quarantined.length !== 1 ||
-          quarantined[0]?.agentId !== AGENT ||
-          healthBody.status !== "degraded" ||
-          healthBody.protectedQuarantine?.[0]?.agentId !== AGENT ||
-          after.status !== 403 ||
-          other.status !== 200 ||
-          otherTenant.status !== 200
-        )
-          failures.push(obs);
+    it("[R2-2] malformed manifest env refuses at parse (startup) and a correct manifest restores capability", async () => {
+      const envs = [
+        { STEWARD_PROTECTED_MINTER_AGENT: AGENT },
+        {
+          STEWARD_PROTECTED_MINTER_TENANT: TENANT,
+          STEWARD_PROTECTED_MINTER_AGENT: AGENT,
+          STEWARD_PROTECTED_MINTER_ADDRESS: "bad",
+        },
+        {
+          STEWARD_PROTECTED_MINTER_TENANT: TENANT,
+          STEWARD_PROTECTED_MINTER_AGENT: AGENT,
+          STEWARD_PROTECTED_MINTER_ADDRESS: signerAddress,
+          STEWARD_PROTECTED_MINTER_FACTORIES: "not-an-address",
+        },
+      ];
+      for (const env of envs) {
+        expect(() => boundary.manifestFromEnv(env as NodeJS.ProcessEnv)).toThrow();
       }
-    } finally {
       boundary.installProtectedMinterManifest(manifest(signerAddress));
-    }
-    expect(failures).toEqual([]);
-    // Covered: nothing quarantined, health ok, capability restored.
-    expect(await boundary.assertProtectedPostureAtStartup()).toEqual([]);
-    const h = (await (await call("GET", "/health", {})).json()) as { status: string };
-    expect(h.status).toBe("ok");
-    expect(
-      (await call("GET", `/vault/${AGENT}/addresses`, bearer(await freshAgentJwt()))).status,
-    ).toBe(200);
-  });
-});
+      const jwt = await freshAgentJwt();
+      expect((await call("GET", `/vault/${AGENT}/addresses`, bearer(jwt))).status).toBe(200);
+    });
+
+    it("[N1] startup quarantines per agent (no throw), flags health, serves unrelated tenants; no usable window", async () => {
+      const failures: unknown[] = [];
+      try {
+        for (const { name, m } of postures()) {
+          boundary.installProtectedMinterManifest(m);
+          // BEFORE the startup hook runs: already zero capability (fencing is per request).
+          const jwtBefore = await freshAgentJwt();
+          const before = await call("GET", `/vault/${AGENT}/addresses`, bearer(jwtBefore));
+          const quarantined = await boundary.assertProtectedPostureAtStartup();
+          const health = await call("GET", "/health", { "Content-Type": "application/json" });
+          const healthBody = (await health.json()) as {
+            status: string;
+            protectedQuarantine?: Array<{ agentId: string }>;
+          };
+          const after = await call(
+            "GET",
+            `/vault/${AGENT}/addresses`,
+            bearer(await freshAgentJwt()),
+          );
+          // Unrelated tenant + ordinary agent in the same tenant still served.
+          const other = await call("GET", `/vault/${OTHER_AGENT}/addresses`, rootHeaders());
+          const otherTenant = await call("GET", "/agents", {
+            "Content-Type": "application/json",
+            "X-Steward-Tenant": OTHER_TENANT,
+            "X-Steward-Key": otherRootKey,
+          });
+          const obs = {
+            name,
+            before: before.status,
+            quarantined: quarantined.map((q) => `${q.agentId}:${q.reason}`),
+            health: healthBody.status,
+            healthFlag: healthBody.protectedQuarantine?.map((q) => q.agentId),
+            after: after.status,
+            other: other.status,
+            otherTenant: otherTenant.status,
+          };
+          if (
+            before.status !== 403 ||
+            quarantined.length !== 1 ||
+            quarantined[0]?.agentId !== AGENT ||
+            healthBody.status !== "degraded" ||
+            healthBody.protectedQuarantine?.[0]?.agentId !== AGENT ||
+            after.status !== 403 ||
+            other.status !== 200 ||
+            otherTenant.status !== 200
+          )
+            failures.push(obs);
+        }
+      } finally {
+        boundary.installProtectedMinterManifest(manifest(signerAddress));
+      }
+      expect(failures).toEqual([]);
+      // Covered: nothing quarantined, health ok, capability restored.
+      expect(await boundary.assertProtectedPostureAtStartup()).toEqual([]);
+      const h = (await (await call("GET", "/health", {})).json()) as { status: string };
+      expect(h.status).toBe("ok");
+      expect(
+        (await call("GET", `/vault/${AGENT}/addresses`, bearer(await freshAgentJwt()))).status,
+      ).toBe(200);
+    });
+  },
+);
 
 // ─── R2-3 ────────────────────────────────────────────────────────────────────
 

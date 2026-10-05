@@ -101,7 +101,9 @@ async function isProtectedAgentPayload(payload: {
 }): Promise<boolean> {
   if (payload.scope !== "agent" || typeof payload.agentId !== "string" || !payload.agentId)
     return false;
-  return isProtectedMinterAgentId(payload.agentId) || (await isPersistedProtectedAgent(payload.agentId));
+  return (
+    isProtectedMinterAgentId(payload.agentId) || (await isPersistedProtectedAgent(payload.agentId))
+  );
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────

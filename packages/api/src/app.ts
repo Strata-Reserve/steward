@@ -24,7 +24,6 @@ import { requireAgentJwt } from "./middleware/agent-jwt";
 import { applicationPrincipalAuth } from "./middleware/application-principal";
 import { correlationId } from "./middleware/correlation";
 import { protectedAgentDispatch, protectedBearerGuard } from "./middleware/protected-agent";
-import { getProtectedQuarantine } from "./services/prod-minter-boundary";
 import { securityHeaders } from "./middleware/security-headers";
 import { tenantCors } from "./middleware/tenant-cors";
 import { agentRoutes } from "./routes/agents";
@@ -51,6 +50,7 @@ import {
   dashboardAuthMiddleware,
   tenantAuth,
 } from "./services/context";
+import { getProtectedQuarantine } from "./services/prod-minter-boundary";
 
 const startTime = Date.now();
 

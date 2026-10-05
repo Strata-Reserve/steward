@@ -553,7 +553,10 @@ export function isProtectedMinterCovered(row: {
   );
 }
 
-export type ProtectedQuarantineReason = "no-manifest" | "tenant-or-agent-mismatch" | "address-mismatch";
+export type ProtectedQuarantineReason =
+  | "no-manifest"
+  | "tenant-or-agent-mismatch"
+  | "address-mismatch";
 
 export interface ProtectedQuarantineEntry {
   tenantId: string;
