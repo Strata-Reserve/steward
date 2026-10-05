@@ -93,6 +93,11 @@ beforeAll(async () => {
   process.env.DATABASE_URL = "postgres://test:test@localhost:5432/steward";
   process.env.STEWARD_MASTER_PASSWORD = "exec-ref-master-password";
   process.env.STEWARD_AUDIT_HMAC_KEY = "exec-ref-audit-key-32-bytes-minimum-aaaaaaaa";
+  // STRATA-1499: the route runs the REAL RPC readiness preflight before the
+  // (mocked) signer. Base chains need an explicit https endpoint; nothing here
+  // ever contacts it because signTransaction is replaced below.
+  process.env.RPC_URL_8453 = "https://exec-ref-mainnet.invalid/v2/UNUSED";
+  process.env.RPC_URL_84532 = "https://exec-ref-sepolia.invalid/v2/UNUSED";
 
   const { db, client } = await createPGLiteDb("memory://");
   setPGLiteOverride(db, async () => client.close());
@@ -150,6 +155,8 @@ afterAll(async () => {
   delete process.env.DATABASE_URL;
   delete process.env.STEWARD_MASTER_PASSWORD;
   delete process.env.STEWARD_AUDIT_HMAC_KEY;
+  delete process.env.RPC_URL_8453;
+  delete process.env.RPC_URL_84532;
 });
 
 describe.serial("vault sign executionRef (STRATA-1486)", () => {
