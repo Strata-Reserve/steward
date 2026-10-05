@@ -36,6 +36,7 @@ import type {
   SignRequest,
 } from "@stwd/shared";
 import {
+  chainRpcUrlsFromEnv,
   getUserWallet,
   provisionUserWallet,
   USER_WALLET_DEFAULT_POLICIES,
@@ -105,6 +106,9 @@ function getVault(): Vault {
     masterPassword,
     rpcUrl: process.env.RPC_URL || "https://sepolia.base.org",
     chainId: parseInt(process.env.CHAIN_ID || "84532", 10),
+    // STRATA-1499: explicit per-chain endpoints (RPC_URL_8453 / RPC_URL_84532).
+    // Base chains never fall back to RPC_URL or a public endpoint.
+    chainRpcUrls: chainRpcUrlsFromEnv(),
   });
 }
 

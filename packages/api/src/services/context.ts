@@ -24,7 +24,7 @@ import {
   type Tenant,
   type TenantConfig,
 } from "@stwd/shared";
-import { Vault } from "@stwd/vault";
+import { chainRpcUrlsFromEnv, Vault } from "@stwd/vault";
 import { WebhookDispatcher } from "@stwd/webhooks";
 import { and, eq, gte, sql } from "drizzle-orm";
 import type { Context, Next } from "hono";
@@ -171,7 +171,14 @@ export async function safeJsonParse<T>(c: Context): Promise<T | null> {
 
 export function sanitizeErrorMessage(error: unknown): string {
   if (error instanceof Error) {
-    const safe = ["already exists", "not found", "Unsupported chain"];
+    // "RPC endpoint not configured" (STRATA-1499) names only the chainId and
+    // the env key, never the configured value, so it is safe to surface.
+    const safe = [
+      "already exists",
+      "not found",
+      "Unsupported chain",
+      "RPC endpoint not configured",
+    ];
     if (safe.some((s) => error.message.includes(s))) return error.message;
   }
   return "Internal server error";
@@ -237,6 +244,9 @@ export const vault = new Vault({
   masterPassword: MASTER_PASSWORD,
   rpcUrl: process.env.RPC_URL || "https://sepolia.base.org",
   chainId: parseInt(process.env.CHAIN_ID || "84532", 10),
+  // STRATA-1499: explicit per-chain endpoints (RPC_URL_8453 / RPC_URL_84532).
+  // Base chains never fall back to RPC_URL or a public endpoint.
+  chainRpcUrls: chainRpcUrlsFromEnv(),
 });
 
 export const policyEngine = new PolicyEngine();

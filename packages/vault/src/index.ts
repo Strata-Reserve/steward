@@ -28,4 +28,11 @@ export {
   USER_WALLET_DEFAULT_POLICIES,
 } from "./user-wallet";
 export type { VaultConfig } from "./vault";
-export { Vault, Vault as VaultClient } from "./vault";
+export {
+  chainRpcEnvKey,
+  chainRpcUrlsFromEnv,
+  EXPLICIT_RPC_CHAINS,
+  resolveEvmRpcUrl,
+  Vault,
+  Vault as VaultClient,
+} from "./vault";

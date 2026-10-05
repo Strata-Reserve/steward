@@ -76,7 +76,7 @@ import {
   userTenants,
 } from "@stwd/db";
 import type { ApiResponse } from "@stwd/shared";
-import { KeyStore, provisionUserWallet, Vault } from "@stwd/vault";
+import { chainRpcUrlsFromEnv, KeyStore, provisionUserWallet, Vault } from "@stwd/vault";
 import bs58 from "bs58";
 import { and, eq, gte, lt } from "drizzle-orm";
 import { type Context, Hono } from "hono";
@@ -843,6 +843,9 @@ function getVault(): Vault {
     masterPassword,
     rpcUrl: process.env.RPC_URL || "https://sepolia.base.org",
     chainId: parseInt(process.env.CHAIN_ID || "84532", 10),
+    // STRATA-1499: explicit per-chain endpoints (RPC_URL_8453 / RPC_URL_84532).
+    // Base chains never fall back to RPC_URL or a public endpoint.
+    chainRpcUrls: chainRpcUrlsFromEnv(),
   });
 }
 
