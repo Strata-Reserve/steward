@@ -74,6 +74,7 @@ function manifest(addr: string) {
     safeAdmin: SAFE,
     factories: [FACTORY],
     verifiedTokens: [{ address: TOKEN, provenance: "0xdeploytx:verified" }],
+    approvers: [OWNER_USER],
   };
 }
 const mintCalldata = () =>

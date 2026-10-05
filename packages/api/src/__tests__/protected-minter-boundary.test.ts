@@ -200,6 +200,7 @@ beforeAll(async () => {
     safeAdmin: SAFE,
     factories: [FACTORY],
     verifiedTokens: [{ address: TOKEN, provenance: "0xdeploytx:receipt:verified-by-human" }],
+    approvers: [OWNER_USER, ADMIN_USER],
   });
 
   const mk = (userId: string) =>

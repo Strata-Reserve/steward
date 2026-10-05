@@ -47,6 +47,7 @@ import {
   getProtectedMinterManifest,
   getProtectedMinterManifestDigest,
   isProtectedMinter,
+  isProtectedMinterApprover,
   protectedReviewDigest,
   validateProtectedShape,
 } from "../services/prod-minter-boundary";
@@ -261,6 +262,13 @@ async function handleProtectedApprove(
   const userId = requireHumanOwnerAdmin(c);
   if (!userId) {
     return protectedRefused(c, "approval requires an authenticated human owner/admin session");
+  }
+  // STRATA-1499 SF-1 (R3 platform-promotion finding): owner/admin membership
+  // is necessary but not sufficient. The approver must also be pinned by
+  // stable user ID in the deployment-controlled manifest allowlist. Platform
+  // membership administration can promote a user; it cannot add them here.
+  if (!isProtectedMinterApprover(userId)) {
+    return protectedRefused(c, "approver is not in the pinned manifest allowlist");
   }
   const body = await safeJsonParse<{ reviewDigest?: unknown }>(c);
   const echoed = typeof body?.reviewDigest === "string" ? body.reviewDigest.toLowerCase() : null;

@@ -24,10 +24,26 @@
  *                                       each `address@provenance` where
  *                                       provenance is the independently
  *                                       verified deploy tx hash / receipt ref
+ *   STEWARD_PROTECTED_MINTER_APPROVERS  comma-separated stable user IDs (the
+ *                                       `users.id` UUID) of the ONLY humans who
+ *                                       may approve for this signer. Email is
+ *                                       not an identity here. Empty/unset =>
+ *                                       NO approver (zero approve capability,
+ *                                       fail-closed); a malformed entry is a
+ *                                       malformed manifest and refuses startup.
+ *                                       Part of the manifest digest, so any
+ *                                       change invalidates pending reviews.
  *   (Safe admin is fixed in code: 0x3Ea77cDf3eC33603bF4135bb1a36712B5e21d721)
  *
  * If any of these is set, all of the required ones must be valid or startup
  * fails. There is no "protected but unconfigured" posture.
+ *
+ * Approver authority (STRATA-1499 SF-1, REVIEW-STEWARD-28-R3 platform finding):
+ * tenant membership (owner/admin) is necessary but NOT sufficient to approve
+ * for the protected signer. Platform membership administration can promote a
+ * user to owner/admin; it cannot put that user in this allowlist, because the
+ * allowlist lives only in the deployment-controlled manifest and no API route
+ * reaches it.
  */
 
 import { agents, getDb } from "@stwd/db";
@@ -73,9 +89,15 @@ export interface ProtectedMinterManifest {
   safeAdmin: string;
   factories: string[];
   verifiedTokens: VerifiedToken[];
+  /**
+   * Pinned approver allowlist: stable user IDs (`users.id` UUIDs) of the only
+   * humans allowed to approve for this signer. Empty => nobody can approve.
+   */
+  approvers: string[];
 }
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const USER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ZERO_ADDRESS = `0x${"0".repeat(40)}`;
 
 function lower(a: string): string {
@@ -102,6 +124,16 @@ export function validateManifest(m: ProtectedMinterManifest): void {
     if (m.factories.some((f) => lower(f) === lower(t.address)))
       throw new Error("protected minter: a factory cannot also be a mint target");
   }
+  // Approver allowlist: required field; may be empty (fail-closed: no approver),
+  // but every entry must be a stable user ID and entries must be unique.
+  if (!Array.isArray(m.approvers)) throw new Error("protected minter: bad approvers");
+  const seen = new Set<string>();
+  for (const a of m.approvers) {
+    if (typeof a !== "string" || !USER_ID_RE.test(a))
+      throw new Error("protected minter: approvers must be stable user IDs (uuid)");
+    if (seen.has(lower(a))) throw new Error("protected minter: duplicate approver");
+    seen.add(lower(a));
+  }
 }
 
 export function computeManifestDigest(m: ProtectedMinterManifest): `0x${string}` {
@@ -116,6 +148,7 @@ export function computeManifestDigest(m: ProtectedMinterManifest): `0x${string}`
     verifiedTokens: [...m.verifiedTokens]
       .map((t) => ({ address: lower(t.address), provenance: t.provenance }))
       .sort((a, b) => (a.address < b.address ? -1 : 1)),
+    approvers: [...m.approvers].map(lower).sort(),
   });
   return keccak256(stringToHex(canonical));
 }
@@ -150,6 +183,8 @@ export function manifestFromEnv(
     safeAdmin: PROTECTED_MINTER_SAFE_ADMIN,
     factories: parseList(env.STEWARD_PROTECTED_MINTER_FACTORIES),
     verifiedTokens: tokens,
+    // Unset/empty => [] => no approver (fail-closed). Malformed => throws.
+    approvers: parseList(env.STEWARD_PROTECTED_MINTER_APPROVERS),
   };
   validateManifest(manifest);
   return manifest;
@@ -493,6 +528,7 @@ export function installProtectedMinterManifest(manifest: ProtectedMinterManifest
     verifiedTokens: Object.freeze(
       manifest.verifiedTokens.map((t) => Object.freeze({ ...t })),
     ) as VerifiedToken[],
+    approvers: Object.freeze([...manifest.approvers]) as string[],
   });
   activeDigest = computeManifestDigest(activeManifest);
   registerProtectedSignerGuard(buildGuard(activeManifest, activeDigest));
@@ -512,6 +548,16 @@ export function isProtectedMinter(tenantId: string, agentId: string): boolean {
     activeManifest.tenantId === tenantId &&
     activeManifest.agentId === agentId
   );
+}
+
+/**
+ * True when `userId` is a pinned approver in the installed manifest. No
+ * manifest, empty allowlist or any other user => false (fail-closed). Tenant
+ * role is checked separately by the caller; both are required.
+ */
+export function isProtectedMinterApprover(userId: string | null | undefined): boolean {
+  if (!activeManifest || !userId) return false;
+  return activeManifest.approvers.some((a) => lower(a) === lower(userId));
 }
 
 /** True when the agent id is the protected minter in any tenant (for id-only routes). */
