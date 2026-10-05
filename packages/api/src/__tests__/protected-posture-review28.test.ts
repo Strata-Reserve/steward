@@ -82,6 +82,10 @@ beforeAll(async () => {
   process.env.STEWARD_AUDIT_HMAC_KEY = "r28-audit-key-32-bytes-minimum-aaaaaaaaaa";
   process.env.STEWARD_JWT_SECRET = "r28-jwt-secret-with-enough-bytes-aaaaaaaaaa";
   process.env.STEWARD_PLATFORM_KEYS = PLATFORM_KEY;
+  // STRATA-1499 (#27 x #28): Base is an explicit-RPC chain; the protected
+  // path preflights it before the permit consume. Synthetic, never dialled:
+  // the broadcast seam is stubbed and the no-network preload blocks fetch.
+  process.env.RPC_URL_8453 = "https://protected-tests-mainnet.invalid/v2/UNUSED";
 
   const created = await createPGLiteDb("memory://");
   db = created.db;
@@ -137,6 +141,7 @@ afterAll(async () => {
     "STEWARD_AUDIT_HMAC_KEY",
     "STEWARD_JWT_SECRET",
     "STEWARD_PLATFORM_KEYS",
+    "RPC_URL_8453",
   ])
     delete process.env[k];
 });

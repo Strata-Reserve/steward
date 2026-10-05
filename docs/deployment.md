@@ -151,6 +151,8 @@ A hosted instance at `api.steward.fi` is run by the project for trusted testers.
 | `STEWARD_PLATFORM_KEYS` | Comma-separated platform operator keys for `/platform/*` | none | Required to use platform routes. Each request sends one key in `X-Steward-Platform-Key`. |
 | `STEWARD_DEFAULT_TENANT_KEY` | API key hash/plain value field for the default tenant bootstrap path | empty string | Only useful for single/default tenant setups. Platform-created tenants return generated API keys. |
 | `RPC_URL` | Default EVM RPC URL | `https://sepolia.base.org` in API/vault code; Compose sets Base mainnet | Must be reachable for balance/broadcast operations. |
+| `RPC_URL_8453` | Explicit Base mainnet RPC endpoint (STRATA-1499) | none | **Required** for any Base mainnet sign/broadcast/nonce/balance/passthrough. Must be an `https://` URL. No fallback to `RPC_URL` or a public endpoint: when unset or invalid the vault fails closed before signing. Consumed by `@stwd/api` (`services/context.ts`, `routes/auth.ts`, `routes/platform.ts`, `routes/user.ts`) via `@stwd/vault`. Never logged. |
+| `RPC_URL_84532` | Explicit Base Sepolia RPC endpoint (STRATA-1499) | none | Same rules as `RPC_URL_8453`, for chain id 84532. |
 | `CHAIN_ID` | Default EVM chain id | `84532` in auth/platform context, `8453` in some vault routes; Compose sets `8453` | Must parse as an integer. Prefer setting explicitly. |
 | `REDIS_URL` | Redis for rate limiting, token/challenge stores, proxy spend tracking/cache | none | Optional, but recommended for production. Without it some stores are in-memory or Postgres-backed depending on startup state. |
 | `RESEND_API_KEY` | Email magic-link delivery | none | If absent, email auth logs/dev-returns tokens instead of sending mail. |

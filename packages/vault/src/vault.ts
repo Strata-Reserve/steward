@@ -64,6 +64,14 @@ export interface VaultConfig {
   masterPassword: string;
   rpcUrl?: string;
   chainId?: number;
+  /**
+   * Explicit per-chain EVM RPC endpoints keyed by chainId (STRATA-1499).
+   * Chains in {@link EXPLICIT_RPC_CHAINS} MUST have an https entry here or
+   * every sign/broadcast/nonce/balance/passthrough call for that chain throws
+   * before any key is decrypted or row is written. Values usually carry a
+   * provider key: never log them.
+   */
+  chainRpcUrls?: Record<number, string | undefined>;
 }
 
 const CHAINS: Record<number, Chain> = {
@@ -88,6 +96,204 @@ const CHAIN_RPCS: Record<number, string> = {
   42161: "https://arb1.arbitrum.io/rpc",
   84532: "https://sepolia.base.org",
 };
+
+/**
+ * Chains that must be served by an explicitly configured endpoint
+ * (`VaultConfig.chainRpcUrls[chainId]`, fed from env `RPC_URL_<chainId>`).
+ * There is NO fallback to CHAIN_RPCS, `config.rpcUrl` or any public URL for
+ * these chains: a missing or non-https entry fails closed (STRATA-1499).
+ */
+export const EXPLICIT_RPC_CHAINS: ReadonlySet<number> = new Set([8453, 84532]);
+
+/** Env key that feeds `chainRpcUrls[chainId]` (convention: agent-trader state.ts). */
+export function chainRpcEnvKey(chainId: number): string {
+  return `RPC_URL_${chainId}`;
+}
+
+/**
+ * Build `VaultConfig.chainRpcUrls` from the process environment using the
+ * `RPC_URL_<chainId>` convention. Only the explicit chains are read; values
+ * are passed through untouched (validation happens at resolve time so a bad
+ * value fails the specific chain, not process start).
+ */
+export function chainRpcUrlsFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): Record<number, string | undefined> {
+  const out: Record<number, string | undefined> = {};
+  for (const chainId of EXPLICIT_RPC_CHAINS) {
+    out[chainId] = env[chainRpcEnvKey(chainId)];
+  }
+  return out;
+}
+
+/**
+ * Resolve the EVM RPC endpoint for `chainId`.
+ *
+ * - Explicit chains (Base 8453, Base Sepolia 84532): only `chainRpcUrls`. The
+ *   value must parse as an `https:` URL. Anything else throws; the thrown
+ *   message names the chainId and env key but never the configured value.
+ * - Every other chain: unchanged legacy behaviour
+ *   (`CHAIN_RPCS[chainId] ?? config.rpcUrl`), may be undefined.
+ */
+export function resolveEvmRpcUrl(
+  chainId: number,
+  config: Pick<VaultConfig, "rpcUrl" | "chainRpcUrls">,
+): string | undefined {
+  if (!EXPLICIT_RPC_CHAINS.has(chainId)) {
+    return CHAIN_RPCS[chainId] ?? config.rpcUrl;
+  }
+  const envKey = chainRpcEnvKey(chainId);
+  const raw = config.chainRpcUrls?.[chainId];
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    throw new Error(
+      `RPC endpoint not configured for chainId ${chainId}: set ${envKey} to an https URL ` +
+        `(no fallback to a public endpoint)`,
+    );
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.trim());
+  } catch {
+    throw new Error(
+      `RPC endpoint not configured for chainId ${chainId}: ${envKey} is not a valid URL ` +
+        `(no fallback to a public endpoint)`,
+    );
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname.length === 0) {
+    throw new Error(
+      `RPC endpoint not configured for chainId ${chainId}: ${envKey} must be an https URL ` +
+        `(got ${parsed.protocol || "no"} scheme; no fallback to a public endpoint)`,
+    );
+  }
+  return parsed.toString();
+}
+
+/**
+ * Readiness preflight for a chain's RPC configuration (STRATA-1499, F1).
+ *
+ * Throws the same deterministic "RPC endpoint not configured" error as
+ * {@link resolveEvmRpcUrl} when an explicit chain (Base 8453 / 84532) has no
+ * https endpoint. Solana and legacy EVM chains are a no-op. Callers MUST run
+ * this before reserving a new action, consuming a pending approval, burning a
+ * one-use permit, or decrypting a key, so a configuration error leaves no row
+ * changed and no claim consumed. The message never echoes the configured value.
+ *
+ * #28 (protected minter) must call this before consuming the protected
+ * one-use permit, i.e. ahead of the permit consume in `Vault.signTransaction`.
+ */
+export function assertChainRpcReady(
+  chainId: number,
+  config: Pick<VaultConfig, "rpcUrl" | "chainRpcUrls">,
+): void {
+  if (chainId === 101 || chainId === 102) return;
+  resolveEvmRpcUrl(chainId, config);
+}
+
+const RPC_REDACTED = "[redacted-rpc-endpoint]";
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The single sanitizer for provider-endpoint confidentiality (STRATA-1499, F2).
+ *
+ * Redacts every configured RPC endpoint from `text` by exact match (full URL,
+ * with and without a trailing slash, plus its host, path and query taken
+ * separately so a partial echo such as `host/v2/<key>` or just `<key>` is also
+ * caught) AND strips any remaining `http(s)://` / `ws(s)://` URL by pattern.
+ * Used by the Vault when it wraps viem/fetch errors and by the API at the
+ * HTTP-response, log and webhook boundaries. Idempotent.
+ */
+export function redactRpcEndpoints(
+  text: string,
+  configuredUrls: Iterable<string | undefined> = [],
+): string {
+  let out = text;
+  const literals: string[] = [];
+  for (const raw of configuredUrls) {
+    if (typeof raw !== "string") continue;
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) continue;
+    literals.push(trimmed, trimmed.replace(/\/+$/, ""));
+    try {
+      const parsed = new URL(trimmed);
+      literals.push(parsed.toString(), parsed.toString().replace(/\/+$/, ""));
+      if (parsed.host.length > 0) literals.push(parsed.host);
+      if (parsed.pathname.length > 1) {
+        literals.push(parsed.pathname);
+        for (const segment of parsed.pathname.split("/")) {
+          // Path segments of key length are credentials by convention.
+          if (segment.length >= 8) literals.push(segment);
+        }
+      }
+      if (parsed.search.length > 1) {
+        literals.push(parsed.search);
+        for (const value of parsed.searchParams.values()) {
+          if (value.length >= 8) literals.push(value);
+        }
+      }
+    } catch {
+      // Not a URL: the literal is still redacted below.
+    }
+  }
+  // Longest first so the full URL wins over its own host/path fragments.
+  for (const literal of [...new Set(literals)].sort((a, b) => b.length - a.length)) {
+    out = out.replace(new RegExp(escapeRegExp(literal), "g"), RPC_REDACTED);
+    const encoded = encodeURIComponent(literal);
+    if (encoded !== literal)
+      out = out.replace(new RegExp(escapeRegExp(encoded), "g"), RPC_REDACTED);
+  }
+  // Pattern stripping: anything that still looks like a URL goes too.
+  out = out.replace(/\b(?:https?|wss?):\/\/[^\s"'`<>()[\]]+/gi, RPC_REDACTED);
+  return out;
+}
+
+/**
+ * Rebuild `error` as a plain Error whose message (and cause chain) has been
+ * passed through {@link redactRpcEndpoints}. The original error is NOT kept
+ * as `cause`: viem attaches the transport URL to `details`/`metaMessages`/
+ * `cause`, and a raw `console.error(err)` would print all of them.
+ */
+export function redactRpcError(
+  error: unknown,
+  configuredUrls: Iterable<string | undefined>,
+): Error {
+  const urls = [...configuredUrls];
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth++) {
+    if (current instanceof Error) {
+      parts.push(current.message);
+      current = current.cause;
+    } else {
+      parts.push(typeof current === "string" ? current : "Unknown error");
+      break;
+    }
+  }
+  const message = redactRpcEndpoints(
+    parts.filter((p) => p.length > 0).join(" | ") || "Unknown error",
+    urls,
+  );
+  const wrapped = new Error(message);
+  if (error instanceof Error && error.name && error.name !== "Error") wrapped.name = error.name;
+  return wrapped;
+}
+
+/**
+ * Same as {@link resolveEvmRpcUrl} but never returns undefined: legacy chains
+ * with no endpoint at all throw the historical "No RPC URL configured" error.
+ */
+function requireEvmRpcUrl(
+  chainId: number,
+  config: Pick<VaultConfig, "rpcUrl" | "chainRpcUrls">,
+): string {
+  const url = resolveEvmRpcUrl(chainId, config);
+  if (!url) {
+    throw new Error(`No RPC URL configured for chainId ${chainId}`);
+  }
+  return url;
+}
 
 // Solana RPC URLs (chainId 101 = mainnet-beta, 102 = devnet)
 const SOLANA_RPCS: Record<number, string> = {
@@ -164,6 +370,22 @@ export class Vault {
   constructor(config: VaultConfig) {
     this.config = config;
     this.keyStore = new KeyStore(config.masterPassword);
+  }
+
+  /** Every endpoint this vault may have handed to a transport (for redaction). */
+  configuredRpcUrls(): string[] {
+    const urls: string[] = [];
+    if (this.config.rpcUrl) urls.push(this.config.rpcUrl);
+    for (const value of Object.values(this.config.chainRpcUrls ?? {})) {
+      if (typeof value === "string" && value.trim().length > 0) urls.push(value);
+    }
+    for (const value of Object.values(CHAIN_RPCS)) urls.push(value);
+    return urls;
+  }
+
+  /** Readiness preflight; see {@link assertChainRpcReady}. */
+  assertChainRpcReady(chainId: number): void {
+    assertChainRpcReady(chainId, this.config);
   }
 
   /**
@@ -550,6 +772,13 @@ export class Vault {
     const chainFamilyToUse = isSolana ? "solana" : "evm";
     const shouldBroadcast = request.broadcast !== false;
 
+    // STRATA-1499 (F1): RPC readiness is checked BEFORE any key is decrypted
+    // and BEFORE the protected permit below is consumed. For explicit chains a
+    // missing/non-https RPC_URL_<chainId> throws here, deterministically, with
+    // no network, no decrypt, no row write, and the permit / issuance claim /
+    // approval all left intact for a retry once configuration is fixed.
+    assertChainRpcReady(chainId, this.config);
+
     // ── STRATA-1499: protected production minter ───────────────────────────
     // Final gate before key decryption. Only the human-approved continuation
     // holds a permit; the permit is bound to the review digest of the exact
@@ -685,51 +914,63 @@ export class Vault {
         throw new Error(`Unsupported EVM chain: ${chainId}`);
       }
 
-      if (shouldBroadcast) {
-        // Use chain-specific RPC. Prior versions fell back to
-        // `this.config.rpcUrl` which is tenant-wide and may not match
-        // the target chain (e.g. Steward config pointed at Base but
-        // the tx is for BSC), causing RPC-side balance checks to fail
-        // with 'total cost exceeds balance' (wrong chain's balance).
-        const rpcUrl = CHAIN_RPCS[chainId] ?? this.config.rpcUrl;
-        const client = createWalletClient({
-          account,
-          chain,
-          transport: http(rpcUrl),
-        });
+      // Resolve the endpoint BEFORE building any client (STRATA-1499). The
+      // readiness preflight above already rejected a missing/invalid
+      // RPC_URL_<chainId>, so this cannot throw for configuration reasons
+      // after the key was decrypted. Prior versions fell back to
+      // `this.config.rpcUrl`, which is tenant-wide and may not match the
+      // target chain (e.g. Steward config pointed at Base but the tx is for
+      // BSC), causing RPC-side balance checks to fail with 'total cost
+      // exceeds balance'.
+      const rpcUrl = resolveEvmRpcUrl(chainId, this.config);
 
-        hash = await this.broadcastEvm(client, {
-          to: request.to as `0x${string}`,
-          value: BigInt(request.value),
-          data: request.data as `0x${string}` | undefined,
-          gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
-          chainId,
-        });
-      } else {
-        // Sign without broadcasting - return the serialized signed transaction
-        const rpcUrl = CHAIN_RPCS[chainId] ?? this.config.rpcUrl;
-        const publicClient = createPublicClient({
-          chain,
-          transport: http(rpcUrl),
-        });
-        const nonce =
-          request.nonce ??
-          (await publicClient.getTransactionCount({
-            address: account.address,
-          }));
-        const gasPrice = await publicClient.getGasPrice();
+      try {
+        if (shouldBroadcast) {
+          // The client (protected path included) is built ONLY from the
+          // explicit resolver above; there is no CHAIN_RPCS/config.rpcUrl
+          // fallback for Base. `broadcastEvm` is the test seam (#28).
+          const client = createWalletClient({
+            account,
+            chain,
+            transport: http(rpcUrl),
+          });
 
-        const txRequest: TransactionSerializable = {
-          to: request.to as `0x${string}`,
-          value: BigInt(request.value),
-          data: request.data as `0x${string}` | undefined,
-          gas: request.gasLimit ? BigInt(request.gasLimit) : 21000n,
-          nonce,
-          gasPrice,
-          chainId,
-        };
+          hash = await this.broadcastEvm(client, {
+            to: request.to as `0x${string}`,
+            value: BigInt(request.value),
+            data: request.data as `0x${string}` | undefined,
+            gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
+            chainId,
+          });
+        } else {
+          // Sign without broadcasting - return the serialized signed transaction
+          const publicClient = createPublicClient({
+            chain,
+            transport: http(rpcUrl),
+          });
+          const nonce =
+            request.nonce ??
+            (await publicClient.getTransactionCount({
+              address: account.address,
+            }));
+          const gasPrice = await publicClient.getGasPrice();
 
-        hash = await account.signTransaction(txRequest);
+          const txRequest: TransactionSerializable = {
+            to: request.to as `0x${string}`,
+            value: BigInt(request.value),
+            data: request.data as `0x${string}` | undefined,
+            gas: request.gasLimit ? BigInt(request.gasLimit) : 21000n,
+            nonce,
+            gasPrice,
+            chainId,
+          };
+
+          hash = await account.signTransaction(txRequest);
+        }
+      } catch (err) {
+        // STRATA-1499 (F2): viem embeds the transport URL in its errors.
+        // Redact at the boundary so no caller can log/return the endpoint.
+        throw redactRpcError(err, this.configuredRpcUrls());
       }
     }
 
@@ -843,11 +1084,16 @@ export class Vault {
     }
 
     const evmAddress = agent.walletAddresses?.evm ?? agent.walletAddress;
-    const rpcUrl = CHAIN_RPCS[resolvedChainId] ?? this.config.rpcUrl;
+    const rpcUrl = resolveEvmRpcUrl(resolvedChainId, this.config);
     const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
-    const native = await publicClient.getBalance({
-      address: evmAddress as `0x${string}`,
-    });
+    let native: bigint;
+    try {
+      native = await publicClient.getBalance({
+        address: evmAddress as `0x${string}`,
+      });
+    } catch (err) {
+      throw redactRpcError(err, this.configuredRpcUrls());
+    }
 
     return {
       native,
@@ -880,9 +1126,15 @@ export class Vault {
 
     const resolvedChainId = chainId ?? this.config.chainId ?? 8453;
     const evmAddress = agent.walletAddresses?.evm ?? agent.walletAddress;
-    const rpcUrl = CHAIN_RPCS[resolvedChainId] ?? this.config.rpcUrl;
+    // Explicit chains throw here; legacy chains may pass undefined and let
+    // tokens.ts apply its own public default (unchanged behaviour).
+    const rpcUrl = resolveEvmRpcUrl(resolvedChainId, this.config);
 
-    return fetchTokenBalances(evmAddress, resolvedChainId, tokens, rpcUrl);
+    try {
+      return await fetchTokenBalances(evmAddress, resolvedChainId, tokens, rpcUrl);
+    } catch (err) {
+      throw redactRpcError(err, this.configuredRpcUrls());
+    }
   }
 
   /**
@@ -1476,16 +1728,9 @@ export class Vault {
     const chainId = request.chainId;
     const isSolana = chainId === 101 || chainId === 102;
 
-    let rpcUrl: string;
-    if (isSolana) {
-      rpcUrl = SOLANA_RPCS[chainId] ?? SOLANA_RPCS[101];
-    } else {
-      rpcUrl = CHAIN_RPCS[chainId] ?? this.config.rpcUrl ?? "";
-    }
-
-    if (!rpcUrl) {
-      throw new Error(`No RPC URL configured for chainId ${chainId}`);
-    }
+    const rpcUrl: string = isSolana
+      ? (SOLANA_RPCS[chainId] ?? SOLANA_RPCS[101])
+      : requireEvmRpcUrl(chainId, this.config);
 
     // Block signing/state-modifying methods - this is read-only passthrough
     const blockedMethods = [
@@ -1503,16 +1748,22 @@ export class Vault {
       );
     }
 
-    const response = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: request.method,
-        params: request.params ?? [],
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: request.method,
+          params: request.params ?? [],
+        }),
+      });
+    } catch (err) {
+      // STRATA-1499 (F2): transport errors name the URL; redact before rethrow.
+      throw redactRpcError(err, [...this.configuredRpcUrls(), ...Object.values(SOLANA_RPCS)]);
+    }
 
     if (!response.ok) {
       throw new Error(`RPC request failed: ${response.status} ${response.statusText}`);

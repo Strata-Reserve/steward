@@ -155,6 +155,10 @@ beforeAll(async () => {
   process.env.STEWARD_MASTER_PASSWORD = "protected-minter-master-password";
   process.env.STEWARD_AUDIT_HMAC_KEY = "protected-minter-audit-key-32-bytes-minimum-aa";
   process.env.STEWARD_JWT_SECRET = "protected-minter-jwt-secret-with-enough-bytes-aaaa";
+  // STRATA-1499 (#27 x #28): Base is an explicit-RPC chain; the protected
+  // path preflights it before the permit consume. Synthetic, never dialled:
+  // the broadcast seam is stubbed and the no-network preload blocks fetch.
+  process.env.RPC_URL_8453 = "https://protected-tests-mainnet.invalid/v2/UNUSED";
 
   const { db, client } = await createPGLiteDb("memory://");
   setPGLiteOverride(db, async () => client.close());
@@ -216,7 +220,7 @@ beforeAll(async () => {
     signedBytes.push(tx);
     return `0x${signedBytes.length.toString(16).padStart(64, "0")}`;
   }) as never) as never;
-});
+}, 120000);
 
 afterAll(async () => {
   sendSpy?.mockRestore();
@@ -228,6 +232,7 @@ afterAll(async () => {
     "STEWARD_MASTER_PASSWORD",
     "STEWARD_AUDIT_HMAC_KEY",
     "STEWARD_JWT_SECRET",
+    "RPC_URL_8453",
   ])
     delete process.env[k];
 });
