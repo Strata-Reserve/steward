@@ -534,7 +534,7 @@ export class Vault {
 
     // Verify agent exists for this tenant
     const [agentRow] = await db
-      .select({ id: agents.id, walletAddress: agents.walletAddress, protected: agents.protected })
+      .select({ id: agents.id, walletAddress: agents.walletAddress })
       .from(agents)
       .where(and(eq(agents.id, request.agentId), eq(agents.tenantId, request.tenantId)));
 
@@ -542,14 +542,7 @@ export class Vault {
       throw new Error(`Agent ${request.agentId} not found for tenant ${request.tenantId}`);
     }
     // STRATA-1499 F1: persisted marker, independent of env. Fail closed.
-    if (
-      agentRow.protected &&
-      !getProtectedSignerGuard()?.isProtected(request.tenantId, request.agentId)
-    ) {
-      throw new ProtectedSignerError(
-        "transaction signing refused: agent is persisted-protected but no valid manifest is installed",
-      );
-    }
+    await assertProtectedPostureIntact(request.tenantId, request.agentId, "transaction signing");
 
     const chainId = request.chainId || this.config.chainId || 8453;
     // Determine chain family from chainId (101/102 = Solana)

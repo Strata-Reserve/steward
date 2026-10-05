@@ -74,11 +74,29 @@ export function assertNotProtected(tenantId: string, agentId: string, operation:
  * it; a missing/invalid manifest therefore never un-protects a signer.
  */
 export async function isPersistedProtected(tenantId: string, agentId: string): Promise<boolean> {
-  const [row] = await getDb()
-    .select({ protected: agents.protected })
-    .from(agents)
-    .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
-  return row?.protected === true;
+  try {
+    const [row] = await getDb()
+      .select({ protected: agents.protected })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+    return row?.protected === true;
+  } catch (e) {
+    // Pre-0029 schema: the marker column cannot exist, so no agent can be
+    // persisted-protected. Any other error propagates (fail closed).
+    if (isUndefinedColumn(e)) return false;
+    throw e;
+  }
+}
+
+/** Postgres 42703 (undefined_column), possibly wrapped by drizzle. */
+export function isUndefinedColumn(e: unknown): boolean {
+  let cur: unknown = e;
+  for (let i = 0; i < 4 && cur && typeof cur === "object"; i++) {
+    const code = (cur as { code?: unknown }).code;
+    if (code === "42703") return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 export async function assertProtectedPostureIntact(

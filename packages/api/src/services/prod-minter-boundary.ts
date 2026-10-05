@@ -33,6 +33,7 @@
 import { agents, getDb } from "@stwd/db";
 import {
   computeProtectedReviewDigest,
+  isUndefinedColumn,
   type ProtectedSignerGuard,
   type ProtectedTransactionShape,
   type ProtectedValidation,
@@ -541,10 +542,20 @@ export function protectedReviewDigest(input: {
  * throws so the process exits non-zero.
  */
 export async function assertProtectedPostureAtStartup(): Promise<void> {
-  const rows = await getDb()
-    .select({ id: agents.id, tenantId: agents.tenantId })
-    .from(agents)
-    .where(eq(agents.protected, true));
+  let rows: Array<{ id: string; tenantId: string }>;
+  try {
+    rows = await getDb()
+      .select({ id: agents.id, tenantId: agents.tenantId })
+      .from(agents)
+      .where(eq(agents.protected, true));
+  } catch (e) {
+    if (isUndefinedColumn(e)) {
+      // Pre-0029 schema: marker column absent => no persisted-protected agent can exist.
+      console.warn("[steward] agents.protected column absent (migration 0029 not applied)");
+      return;
+    }
+    throw e;
+  }
   const uncovered = rows.filter((r) => !isProtectedMinter(r.tenantId, r.id));
   if (uncovered.length > 0) {
     throw new Error(
@@ -557,11 +568,16 @@ export async function assertProtectedPostureAtStartup(): Promise<void> {
 
 /** Persisted-marker lookup for route guards (deny-by-default when manifest absent). */
 export async function isPersistedProtectedAgent(agentId: string): Promise<boolean> {
-  const [row] = await getDb()
-    .select({ protected: agents.protected })
-    .from(agents)
-    .where(eq(agents.id, agentId));
-  return row?.protected === true;
+  try {
+    const [row] = await getDb()
+      .select({ protected: agents.protected })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    return row?.protected === true;
+  } catch (e) {
+    if (isUndefinedColumn(e)) return false; // pre-0029 schema: marker cannot exist
+    throw e;
+  }
 }
 
 // Startup: read env once. Fail closed on invalid configuration.

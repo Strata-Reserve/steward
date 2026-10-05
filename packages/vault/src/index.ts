@@ -17,6 +17,7 @@ export {
   isPersistedProtected,
   isProtectedSigner,
   issueProtectedSigningPermit,
+  isUndefinedColumn,
   outstandingProtectedPermits,
   ProtectedSignerError,
   registerProtectedSignerGuard,
