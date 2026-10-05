@@ -24,7 +24,7 @@ import {
   type Tenant,
   type TenantConfig,
 } from "@stwd/shared";
-import { chainRpcUrlsFromEnv, Vault } from "@stwd/vault";
+import { chainRpcUrlsFromEnv, redactRpcEndpoints, Vault } from "@stwd/vault";
 import { WebhookDispatcher } from "@stwd/webhooks";
 import { and, eq, gte, sql } from "drizzle-orm";
 import type { Context, Next } from "hono";
@@ -217,10 +217,34 @@ export function isRpcError(error: unknown): boolean {
 export function extractRpcErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     const innerMatch = error.message.match(/message["\s:]+([^"]+)/i);
-    if (innerMatch) return innerMatch[1].trim();
-    return error.message;
+    if (innerMatch) return redactRpcMessage(innerMatch[1].trim());
+    return redactRpcMessage(error.message);
   }
   return "RPC error";
+}
+
+/**
+ * STRATA-1499 (F2): the one RPC-error sanitizer for the API. Every string that
+ * came out of an RPC/transport failure MUST pass through here before it is
+ * placed in an HTTP body, a log line or a webhook payload. Exact-matches the
+ * endpoints this process has configured (RPC_URL, RPC_URL_<chainId>, the
+ * built-in defaults) and strips any remaining URL by pattern.
+ */
+export function redactRpcMessage(text: string): string {
+  return redactRpcEndpoints(text, vault.configuredRpcUrls());
+}
+
+/**
+ * Loggable form of an RPC/transport error: name + redacted message only.
+ * Never pass the raw error object to console.error: viem errors carry the
+ * transport URL in `details`, `metaMessages` and `cause`.
+ */
+export function describeRpcError(error: unknown): string {
+  if (error instanceof Error) {
+    const name = error.name && error.name !== "Error" ? `${error.name}: ` : "";
+    return redactRpcMessage(`${name}${error.message}`);
+  }
+  return redactRpcMessage(typeof error === "string" ? error : "Unknown error");
 }
 
 // ─── Environment ──────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ import {
   type AppVariables,
   approvalQueue,
   db,
+  describeRpcError,
   ensureAgentForTenant,
   extractRpcErrorMessage,
   getPolicySet,
@@ -28,6 +29,7 @@ import {
   priceOracle,
   type RpcRequest,
   type RpcResponse,
+  redactRpcMessage,
   requireAgentAccess,
   requireTenantLevel,
   type SignRequest,
@@ -307,6 +309,22 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
     if (existing) return replayExistingAction(c, existing, incomingPayload);
   }
 
+  // STRATA-1499 (F1): RPC readiness preflight BEFORE anything is reserved,
+  // rate-limited, evaluated, queued or decrypted. A missing/non-https
+  // RPC_URL_<chainId> for an explicit chain is a deterministic configuration
+  // error: it makes no row change and consumes nothing, so the same request
+  // succeeds once the operator fixes the configuration. Replay by
+  // executionRef (above) stays first and unchanged.
+  try {
+    vault.assertChainRpcReady(resolvedChainId);
+  } catch (e: unknown) {
+    const requestId = c.get("requestId") || "unknown";
+    console.error(
+      `[${requestId}] Sign preflight failed for agent ${agentId}: ${describeRpcError(e)}`,
+    );
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
+  }
+
   const policySet = await getPolicySet(tenantId, agentId);
 
   // ── Redis rate-limit check (before policy evaluation) ──────────────────────
@@ -558,8 +576,9 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    const rawMessage = e instanceof Error ? e.message : "Unknown error";
-    console.error(`[${requestId}] Sign transaction failed for agent ${agentId}:`, e);
+    // STRATA-1499 (F2): one redacted message for log, webhook and HTTP body.
+    const safeMessage = describeRpcError(e);
+    console.error(`[${requestId}] Sign transaction failed for agent ${agentId}: ${safeMessage}`);
 
     if (reserved) {
       // The reservation stays bound to this reference as a terminal failure.
@@ -577,7 +596,7 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
     dispatchWebhook(tenantId, agentId, "tx_failed", {
       txId,
       ...(executionRef ? { executionRef } : {}),
-      error: rawMessage,
+      error: safeMessage,
       requestId,
     });
 
@@ -615,6 +634,21 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
     .where(and(eq(transactions.id, txId), eq(transactions.agentId, agentId)));
   if (!transaction) {
     return c.json<ApiResponse>({ ok: false, error: "Transaction not found" }, 404);
+  }
+
+  // STRATA-1499 (F1): RPC readiness preflight BEFORE the pending approval is
+  // claimed. A deterministic configuration error leaves the approval pending
+  // and the transaction row unchanged, so the same approval succeeds once the
+  // endpoint is configured. Anything thrown after the claim below is treated
+  // as ambiguous (see the catch) and is never released.
+  try {
+    vault.assertChainRpcReady(transaction.chainId);
+  } catch (e: unknown) {
+    const requestId = c.get("requestId") || "unknown";
+    console.error(
+      `[${requestId}] Approve preflight failed for agent ${agentId}, tx ${txId}: ${describeRpcError(e)}`,
+    );
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
   }
 
   const resolvedAt = new Date();
@@ -692,8 +726,11 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    const rawMessage = e instanceof Error ? e.message : "Unknown error";
-    console.error(`[${requestId}] Approve transaction failed for agent ${agentId}, tx ${txId}:`, e);
+    // STRATA-1499 (F2): one redacted message for log, webhook and HTTP body.
+    const safeMessage = describeRpcError(e);
+    console.error(
+      `[${requestId}] Approve transaction failed for agent ${agentId}, tx ${txId}: ${safeMessage}`,
+    );
 
     // STRATA-1499: fail closed. The approval claim has been consumed and the
     // broadcaster was invoked; an RPC can accept a transaction and still
@@ -718,7 +755,7 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
     dispatchWebhook(tenantId, agentId, "tx_failed", {
       txId,
       ...(transaction.executionRef ? { executionRef: transaction.executionRef } : {}),
-      error: rawMessage,
+      error: safeMessage,
       requestId,
     });
 
@@ -1444,10 +1481,11 @@ vaultRoutes.post("/:agentId/sign-solana", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    console.error(`[${requestId}] Solana sign failed for agent ${agentId}:`, e);
+    const safeMessage = describeRpcError(e);
+    console.error(`[${requestId}] Solana sign failed for agent ${agentId}: ${safeMessage}`);
 
     dispatchWebhook(tenantId, agentId, "tx_failed", {
-      error: e instanceof Error ? e.message : "Unknown error",
+      error: safeMessage,
       requestId,
     });
 
@@ -1500,8 +1538,11 @@ vaultRoutes.post("/:agentId/rpc", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    const message = e instanceof Error ? e.message : "Unknown error";
-    console.error(`[${requestId}] RPC passthrough failed for agent ${agentId}:`, e);
+    // STRATA-1499 (F2): passthrough errors name the endpoint; redact for both.
+    const message = e instanceof Error ? redactRpcMessage(e.message) : "Unknown error";
+    console.error(
+      `[${requestId}] RPC passthrough failed for agent ${agentId}: ${describeRpcError(e)}`,
+    );
     return c.json<ApiResponse>({ ok: false, error: message }, 400);
   }
 });

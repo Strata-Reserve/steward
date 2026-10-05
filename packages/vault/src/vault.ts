@@ -161,6 +161,118 @@ export function resolveEvmRpcUrl(
 }
 
 /**
+ * Readiness preflight for a chain's RPC configuration (STRATA-1499, F1).
+ *
+ * Throws the same deterministic "RPC endpoint not configured" error as
+ * {@link resolveEvmRpcUrl} when an explicit chain (Base 8453 / 84532) has no
+ * https endpoint. Solana and legacy EVM chains are a no-op. Callers MUST run
+ * this before reserving a new action, consuming a pending approval, burning a
+ * one-use permit, or decrypting a key, so a configuration error leaves no row
+ * changed and no claim consumed. The message never echoes the configured value.
+ *
+ * #28 (protected minter) must call this before consuming the protected
+ * one-use permit, i.e. ahead of the permit consume in `Vault.signTransaction`.
+ */
+export function assertChainRpcReady(
+  chainId: number,
+  config: Pick<VaultConfig, "rpcUrl" | "chainRpcUrls">,
+): void {
+  if (chainId === 101 || chainId === 102) return;
+  resolveEvmRpcUrl(chainId, config);
+}
+
+const RPC_REDACTED = "[redacted-rpc-endpoint]";
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The single sanitizer for provider-endpoint confidentiality (STRATA-1499, F2).
+ *
+ * Redacts every configured RPC endpoint from `text` by exact match (full URL,
+ * with and without a trailing slash, plus its host, path and query taken
+ * separately so a partial echo such as `host/v2/<key>` or just `<key>` is also
+ * caught) AND strips any remaining `http(s)://` / `ws(s)://` URL by pattern.
+ * Used by the Vault when it wraps viem/fetch errors and by the API at the
+ * HTTP-response, log and webhook boundaries. Idempotent.
+ */
+export function redactRpcEndpoints(
+  text: string,
+  configuredUrls: Iterable<string | undefined> = [],
+): string {
+  let out = text;
+  const literals: string[] = [];
+  for (const raw of configuredUrls) {
+    if (typeof raw !== "string") continue;
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) continue;
+    literals.push(trimmed, trimmed.replace(/\/+$/, ""));
+    try {
+      const parsed = new URL(trimmed);
+      literals.push(parsed.toString(), parsed.toString().replace(/\/+$/, ""));
+      if (parsed.host.length > 0) literals.push(parsed.host);
+      if (parsed.pathname.length > 1) {
+        literals.push(parsed.pathname);
+        for (const segment of parsed.pathname.split("/")) {
+          // Path segments of key length are credentials by convention.
+          if (segment.length >= 8) literals.push(segment);
+        }
+      }
+      if (parsed.search.length > 1) {
+        literals.push(parsed.search);
+        for (const value of parsed.searchParams.values()) {
+          if (value.length >= 8) literals.push(value);
+        }
+      }
+    } catch {
+      // Not a URL: the literal is still redacted below.
+    }
+  }
+  // Longest first so the full URL wins over its own host/path fragments.
+  for (const literal of [...new Set(literals)].sort((a, b) => b.length - a.length)) {
+    out = out.replace(new RegExp(escapeRegExp(literal), "g"), RPC_REDACTED);
+    const encoded = encodeURIComponent(literal);
+    if (encoded !== literal)
+      out = out.replace(new RegExp(escapeRegExp(encoded), "g"), RPC_REDACTED);
+  }
+  // Pattern stripping: anything that still looks like a URL goes too.
+  out = out.replace(/\b(?:https?|wss?):\/\/[^\s"'`<>()[\]]+/gi, RPC_REDACTED);
+  return out;
+}
+
+/**
+ * Rebuild `error` as a plain Error whose message (and cause chain) has been
+ * passed through {@link redactRpcEndpoints}. The original error is NOT kept
+ * as `cause`: viem attaches the transport URL to `details`/`metaMessages`/
+ * `cause`, and a raw `console.error(err)` would print all of them.
+ */
+export function redactRpcError(
+  error: unknown,
+  configuredUrls: Iterable<string | undefined>,
+): Error {
+  const urls = [...configuredUrls];
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth++) {
+    if (current instanceof Error) {
+      parts.push(current.message);
+      current = current.cause;
+    } else {
+      parts.push(typeof current === "string" ? current : "Unknown error");
+      break;
+    }
+  }
+  const message = redactRpcEndpoints(
+    parts.filter((p) => p.length > 0).join(" | ") || "Unknown error",
+    urls,
+  );
+  const wrapped = new Error(message);
+  if (error instanceof Error && error.name && error.name !== "Error") wrapped.name = error.name;
+  return wrapped;
+}
+
+/**
  * Same as {@link resolveEvmRpcUrl} but never returns undefined: legacy chains
  * with no endpoint at all throw the historical "No RPC URL configured" error.
  */
@@ -242,6 +354,22 @@ export class Vault {
   constructor(config: VaultConfig) {
     this.config = config;
     this.keyStore = new KeyStore(config.masterPassword);
+  }
+
+  /** Every endpoint this vault may have handed to a transport (for redaction). */
+  configuredRpcUrls(): string[] {
+    const urls: string[] = [];
+    if (this.config.rpcUrl) urls.push(this.config.rpcUrl);
+    for (const value of Object.values(this.config.chainRpcUrls ?? {})) {
+      if (typeof value === "string" && value.trim().length > 0) urls.push(value);
+    }
+    for (const value of Object.values(CHAIN_RPCS)) urls.push(value);
+    return urls;
+  }
+
+  /** Readiness preflight; see {@link assertChainRpcReady}. */
+  assertChainRpcReady(chainId: number): void {
+    assertChainRpcReady(chainId, this.config);
   }
 
   /**
@@ -619,6 +747,11 @@ export class Vault {
     const chainFamilyToUse = isSolana ? "solana" : "evm";
     const shouldBroadcast = request.broadcast !== false;
 
+    // STRATA-1499 (F1): RPC readiness is checked BEFORE any key is decrypted.
+    // For explicit chains a missing/non-https RPC_URL_<chainId> throws here,
+    // deterministically, with no network, no decrypt and no row write.
+    assertChainRpcReady(chainId, this.config);
+
     // ── Resolve the correct signing key ─────────────────────────────────
     // 1. Try the multi-chain key table (new agents)
     // 2. Fall back to legacy single-key table (old EVM-only agents)
@@ -687,52 +820,59 @@ export class Vault {
         throw new Error(`Unsupported EVM chain: ${chainId}`);
       }
 
-      // Resolve the endpoint BEFORE building any client (STRATA-1499): for
-      // explicit chains a missing/invalid RPC_URL_<chainId> throws here, so
-      // nothing is signed and no claim/row is mutated by this method.
-      // Prior versions fell back to `this.config.rpcUrl`, which is
-      // tenant-wide and may not match the target chain (e.g. Steward config
-      // pointed at Base but the tx is for BSC), causing RPC-side balance
-      // checks to fail with 'total cost exceeds balance'.
+      // Resolve the endpoint BEFORE building any client (STRATA-1499). The
+      // readiness preflight above already rejected a missing/invalid
+      // RPC_URL_<chainId>, so this cannot throw for configuration reasons
+      // after the key was decrypted. Prior versions fell back to
+      // `this.config.rpcUrl`, which is tenant-wide and may not match the
+      // target chain (e.g. Steward config pointed at Base but the tx is for
+      // BSC), causing RPC-side balance checks to fail with 'total cost
+      // exceeds balance'.
       const rpcUrl = resolveEvmRpcUrl(chainId, this.config);
 
-      if (shouldBroadcast) {
-        const client = createWalletClient({
-          account,
-          chain,
-          transport: http(rpcUrl),
-        });
+      try {
+        if (shouldBroadcast) {
+          const client = createWalletClient({
+            account,
+            chain,
+            transport: http(rpcUrl),
+          });
 
-        hash = await client.sendTransaction({
-          to: request.to as `0x${string}`,
-          value: BigInt(request.value),
-          data: request.data as `0x${string}` | undefined,
-          gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
-        });
-      } else {
-        // Sign without broadcasting - return the serialized signed transaction
-        const publicClient = createPublicClient({
-          chain,
-          transport: http(rpcUrl),
-        });
-        const nonce =
-          request.nonce ??
-          (await publicClient.getTransactionCount({
-            address: account.address,
-          }));
-        const gasPrice = await publicClient.getGasPrice();
+          hash = await client.sendTransaction({
+            to: request.to as `0x${string}`,
+            value: BigInt(request.value),
+            data: request.data as `0x${string}` | undefined,
+            gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
+          });
+        } else {
+          // Sign without broadcasting - return the serialized signed transaction
+          const publicClient = createPublicClient({
+            chain,
+            transport: http(rpcUrl),
+          });
+          const nonce =
+            request.nonce ??
+            (await publicClient.getTransactionCount({
+              address: account.address,
+            }));
+          const gasPrice = await publicClient.getGasPrice();
 
-        const txRequest: TransactionSerializable = {
-          to: request.to as `0x${string}`,
-          value: BigInt(request.value),
-          data: request.data as `0x${string}` | undefined,
-          gas: request.gasLimit ? BigInt(request.gasLimit) : 21000n,
-          nonce,
-          gasPrice,
-          chainId,
-        };
+          const txRequest: TransactionSerializable = {
+            to: request.to as `0x${string}`,
+            value: BigInt(request.value),
+            data: request.data as `0x${string}` | undefined,
+            gas: request.gasLimit ? BigInt(request.gasLimit) : 21000n,
+            nonce,
+            gasPrice,
+            chainId,
+          };
 
-        hash = await account.signTransaction(txRequest);
+          hash = await account.signTransaction(txRequest);
+        }
+      } catch (err) {
+        // STRATA-1499 (F2): viem embeds the transport URL in its errors.
+        // Redact at the boundary so no caller can log/return the endpoint.
+        throw redactRpcError(err, this.configuredRpcUrls());
       }
     }
 
@@ -825,9 +965,14 @@ export class Vault {
     const evmAddress = agent.walletAddresses?.evm ?? agent.walletAddress;
     const rpcUrl = resolveEvmRpcUrl(resolvedChainId, this.config);
     const publicClient = createPublicClient({ chain, transport: http(rpcUrl) });
-    const native = await publicClient.getBalance({
-      address: evmAddress as `0x${string}`,
-    });
+    let native: bigint;
+    try {
+      native = await publicClient.getBalance({
+        address: evmAddress as `0x${string}`,
+      });
+    } catch (err) {
+      throw redactRpcError(err, this.configuredRpcUrls());
+    }
 
     return {
       native,
@@ -864,7 +1009,11 @@ export class Vault {
     // tokens.ts apply its own public default (unchanged behaviour).
     const rpcUrl = resolveEvmRpcUrl(resolvedChainId, this.config);
 
-    return fetchTokenBalances(evmAddress, resolvedChainId, tokens, rpcUrl);
+    try {
+      return await fetchTokenBalances(evmAddress, resolvedChainId, tokens, rpcUrl);
+    } catch (err) {
+      throw redactRpcError(err, this.configuredRpcUrls());
+    }
   }
 
   /**
@@ -1466,16 +1615,22 @@ export class Vault {
       );
     }
 
-    const response = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: request.method,
-        params: request.params ?? [],
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: request.method,
+          params: request.params ?? [],
+        }),
+      });
+    } catch (err) {
+      // STRATA-1499 (F2): transport errors name the URL; redact before rethrow.
+      throw redactRpcError(err, [...this.configuredRpcUrls(), ...Object.values(SOLANA_RPCS)]);
+    }
 
     if (!response.ok) {
       throw new Error(`RPC request failed: ${response.status} ${response.statusText}`);

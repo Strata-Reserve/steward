@@ -29,9 +29,12 @@ export {
 } from "./user-wallet";
 export type { VaultConfig } from "./vault";
 export {
+  assertChainRpcReady,
   chainRpcEnvKey,
   chainRpcUrlsFromEnv,
   EXPLICIT_RPC_CHAINS,
+  redactRpcEndpoints,
+  redactRpcError,
   resolveEvmRpcUrl,
   Vault,
   Vault as VaultClient,
