@@ -15,8 +15,8 @@
  * refuses every operation on such an agent unless a guard recognises it.
  */
 
-import { agents, approvalQueue, getDb } from "@stwd/db";
-import { and, eq } from "drizzle-orm";
+import { agents, approvalQueue, getDb, transactions } from "@stwd/db";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { keccak256, stringToHex } from "viem";
 
 export interface ProtectedTransactionShape {
@@ -171,6 +171,16 @@ const permits = new Map<string, Permit>();
  * Issued only by the human-approval continuation after the approval-queue
  * CAS succeeded. The returned handle is module-private state, never a caller
  * field or HTTP token; it is consumed exactly once by `consumeSigningPermit`.
+ *
+ * REVIEW-STEWARD-28-R2 R2-1: issuance itself is a durable single-use claim.
+ * One approval row yields at most ONE permit, ever. The claim is taken by a
+ * DB compare-and-set on `approval_queue.issuance_claimed_at` (NULL -> now)
+ * conditioned on `status='approved'` and the exact review digest, in the
+ * same statement, so two concurrent issuers get exactly one success. Once
+ * claimed, the row is permanently spent: a signing that already happened,
+ * is in flight, or failed after the claim never yields a fresh permit. A
+ * lost/unknown outcome must be resolved by the executionRef status lookup,
+ * never by re-issuing.
  */
 export async function issueProtectedSigningPermit(input: {
   tenantId: string;
@@ -178,22 +188,83 @@ export async function issueProtectedSigningPermit(input: {
   txId: string;
   reviewDigest: string;
 }): Promise<string> {
-  // The issuer independently verifies the consumed approval: the queue row
-  // must already be in `approved` state with the exact digest. Callers are
-  // not trusted to have performed the CAS.
-  const [row] = await getDb()
-    .select({ status: approvalQueue.status, reviewDigest: approvalQueue.reviewDigest })
+  const db = getDb();
+  const digest = input.reviewDigest.toLowerCase();
+
+  // Belt-and-braces: the transaction row itself must still be pending for
+  // this tenant/agent. Any terminal or in-progress state refuses issuance
+  // regardless of the queue row.
+  const [tx] = await db
+    .select({ status: transactions.status })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.id, input.txId),
+        eq(transactions.agentId, input.agentId),
+        eq(transactions.tenantId, input.tenantId),
+      ),
+    );
+  if (!tx) {
+    throw new ProtectedSignerError("permit refused: no consumed approval for this transaction");
+  }
+  if (tx.status !== "pending") {
+    throw new ProtectedSignerError(
+      `permit refused: transaction already ${tx.status}; resolve via executionRef lookup`,
+    );
+  }
+
+  // Atomic claim. Exactly one caller can move issuance_claimed_at NULL -> now
+  // for an approved row with this digest.
+  const claimed = await db
+    .update(approvalQueue)
+    .set({ issuanceClaimedAt: new Date() })
+    .where(
+      and(
+        eq(approvalQueue.txId, input.txId),
+        eq(approvalQueue.agentId, input.agentId),
+        eq(approvalQueue.status, "approved"),
+        isNull(approvalQueue.issuanceClaimedAt),
+        sql`lower(${approvalQueue.reviewDigest}) = ${digest}`,
+      ),
+    )
+    .returning({ id: approvalQueue.id });
+
+  if (claimed.length === 1) {
+    const handle = crypto.randomUUID();
+    permits.set(handle, { ...input, expiresAt: Date.now() + PERMIT_TTL_MS });
+    return handle;
+  }
+
+  // Diagnose (read-only) for an accurate refusal reason; every branch refuses.
+  const [row] = await db
+    .select({
+      status: approvalQueue.status,
+      reviewDigest: approvalQueue.reviewDigest,
+      issuanceClaimedAt: approvalQueue.issuanceClaimedAt,
+    })
     .from(approvalQueue)
     .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)));
   if (!row || row.status !== "approved") {
     throw new ProtectedSignerError("permit refused: no consumed approval for this transaction");
   }
-  if (!row.reviewDigest || row.reviewDigest.toLowerCase() !== input.reviewDigest.toLowerCase()) {
+  if (!row.reviewDigest || row.reviewDigest.toLowerCase() !== digest) {
     throw new ProtectedSignerError("permit refused: approval digest does not match");
   }
-  const handle = crypto.randomUUID();
-  permits.set(handle, { ...input, expiresAt: Date.now() + PERMIT_TTL_MS });
-  return handle;
+  if (row.issuanceClaimedAt) {
+    throw new ProtectedSignerError(
+      "permit refused: a permit was already issued for this approval; resolve via executionRef lookup",
+    );
+  }
+  throw new ProtectedSignerError("permit refused: issuance claim lost");
+}
+
+/** Diagnostic: whether the one-time issuance claim for a txId has been taken. */
+export async function isProtectedIssuanceClaimed(txId: string): Promise<boolean> {
+  const [row] = await getDb()
+    .select({ issuanceClaimedAt: approvalQueue.issuanceClaimedAt })
+    .from(approvalQueue)
+    .where(eq(approvalQueue.txId, txId));
+  return Boolean(row?.issuanceClaimedAt);
 }
 
 export function consumeProtectedSigningPermit(

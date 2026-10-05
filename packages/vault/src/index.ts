@@ -15,6 +15,7 @@ export {
   consumeProtectedSigningPermit,
   getProtectedSignerGuard,
   isPersistedProtected,
+  isProtectedIssuanceClaimed,
   isProtectedSigner,
   issueProtectedSigningPermit,
   isUndefinedColumn,

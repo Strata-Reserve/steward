@@ -641,6 +641,13 @@ export const approvalQueue = pgTable(
     reviewProjection: jsonb("review_projection").$type<Record<string, unknown>>(),
     requestedBy: varchar("requested_by", { length: 255 }),
     approvedByUserId: varchar("approved_by_user_id", { length: 64 }),
+    /**
+     * REVIEW-STEWARD-28-R2 R2-1: durable single-use issuance claim. Set by
+     * CAS when the one internal signing permit for this approval is issued.
+     * Non-NULL means signing already happened or is in flight; no further
+     * permit may ever be issued for this row.
+     */
+    issuanceClaimedAt: timestamp("issuance_claimed_at", { withTimezone: true }),
   },
   (table) => ({
     txIdUniqueIdx: uniqueIndex("approval_queue_tx_id_idx").on(table.txId),
