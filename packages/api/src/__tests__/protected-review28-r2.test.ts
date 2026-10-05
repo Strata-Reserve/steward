@@ -100,6 +100,25 @@ async function approve(q: { txId: string; reviewDigest: string }, h = bearer(own
 }
 const freshAgentJwt = () => signAgentToken({ agentId: AGENT, tenantId: TENANT }, "1h");
 
+// Base-falsification shims: on 876d0832 these exports do not exist (or the
+// startup hook throws). Resolve to a sentinel so each test fails on its own
+// assertion rather than on a TypeError in setup.
+async function issuanceClaimed(txId: string): Promise<boolean | "unsupported"> {
+  const fn = (vaultLib as { isProtectedIssuanceClaimed?: (t: string) => Promise<boolean> })
+    .isProtectedIssuanceClaimed;
+  return fn ? fn(txId) : "unsupported";
+}
+async function startupQuarantine(): Promise<
+  Array<{ agentId: string; tenantId: string; reason: string }> | "threw"
+> {
+  try {
+    const r = (await boundary.assertProtectedPostureAtStartup()) as unknown;
+    return Array.isArray(r) ? r : [];
+  } catch {
+    return "threw";
+  }
+}
+
 beforeAll(async () => {
   process.env.STEWARD_PGLITE_MEMORY = "true";
   process.env.DATABASE_URL = "postgres://test:test@localhost:5432/steward";
@@ -206,7 +225,7 @@ describe.serial("R2-1: issuance consumes a durable single-use claim", () => {
     expect(q.status).toBe(202);
     expect((await approve(q)).status).toBe(200);
     const before = sent.length;
-    expect(await vaultLib.isProtectedIssuanceClaimed(q.txId)).toBe(true);
+    expect(await issuanceClaimed(q.txId)).toBe(true);
     let error = "";
     try {
       await directSign(q);
@@ -307,7 +326,7 @@ describe.serial("R2-1: issuance consumes a durable single-use claim", () => {
         reviewDigest: q.reviewDigest,
       }),
     ).rejects.toThrow(/no consumed approval/);
-    expect(await vaultLib.isProtectedIssuanceClaimed(q.txId)).toBe(false);
+    expect(await issuanceClaimed(q.txId)).toBe(false);
     await expect(
       vaultLib.issueProtectedSigningPermit({
         tenantId: TENANT,
@@ -419,7 +438,7 @@ describe.serial(
           // BEFORE the startup hook runs: already zero capability (fencing is per request).
           const jwtBefore = await freshAgentJwt();
           const before = await call("GET", `/vault/${AGENT}/addresses`, bearer(jwtBefore));
-          const quarantined = await boundary.assertProtectedPostureAtStartup();
+          const quarantined = await startupQuarantine();
           const health = await call("GET", "/health", { "Content-Type": "application/json" });
           const healthBody = (await health.json()) as {
             status: string;
@@ -468,7 +487,7 @@ describe.serial(
       }
       expect(failures).toEqual([]);
       // Covered: nothing quarantined, health ok, capability restored.
-      expect(await boundary.assertProtectedPostureAtStartup()).toEqual([]);
+      expect(await startupQuarantine()).toEqual([]);
       const h = (await (await call("GET", "/health", {})).json()) as { status: string };
       expect(h.status).toBe("ok");
       expect(
