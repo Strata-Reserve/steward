@@ -509,6 +509,10 @@ function buildGuard(manifest: ProtectedMinterManifest, digest: string): Protecte
       const r = validateProtectedShape(manifest, tx);
       return r.ok ? { ok: true } : { ok: false, reason: r.reason };
     },
+    // REVIEW-STEWARD-28-R5 N1: the vault verifies the recorded approver at
+    // permit issuance against this same pinned allowlist.
+    isApprover: (userId) =>
+      Boolean(userId) && manifest.approvers.some((a) => lower(a) === lower(userId as string)),
   };
 }
 

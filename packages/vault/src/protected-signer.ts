@@ -37,6 +37,11 @@ export interface ProtectedSignerGuard {
   manifestDigest(): string;
   /** Hard shape validation (chain, value, target, selector, decoded arguments). */
   validateTransaction(tx: ProtectedTransactionShape): ProtectedValidation;
+  /**
+   * REVIEW-STEWARD-28-R5 N1: true only when `userId` is a pinned approver in
+   * the installed manifest allowlist. Empty allowlist / unknown user => false.
+   */
+  isApprover(userId: string | null | undefined): boolean;
 }
 
 let registeredGuard: ProtectedSignerGuard | null = null;
@@ -204,6 +209,12 @@ const permits = new Map<string, Permit>();
  * is in flight, or failed after the claim never yields a fresh permit. A
  * lost/unknown outcome must be resolved by the executionRef status lookup,
  * never by re-issuing.
+ *
+ * REVIEW-STEWARD-28-R5 N1: the approving identity is verified here too, not
+ * only at the HTTP route. The claim CAS additionally requires the row's
+ * `approved_by_user_id` to be a pinned approver in the installed manifest
+ * (via `guard.isApprover`). No guard, no approver or a non-allowlisted
+ * approver refuses WITHOUT spending the durable claim.
  */
 export async function issueProtectedSigningPermit(input: {
   tenantId: string;
@@ -213,6 +224,13 @@ export async function issueProtectedSigningPermit(input: {
 }): Promise<string> {
   const db = getDb();
   const digest = input.reviewDigest.toLowerCase();
+
+  const guard = registeredGuard;
+  if (!guard || !guard.isProtected(input.tenantId, input.agentId)) {
+    throw new ProtectedSignerError(
+      "permit refused: no valid manifest covers this agent (no approver allowlist)",
+    );
+  }
 
   // Belt-and-braces: the transaction row itself must still be pending for
   // this tenant/agent. Any terminal or in-progress state refuses issuance
@@ -236,8 +254,29 @@ export async function issueProtectedSigningPermit(input: {
     );
   }
 
+  // The approving identity must be in the allowlist BEFORE the claim is
+  // spent; a refused row must stay claimable by a legitimate re-approval.
+  const [pre] = await db
+    .select({ status: approvalQueue.status, approvedByUserId: approvalQueue.approvedByUserId })
+    .from(approvalQueue)
+    .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)));
+  if (!pre || pre.status !== "approved") {
+    throw new ProtectedSignerError("permit refused: no consumed approval for this transaction");
+  }
+  const approver = pre.approvedByUserId ?? null;
+  if (!approver) {
+    throw new ProtectedSignerError("permit refused: approval has no recorded approver");
+  }
+  if (!guard.isApprover(approver)) {
+    throw new ProtectedSignerError(
+      "permit refused: recorded approver is not in the pinned manifest allowlist",
+    );
+  }
+
   // Atomic claim. Exactly one caller can move issuance_claimed_at NULL -> now
-  // for an approved row with this digest.
+  // for an approved row with this digest AND the same allowlisted approver
+  // (the row cannot be re-pointed at a different identity between the check
+  // above and the claim).
   const claimed = await db
     .update(approvalQueue)
     .set({ issuanceClaimedAt: new Date() })
@@ -246,6 +285,7 @@ export async function issueProtectedSigningPermit(input: {
         eq(approvalQueue.txId, input.txId),
         eq(approvalQueue.agentId, input.agentId),
         eq(approvalQueue.status, "approved"),
+        eq(approvalQueue.approvedByUserId, approver),
         isNull(approvalQueue.issuanceClaimedAt),
         sql`lower(${approvalQueue.reviewDigest}) = ${digest}`,
       ),
@@ -264,11 +304,17 @@ export async function issueProtectedSigningPermit(input: {
       status: approvalQueue.status,
       reviewDigest: approvalQueue.reviewDigest,
       issuanceClaimedAt: approvalQueue.issuanceClaimedAt,
+      approvedByUserId: approvalQueue.approvedByUserId,
     })
     .from(approvalQueue)
     .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)));
   if (!row || row.status !== "approved") {
     throw new ProtectedSignerError("permit refused: no consumed approval for this transaction");
+  }
+  if (row.approvedByUserId !== approver || !guard.isApprover(row.approvedByUserId)) {
+    throw new ProtectedSignerError(
+      "permit refused: recorded approver is not in the pinned manifest allowlist",
+    );
   }
   if (!row.reviewDigest || row.reviewDigest.toLowerCase() !== digest) {
     throw new ProtectedSignerError("permit refused: approval digest does not match");
