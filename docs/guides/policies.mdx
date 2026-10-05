@@ -173,6 +173,56 @@ Restricts which blockchain networks the agent can use.
 }
 ```
 
+### calldata-amount-window
+
+Caps the **sum** of a decoded `uint256` calldata argument for calls to a given contract and function selector over a rolling window. Built for token minters: `mint(address,uint256)` is usually uncapped on chain, so the signer is the only place a volume ceiling can live. The sum is computed server-side from the agent's own prior signing records; nothing in the request is trusted as a total.
+
+| Config Field | Type | Description |
+|-------------|------|-------------|
+| `rules[].contract` | string | Target contract address (case-insensitive) |
+| `rules[].selector` | string | 4-byte function selector, e.g. `0x40c10f19` for `mint(address,uint256)` |
+| `rules[].amountArgIndex` | number | 0-based index of the `uint256` argument to sum, counted in 32-byte static words after the selector |
+| `rules[].maxPerWindow` | string (uint256 decimal) | Cap on the window sum, in raw token units |
+| `rules[].windowSeconds` | number | Rolling window length (1 .. 365 days) |
+| `rules[].chainId` | number (optional) | Only apply the rule on this chain. History is always scoped to the request's chain |
+| `unmatched` | `"pass"` \| `"deny"` | Verdict when no rule matches the request (default `"pass"`) |
+| `overCap` | `"reject"` \| `"manual-approval"` | Over-cap handling: hard deny (default) or queue for human approval |
+
+```json
+{
+  "id": "mint-volume-cap",
+  "type": "calldata-amount-window",
+  "enabled": true,
+  "config": {
+    "rules": [
+      {
+        "contract": "0xDEAL_TOKEN",
+        "selector": "0x40c10f19",
+        "amountArgIndex": 1,
+        "maxPerWindow": "1000000000000000000000000",
+        "windowSeconds": 86400,
+        "chainId": 8453
+      }
+    ],
+    "unmatched": "pass",
+    "overCap": "reject"
+  }
+}
+```
+
+Semantics, all fail-closed:
+
+- Every rule whose contract (and `chainId`, if set) matches the request is checked; all must pass.
+- Prior rows that count toward the window: the agent's own `transactions` with status `pending`, `approved`, `signed`, `broadcast` or `confirmed`, same chain, same contract, same selector, created within the window. `rejected` and `failed` rows never produced a signature and are excluded. A queued (pending approval) mint holds its amount until it is resolved.
+- `prior sum + this amount > maxPerWindow` denies (or queues with `overCap: "manual-approval"`). Exactly reaching the cap is allowed.
+- Malformed config, calldata to a governed contract that is not valid hex or shorter than 4 bytes, a truncated amount word, a history lookup failure, or a prior row that cannot be decoded all deny. `overCap` does not soften these.
+- Empty calldata (`0x`) to a governed contract has no selector and follows `unmatched`.
+- This policy only constrains the listed calls. Pair it with `approved-addresses` (or `unmatched: "deny"`) to stop the agent calling anything else, and with `spending-limit` for native value.
+
+<Note>
+  Two concurrent requests can both read the same window sum before either has written its row, so a burst can overshoot the cap by at most one request's amount per concurrent caller. Serialize mints per agent (for example one in-flight mint at a time, or an `executionRef` per intent) if the cap must be exact.
+</Note>
+
 ## Common Patterns
 
 <Accordion title="Conservative Trading Agent">
@@ -208,6 +258,42 @@ const conservativeTrader = [
 // Just create the agent and don't set policies:
 const agent = await steward.createWallet("data-agent", "Data Agent");
 // This agent can check balances and read chain data but cannot sign transactions.
+```
+</Accordion>
+
+<Accordion title="Token Minter with a Rolling Mint Cap">
+```typescript
+// Signs only mint(address,uint256) on one deal token, at most 1,000,000
+// tokens (18 decimals) per rolling 24h, with no native value.
+const minter = [
+  {
+    id: "addresses", type: "approved-addresses", enabled: true,
+    config: { mode: "whitelist", addresses: ["0xDEAL_TOKEN"] },
+  },
+  {
+    id: "no-native-value", type: "spending-limit", enabled: true,
+    config: { maxPerTransaction: "0", maxPerDay: "0" },
+  },
+  {
+    id: "mint-volume-cap", type: "calldata-amount-window", enabled: true,
+    config: {
+      rules: [{
+        contract: "0xDEAL_TOKEN",
+        selector: "0x40c10f19",
+        amountArgIndex: 1,
+        maxPerWindow: "1000000000000000000000000",
+        windowSeconds: 86400,
+        chainId: 8453,
+      }],
+      unmatched: "deny",
+      overCap: "reject",
+    },
+  },
+  {
+    id: "chains", type: "allowed-chains", enabled: true,
+    config: { chainIds: [8453] },
+  },
+];
 ```
 </Accordion>
 

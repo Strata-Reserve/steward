@@ -1,5 +1,6 @@
 import type { PolicyResult, PolicyRule, PriceOracle, SignRequest } from "@stwd/shared";
 import { type EvaluatorContext, evaluatePolicy } from "./evaluators";
+import type { CalldataHistoryLookup } from "./evaluators/calldata-amount-window";
 
 export interface TransactionSimulationRequest extends SignRequest {
   kind?: "transaction";
@@ -33,6 +34,13 @@ export interface PolicyEvaluationContext {
   leverage?: number;
   /** Sprint 4: pre-computed USD value of the action. */
   valueUsd?: number;
+  /**
+   * STRATA-1499: history lookup for `calldata-amount-window`. Bound by the
+   * API to the current agent's own prior signing records.
+   */
+  calldataHistoryLookup?: CalldataHistoryLookup;
+  /** Injectable clock (tests). */
+  now?: Date;
 }
 
 export interface EvaluationResult {
@@ -100,6 +108,9 @@ export interface PolicyEngineOptions {
  * Logic:
  * - All enabled policies must pass for auto-approval
  * - If auto-approve-threshold fails but all other policies pass, tx is queued for manual approval
+ * - A failed result that carries `disposition: "manual-approval"` (e.g. a
+ *   `calldata-amount-window` rule configured with `overCap: "manual-approval"`)
+ *   is treated the same way as a failed auto-approve-threshold: queue, don't sign
  * - If any hard policy (spending-limit, approved-addresses, rate-limit, time-window) fails, tx is rejected
  */
 export class PolicyEngine {
@@ -134,24 +145,31 @@ export class PolicyEngine {
       venue: ctx.venue,
       leverage: ctx.leverage,
       valueUsd: ctx.valueUsd,
+      calldataHistoryLookup: ctx.calldataHistoryLookup,
+      now: ctx.now,
     };
 
     const results: PolicyResult[] = await Promise.all(
       policies.map((policy) => evaluatePolicy(policy, evaluatorCtx)),
     );
 
-    const hardPolicies = results.filter((r) => r.type !== "auto-approve-threshold");
-    const autoApproveResult = results.find((r) => r.type === "auto-approve-threshold");
+    // A result is "soft" when its failure asks for a human instead of a hard
+    // deny: auto-approve-threshold by type, or any evaluator that explicitly
+    // sets `disposition: "manual-approval"`.
+    const isSoft = (r: PolicyResult) =>
+      r.type === "auto-approve-threshold" || r.disposition === "manual-approval";
+    const hardPolicies = results.filter((r) => !isSoft(r));
+    const softFailures = results.filter((r) => isSoft(r) && !r.passed);
 
     const allHardPass = hardPolicies.every((r) => r.passed);
-    const autoApprovePass = autoApproveResult ? autoApproveResult.passed : true;
+    const softPass = softFailures.length === 0;
 
     let evaluationResult: EvaluationResult;
-    if (allHardPass && autoApprovePass) {
+    if (allHardPass && softPass) {
       evaluationResult = { approved: true, results, requiresManualApproval: false };
-    } else if (allHardPass && !autoApprovePass) {
-      // Hard policies pass but value exceeds auto-approve threshold
-      // Queue for manual approval
+    } else if (allHardPass && !softPass) {
+      // Hard policies pass but a soft rule (auto-approve threshold, or a
+      // manual-approval disposition) asked for a human. Queue for approval.
       evaluationResult = { approved: false, results, requiresManualApproval: true };
     } else {
       // Hard policy failed - reject

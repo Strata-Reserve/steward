@@ -101,6 +101,7 @@ export const policyTypeEnum = pgEnum("policy_type", [
   "reputation-scaling",
   "venue-allowlist",
   "leverage-cap",
+  "calldata-amount-window",
 ]);
 
 export const transactionStatusEnum = pgEnum("transaction_status", [
