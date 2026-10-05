@@ -217,15 +217,13 @@ describe.serial("F1: configuration errors mutate nothing and are recoverable", (
           value: "1",
           chainId,
         });
-        await getDb()
-          .insert(approvalQueue)
-          .values({
-            id: crypto.randomUUID(),
-            agentId: A,
-            txId: id,
-            status: "pending",
-            reason: "manual",
-          });
+        await getDb().insert(approvalQueue).values({
+          id: crypto.randomUUID(),
+          agentId: A,
+          txId: id,
+          status: "pending",
+          reason: "manual",
+        });
         setChainUrls({ [chainId]: bad });
         rpcMode = "ok";
         networkCalls = 0;
@@ -278,15 +276,13 @@ describe.serial("F1: configuration errors mutate nothing and are recoverable", (
       value: "1",
       chainId: 8453,
     });
-    await getDb()
-      .insert(approvalQueue)
-      .values({
-        id: crypto.randomUUID(),
-        agentId: A,
-        txId: id,
-        status: "pending",
-        reason: "manual",
-      });
+    await getDb().insert(approvalQueue).values({
+      id: crypto.randomUUID(),
+      agentId: A,
+      txId: id,
+      status: "pending",
+      reason: "manual",
+    });
     setChainUrls({ 8453: URL });
     rpcMode = "revert";
     const res = await approve(id);
