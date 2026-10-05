@@ -45,6 +45,7 @@ import {
 import { type EncryptedKey, KeyStore } from "./keystore";
 import {
   assertNotProtected,
+  assertProtectedPostureIntact,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
   getProtectedSignerGuard,
@@ -194,6 +195,7 @@ export class Vault {
       name: string;
       platformId?: string;
       createdAt: Date;
+      protected?: boolean;
     },
     material: ReturnType<Vault["generateAgentMaterial"]>,
   ) {
@@ -203,6 +205,7 @@ export class Vault {
       name: input.name,
       walletAddress: material.evmAddress,
       platformId: input.platformId,
+      protected: input.protected === true,
       createdAt: input.createdAt,
       updatedAt: input.createdAt,
     });
@@ -253,6 +256,7 @@ export class Vault {
     name: string,
     platformId?: string,
     _chainType?: "evm" | "solana",
+    options?: { protected?: boolean },
   ): Promise<AgentIdentity> {
     const db = getDb();
     const [existingAgent] = await db
@@ -264,7 +268,11 @@ export class Vault {
     const material = this.generateAgentMaterial();
     const createdAt = new Date();
     await db.transaction((tx) =>
-      this.persistAgentMaterial(tx, { tenantId, agentId, name, platformId, createdAt }, material),
+      this.persistAgentMaterial(
+        tx,
+        { tenantId, agentId, name, platformId, createdAt, protected: options?.protected === true },
+        material,
+      ),
     );
     return {
       id: agentId,
@@ -526,12 +534,21 @@ export class Vault {
 
     // Verify agent exists for this tenant
     const [agentRow] = await db
-      .select({ id: agents.id, walletAddress: agents.walletAddress })
+      .select({ id: agents.id, walletAddress: agents.walletAddress, protected: agents.protected })
       .from(agents)
       .where(and(eq(agents.id, request.agentId), eq(agents.tenantId, request.tenantId)));
 
     if (!agentRow) {
       throw new Error(`Agent ${request.agentId} not found for tenant ${request.tenantId}`);
+    }
+    // STRATA-1499 F1: persisted marker, independent of env. Fail closed.
+    if (
+      agentRow.protected &&
+      !getProtectedSignerGuard()?.isProtected(request.tenantId, request.agentId)
+    ) {
+      throw new ProtectedSignerError(
+        "transaction signing refused: agent is persisted-protected but no valid manifest is installed",
+      );
     }
 
     const chainId = request.chainId || this.config.chainId || 8453;
@@ -889,6 +906,7 @@ export class Vault {
     chainType: "evm" | "solana",
   ): Promise<{ walletAddress: string }> {
     assertNotProtected(tenantId, agentId, "key import");
+    await assertProtectedPostureIntact(tenantId, agentId, "key import");
     const db = getDb();
 
     let walletAddress: string;
@@ -1005,6 +1023,7 @@ export class Vault {
    */
   async signMessage(tenantId: string, agentId: string, message: string): Promise<string> {
     assertNotProtected(tenantId, agentId, "message signing");
+    await assertProtectedPostureIntact(tenantId, agentId, "message signing");
     const db = getDb();
 
     // Verify agent exists for this tenant
@@ -1085,6 +1104,7 @@ export class Vault {
     yParity: 0 | 1;
   }> {
     assertNotProtected(tenantId, agentId, "EIP-7702 authorization signing");
+    await assertProtectedPostureIntact(tenantId, agentId, "EIP-7702 authorization signing");
     if (!/^0x[0-9a-fA-F]{40}$/.test(params.contractAddress)) {
       throw new Error("contractAddress must be a 20-byte hex address");
     }
@@ -1154,6 +1174,7 @@ export class Vault {
    */
   async signTypedData(request: SignTypedDataRequest): Promise<string> {
     assertNotProtected(request.tenantId, request.agentId, "typed-data signing");
+    await assertProtectedPostureIntact(request.tenantId, request.agentId, "typed-data signing");
     const db = getDb();
 
     // Verify agent exists for this tenant
@@ -1243,6 +1264,7 @@ export class Vault {
     caip2?: string;
   }> {
     assertNotProtected(request.tenantId, request.agentId, "Solana signing");
+    await assertProtectedPostureIntact(request.tenantId, request.agentId, "Solana signing");
     const db = getDb();
 
     // Verify agent exists
@@ -1352,6 +1374,7 @@ export class Vault {
     solana?: { privateKey: string; address: string };
   }> {
     assertNotProtected(tenantId, agentId, "key export");
+    await assertProtectedPostureIntact(tenantId, agentId, "key export");
     const db = getDb();
 
     // Verify agent belongs to this tenant

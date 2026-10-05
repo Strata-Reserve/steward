@@ -156,6 +156,14 @@ if (shouldUsePGLite()) {
 // ─── Data retention scheduler (SOC2 CC2) ────────────────────────────────────
 
 if (migrationsRan) {
+  // STRATA-1499 F1(c): a persisted-protected agent with no manifest is fatal.
+  try {
+    const { assertProtectedPostureAtStartup } = await import("./services/prod-minter-boundary");
+    await assertProtectedPostureAtStartup();
+  } catch (err) {
+    console.error("[steward] Protected posture check failed — cannot start:", err);
+    process.exit(1);
+  }
   cancelRetention = startRetentionScheduler();
 }
 

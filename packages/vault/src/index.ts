@@ -10,9 +10,11 @@ export type {
 } from "./protected-signer";
 export {
   assertNotProtected,
+  assertProtectedPostureIntact,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
   getProtectedSignerGuard,
+  isPersistedProtected,
   isProtectedSigner,
   issueProtectedSigningPermit,
   outstandingProtectedPermits,

@@ -30,6 +30,7 @@
  * fails. There is no "protected but unconfigured" posture.
  */
 
+import { agents, getDb } from "@stwd/db";
 import {
   computeProtectedReviewDigest,
   type ProtectedSignerGuard,
@@ -37,7 +38,8 @@ import {
   type ProtectedValidation,
   registerProtectedSignerGuard,
 } from "@stwd/vault";
-import { keccak256, stringToHex, toFunctionSelector } from "viem";
+import { eq } from "drizzle-orm";
+import { encodeFunctionData, keccak256, parseAbi, stringToHex, toFunctionSelector } from "viem";
 
 // ─── Fixed constants ─────────────────────────────────────────────────────────
 
@@ -159,6 +161,9 @@ export function manifestFromEnv(
 // exact canonical length, zero address padding, in-range word-aligned offsets,
 // tails laid out back to back with no stray bytes.
 
+const CREATE_DEAL_TOKEN_ABI = parseAbi([
+  "function createDealToken(string name, string symbol, address admin, address minter, bytes32 salt) returns (address)",
+]);
 const SELECTOR_HEX = 8;
 const WORD_HEX = 64;
 
@@ -287,6 +292,15 @@ export function decodeCreateDealToken(data: unknown): DecodedCreateDealToken | n
   if (first.start !== 5 * 32) return null;
   if (second.start !== first.end) return null;
   if (second.end !== argsLength) return null;
+
+  // Canonical encoding: decode -> re-encode must reproduce the input bytes
+  // exactly (name tail before symbol tail, no swapped tails, no slack).
+  const reencoded = encodeFunctionData({
+    abi: CREATE_DEAL_TOKEN_ABI,
+    functionName: "createDealToken",
+    args: [name.value, symbol.value, admin as `0x${string}`, minter as `0x${string}`, `0x${salt}`],
+  }).toLowerCase();
+  if (reencoded !== `0x${hex}`) return null;
 
   return {
     kind: "createDealToken",
@@ -519,6 +533,35 @@ export function protectedReviewDigest(input: {
     signerAddress: activeManifest.signerAddress,
     manifestDigest: activeDigest,
   });
+}
+
+/**
+ * REVIEW-STEWARD-28 F1(c): refuse to serve when any persisted-protected agent
+ * exists and no manifest covers it. Called from index.ts after migrations;
+ * throws so the process exits non-zero.
+ */
+export async function assertProtectedPostureAtStartup(): Promise<void> {
+  const rows = await getDb()
+    .select({ id: agents.id, tenantId: agents.tenantId })
+    .from(agents)
+    .where(eq(agents.protected, true));
+  const uncovered = rows.filter((r) => !isProtectedMinter(r.tenantId, r.id));
+  if (uncovered.length > 0) {
+    throw new Error(
+      `protected minter: ${uncovered.length} persisted-protected agent(s) exist but no valid manifest covers them (${uncovered
+        .map((r) => `${r.tenantId}/${r.id}`)
+        .join(", ")}); refusing to start`,
+    );
+  }
+}
+
+/** Persisted-marker lookup for route guards (deny-by-default when manifest absent). */
+export async function isPersistedProtectedAgent(agentId: string): Promise<boolean> {
+  const [row] = await getDb()
+    .select({ protected: agents.protected })
+    .from(agents)
+    .where(eq(agents.id, agentId));
+  return row?.protected === true;
 }
 
 // Startup: read env once. Fail closed on invalid configuration.

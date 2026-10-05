@@ -170,6 +170,12 @@ export const agents = pgTable(
     erc8004TokenId: varchar("erc8004_token_id", { length: 255 }),
     ownerUserId: uuid("owner_user_id"),
     walletType: varchar("wallet_type", { length: 32 }).default("agent"),
+    /**
+     * STRATA-1499: persisted protected-signer marker. Set at protected
+     * creation, independent of env; no API route can clear it. A protected
+     * agent with no valid installed manifest is refused everywhere.
+     */
+    protected: boolean("protected").notNull().default(false),
     ...timestamps,
   },
   (table) => ({

@@ -356,9 +356,10 @@ async function handleProtectedApprove(
   });
 
   try {
-    const permit = issueProtectedSigningPermit({
+    const permit = await issueProtectedSigningPermit({
       tenantId,
       agentId,
+      txId,
       reviewDigest: queue.reviewDigest,
     });
     const txHash = await vault.signTransaction(

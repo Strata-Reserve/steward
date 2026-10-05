@@ -97,8 +97,10 @@ async function sweepFailedTransactions(): Promise<SweepResult> {
       AND created_at < now() - make_interval(days => ${days})
       AND NOT (
         execution_ref IS NOT NULL
-        AND tenant_id = ${manifest?.tenantId ?? ""}
-        AND agent_id = ${manifest?.agentId ?? ""}
+        AND (
+          (tenant_id = ${manifest?.tenantId ?? ""} AND agent_id = ${manifest?.agentId ?? ""})
+          OR agent_id IN (SELECT id FROM agents WHERE protected = true)
+        )
       )
   `);
   return { table: "transactions", deleted };

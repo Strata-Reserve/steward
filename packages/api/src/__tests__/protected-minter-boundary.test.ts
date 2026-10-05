@@ -658,7 +658,22 @@ describe.serial("STRATA-1499 protected production minter", () => {
       vault.signTransaction(req, { txId, protectedReviewDigest: reviewDigest }),
     ).rejects.toThrow(/permit/);
     const { issueProtectedSigningPermit } = await import("@stwd/vault");
-    const permit = issueProtectedSigningPermit({ tenantId: TENANT, agentId: AGENT, reviewDigest });
+    // REVIEW-STEWARD-28: issuance itself verifies a consumed approval; a
+    // pending queue row cannot yield a permit.
+    await expect(
+      issueProtectedSigningPermit({ tenantId: TENANT, agentId: AGENT, txId, reviewDigest }),
+    ).rejects.toThrow(/no consumed approval/);
+    // Simulate the CAS continuation having claimed the row, then issue.
+    await getDb()
+      .update(approvalQueue)
+      .set({ status: "approved", resolvedAt: new Date(), resolvedBy: "test" })
+      .where(and(eq(approvalQueue.txId, txId), eq(approvalQueue.status, "pending")));
+    const permit = await issueProtectedSigningPermit({
+      tenantId: TENANT,
+      agentId: AGENT,
+      txId,
+      reviewDigest,
+    });
     // Permit bound to digest A cannot sign different bytes B.
     await expect(
       vault.signTransaction(

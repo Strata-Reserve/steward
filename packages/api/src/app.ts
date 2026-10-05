@@ -23,6 +23,7 @@ import { logger } from "hono/logger";
 import { requireAgentJwt } from "./middleware/agent-jwt";
 import { applicationPrincipalAuth } from "./middleware/application-principal";
 import { correlationId } from "./middleware/correlation";
+import { protectedAgentDispatch } from "./middleware/protected-agent";
 import { securityHeaders } from "./middleware/security-headers";
 import { tenantCors } from "./middleware/tenant-cors";
 import { agentRoutes } from "./routes/agents";
@@ -156,6 +157,33 @@ app.use("/v1/trade", (c, next) => tenantAuth(c, next));
 app.use("/v1/trade/*", (c, next) =>
   c.req.path.endsWith("/v1/trade/hyperliquid/order") ? next() : tenantAuth(c, next),
 );
+
+// STRATA-1499: central protected-agent allowlist / deny-by-default, after auth.
+for (const prefix of [
+  "/agents",
+  "/agents/*",
+  "/vault/*",
+  "/secrets",
+  "/secrets/*",
+  "/tenants/*",
+  "/webhooks",
+  "/webhooks/*",
+  "/approvals",
+  "/approvals/*",
+  "/audit",
+  "/audit/*",
+  "/policies",
+  "/policies/*",
+  "/trade",
+  "/trade/*",
+  "/v1/trade",
+  "/v1/trade/*",
+  "/application-principals",
+  "/application-principals/*",
+  "/dashboard/*",
+]) {
+  app.use(prefix, (c, next) => protectedAgentDispatch(c, next));
+}
 
 // ─── Health & root ────────────────────────────────────────────────────────────
 

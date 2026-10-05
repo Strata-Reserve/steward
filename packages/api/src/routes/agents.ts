@@ -94,7 +94,16 @@ agentRoutes.post("/", async (c) => {
   }
 
   try {
-    const identity = await vault.createAgent(tenantId, body.id, body.name, body.platformId);
+    const identity = await vault.createAgent(
+      tenantId,
+      body.id,
+      body.name,
+      body.platformId,
+      undefined,
+      {
+        protected: isProtectedMinter(tenantId, body.id),
+      },
+    );
     trackAuditEvent({
       tenantId,
       actorType: "user",

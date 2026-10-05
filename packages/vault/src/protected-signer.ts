@@ -10,9 +10,13 @@
  *
  * The guard is registered by the API process (see
  * `packages/api/src/services/prod-minter-boundary.ts`). If no guard is
- * registered, no agent is protected and legacy behaviour is unchanged.
+ * registered, NO persisted-protected agent may be used at all (fail closed):
+ * the `agents.protected` column is an env-independent marker and the vault
+ * refuses every operation on such an agent unless a guard recognises it.
  */
 
+import { agents, approvalQueue, getDb } from "@stwd/db";
+import { and, eq } from "drizzle-orm";
 import { keccak256, stringToHex } from "viem";
 
 export interface ProtectedTransactionShape {
@@ -61,6 +65,32 @@ export class ProtectedSignerError extends Error {
 export function assertNotProtected(tenantId: string, agentId: string, operation: string): void {
   if (isProtectedSigner(tenantId, agentId)) {
     throw new ProtectedSignerError(`${operation} is refused for the protected signer`);
+  }
+}
+
+/**
+ * Persisted marker check (REVIEW-STEWARD-28 F1). A row with `protected=true`
+ * is refused for every key operation unless the installed guard recognises
+ * it; a missing/invalid manifest therefore never un-protects a signer.
+ */
+export async function isPersistedProtected(tenantId: string, agentId: string): Promise<boolean> {
+  const [row] = await getDb()
+    .select({ protected: agents.protected })
+    .from(agents)
+    .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+  return row?.protected === true;
+}
+
+export async function assertProtectedPostureIntact(
+  tenantId: string,
+  agentId: string,
+  operation: string,
+): Promise<void> {
+  if (isProtectedSigner(tenantId, agentId)) return; // guard present; route/vault checks apply
+  if (await isPersistedProtected(tenantId, agentId)) {
+    throw new ProtectedSignerError(
+      `${operation} refused: agent is persisted-protected but no valid manifest is installed`,
+    );
   }
 }
 
@@ -124,11 +154,25 @@ const permits = new Map<string, Permit>();
  * CAS succeeded. The returned handle is module-private state, never a caller
  * field or HTTP token; it is consumed exactly once by `consumeSigningPermit`.
  */
-export function issueProtectedSigningPermit(input: {
+export async function issueProtectedSigningPermit(input: {
   tenantId: string;
   agentId: string;
+  txId: string;
   reviewDigest: string;
-}): string {
+}): Promise<string> {
+  // The issuer independently verifies the consumed approval: the queue row
+  // must already be in `approved` state with the exact digest. Callers are
+  // not trusted to have performed the CAS.
+  const [row] = await getDb()
+    .select({ status: approvalQueue.status, reviewDigest: approvalQueue.reviewDigest })
+    .from(approvalQueue)
+    .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)));
+  if (!row || row.status !== "approved") {
+    throw new ProtectedSignerError("permit refused: no consumed approval for this transaction");
+  }
+  if (!row.reviewDigest || row.reviewDigest.toLowerCase() !== input.reviewDigest.toLowerCase()) {
+    throw new ProtectedSignerError("permit refused: approval digest does not match");
+  }
   const handle = crypto.randomUUID();
   permits.set(handle, { ...input, expiresAt: Date.now() + PERMIT_TTL_MS });
   return handle;
