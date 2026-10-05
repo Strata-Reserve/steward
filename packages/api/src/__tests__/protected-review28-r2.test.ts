@@ -440,7 +440,10 @@ describe.serial(
           const obs = {
             name,
             before: before.status,
-            quarantined: quarantined.map((q) => `${q.agentId}:${q.reason}`),
+            quarantined:
+              quarantined === "threw"
+                ? "threw"
+                : quarantined.map((q) => `${q.agentId}:${q.reason}`),
             health: healthBody.status,
             healthFlag: healthBody.protectedQuarantine?.map((q) => q.agentId),
             after: after.status,
@@ -449,6 +452,7 @@ describe.serial(
           };
           if (
             before.status !== 403 ||
+            quarantined === "threw" ||
             quarantined.length !== 1 ||
             quarantined[0]?.agentId !== AGENT ||
             healthBody.status !== "degraded" ||
