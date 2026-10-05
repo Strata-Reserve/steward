@@ -150,15 +150,16 @@ describe.serial("REVIEW-STEWARD-28 F1: missing manifest never un-protects", () =
     expect(row?.protected).toBe(true);
   });
 
-  it("[F1c] startup refuses when a persisted-protected agent has no manifest", async () => {
+  it("[F1c->N1] startup quarantines a persisted-protected agent that has no manifest (per-agent, not whole process)", async () => {
     const check = (boundary as Record<string, unknown>).assertProtectedPostureAtStartup as
-      | (() => Promise<void>)
+      | (() => Promise<Array<{ agentId: string; reason: string }>>)
       | undefined;
     expect(typeof check).toBe("function");
     boundary.installProtectedMinterManifest(null);
-    await expect(check!()).rejects.toThrow(/refusing to start/);
+    const quarantined = await check!();
+    expect(quarantined.map((q) => `${q.agentId}:${q.reason}`)).toEqual([`${AGENT}:no-manifest`]);
     boundary.installProtectedMinterManifest(manifest(signerAddress));
-    await expect(check!()).resolves.toBeUndefined();
+    await expect(check!()).resolves.toEqual([]);
   });
 
   it("[F1b] absent manifest: every route on the persisted-protected agent is 403 (root key + human)", async () => {
