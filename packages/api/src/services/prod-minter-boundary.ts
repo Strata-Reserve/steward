@@ -169,6 +169,9 @@ export function manifestFromEnv(
     "STEWARD_PROTECTED_MINTER_ADDRESS",
     "STEWARD_PROTECTED_MINTER_FACTORIES",
     "STEWARD_PROTECTED_MINTER_TOKENS",
+    // REVIEW-STEWARD-28-R5 F1: every manifest field activates validation, so
+    // an approvers-only (partial or malformed) config is fatal, never ignored.
+    "STEWARD_PROTECTED_MINTER_APPROVERS",
   ];
   if (!keys.some((k) => env[k] !== undefined && env[k] !== "")) return null;
   const tokens = parseList(env.STEWARD_PROTECTED_MINTER_TOKENS).map((entry) => {
