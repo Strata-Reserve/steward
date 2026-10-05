@@ -21,8 +21,8 @@ import { DEFAULT_TENANT_CONFIGS } from "../defaults/tenant-configs";
 import { invalidateTenantCorsCache } from "../middleware/tenant-cors";
 import { trackAuditEvent } from "../services/audit";
 import { type ApiResponse, type AppVariables, db, safeJsonParse } from "../services/context";
+import { isProtectedMinter } from "../services/prod-minter-boundary";
 import { requireTenantId } from "./tenants";
-
 export const tenantConfigRoutes = new Hono<{ Variables: AppVariables }>();
 
 const emptyTenantConfig = (tenantId: string): TenantControlPlaneConfig => ({
@@ -210,6 +210,12 @@ tenantConfigRoutes.post("/:id/config/templates/:name/apply", requireTenantId, as
 
   if (!body?.agentId) {
     return c.json<ApiResponse>({ ok: false, error: "agentId is required" }, 400);
+  }
+  if (isProtectedMinter(tenantId, String(body.agentId))) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: policy template application is refused" },
+      403,
+    );
   }
 
   // Get templates from DB or defaults

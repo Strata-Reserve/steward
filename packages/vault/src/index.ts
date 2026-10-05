@@ -2,6 +2,23 @@ export type { EncryptedKey } from "./keystore";
 export { KeyStore } from "./keystore";
 export type { KeystoreBackend, KeystoreContext } from "./keystore-backend";
 export { backendFromKeyStore } from "./keystore-backend";
+export type {
+  ProtectedSignerGuard,
+  ProtectedTransactionShape,
+  ProtectedValidation,
+  ReviewDigestInput,
+} from "./protected-signer";
+export {
+  assertNotProtected,
+  computeProtectedReviewDigest,
+  consumeProtectedSigningPermit,
+  getProtectedSignerGuard,
+  isProtectedSigner,
+  issueProtectedSigningPermit,
+  outstandingProtectedPermits,
+  ProtectedSignerError,
+  registerProtectedSignerGuard,
+} from "./protected-signer";
 export type { MatchedRoute } from "./route-matcher";
 export {
   findMatchingRoute,

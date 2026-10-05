@@ -27,6 +27,7 @@ import {
   parseAgentTokenScopes,
   policies,
   requireAgentAccess,
+  requireHumanOwnerAdmin,
   requireTenantLevel,
   safeJsonParse,
   sanitizeErrorMessage,
@@ -34,6 +35,7 @@ import {
   transactions,
   vault,
 } from "../services/context";
+import { isProtectedMinter, isProtectedMinterAgentId } from "../services/prod-minter-boundary";
 
 export const agentRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -56,6 +58,19 @@ agentRoutes.post("/", async (c) => {
     name: string;
     platformId?: string;
   }>(c);
+
+  if (body && typeof body.id === "string" && isProtectedMinterAgentId(body.id)) {
+    if (!isProtectedMinter(tenantId, body.id) || !requireHumanOwnerAdmin(c)) {
+      return c.json<ApiResponse>(
+        {
+          ok: false,
+          error:
+            "Protected signer: creation requires a human owner/admin session in the manifest tenant",
+        },
+        403,
+      );
+    }
+  }
 
   if (!body) {
     return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
@@ -135,9 +150,30 @@ agentRoutes.post("/:agentId/token", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
   }
 
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    if (!requireHumanOwnerAdmin(c)) {
+      return c.json<ApiResponse>(
+        {
+          ok: false,
+          error: "Protected signer: token issuance requires a human owner/admin session",
+        },
+        403,
+      );
+    }
+  }
   const body = await safeJsonParse<{ expiresIn?: string; scopes?: string[] | string }>(c);
   const expiresIn = body?.expiresIn || AGENT_TOKEN_EXPIRY;
   const scopes = parseAgentTokenScopes(body?.scopes ?? c.req.query("scopes"));
+  if (
+    scopes &&
+    isProtectedMinter(c.get("tenantId"), c.req.param("agentId")) &&
+    scopes.includes("api:proxy")
+  ) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: api:proxy scope is refused" },
+      403,
+    );
+  }
   if (!scopes) {
     return c.json<ApiResponse>(
       { ok: false, error: "Invalid scopes — supported values: agent, api:proxy" },
@@ -195,6 +231,12 @@ agentRoutes.post("/:agentId/wallets", async (c) => {
   if (!requireTenantLevel(c)) {
     return c.json<ApiResponse>(
       { ok: false, error: "Venue wallet creation requires tenant-level authentication" },
+      403,
+    );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: wallet provisioning is refused" },
       403,
     );
   }
@@ -289,6 +331,12 @@ agentRoutes.delete("/:agentId", async (c) => {
         ok: false,
         error: "Agent deletion requires tenant-level authentication",
       },
+      403,
+    );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: deletion is refused for every credential" },
       403,
     );
   }
@@ -454,6 +502,16 @@ agentRoutes.post("/batch", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
   }
 
+  if (
+    Array.isArray(body.agents) &&
+    body.agents.some((a) => a && isProtectedMinterAgentId(String(a.id)))
+  ) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: batch creation/policy assignment is refused" },
+      403,
+    );
+  }
+
   if (!Array.isArray(body.agents) || body.agents.length === 0) {
     return c.json<ApiResponse>(
       { ok: false, error: "agents array is required and must not be empty" },
@@ -574,6 +632,16 @@ agentRoutes.put("/:agentId/policies", async (c) => {
   if (!requireAgentAccess(c)) {
     return c.json<ApiResponse>(
       { ok: false, error: "Forbidden: token scope does not match agent" },
+      403,
+    );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error:
+          "Protected signer: policy is a deployment-controlled manifest; changes require a Steward release",
+      },
       403,
     );
   }

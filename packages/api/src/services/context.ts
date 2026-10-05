@@ -502,6 +502,21 @@ export function requireTenantLevel(c: Context<{ Variables: AppVariables }>): boo
 }
 
 /**
+ * STRATA-1499: a verified human owner/admin session. Requires a session JWT
+ * carrying `userId` whose live membership (looked up by tenantAuth on this
+ * request) is owner or admin. Tenant API keys, agent tokens, application
+ * principals and dashboard tokens without membership are never human sessions.
+ */
+export function requireHumanOwnerAdmin(c: Context<{ Variables: AppVariables }>): string | null {
+  if (c.get("authType") !== "session-jwt") return null;
+  const userId = c.get("userId");
+  if (!userId) return null;
+  const tenantRole = c.get("tenantRole");
+  if (tenantRole !== "owner" && tenantRole !== "admin") return null;
+  return userId;
+}
+
+/**
  * dashboardAuthMiddleware
  * Accepts a session JWT (Bearer token) issued by the auth routes.
  * Extracts userId and tenantId, looks up the tenant, and sets context variables

@@ -624,6 +624,17 @@ export const approvalQueue = pgTable(
     requestedAt: timestamp("requested_at", { withTimezone: true }).notNull().defaultNow(),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
     resolvedBy: varchar("resolved_by", { length: 255 }),
+    /**
+     * STRATA-1499 protected-minter review evidence. NULL for ordinary
+     * approvals. `review_digest` binds the exact immutable payload (chain,
+     * to, value, data, agentId, executionRef, manifest digest); the human
+     * approval must echo it and the signer rechecks it before key use.
+     */
+    reviewDigest: varchar("review_digest", { length: 66 }),
+    manifestDigest: varchar("manifest_digest", { length: 66 }),
+    reviewProjection: jsonb("review_projection").$type<Record<string, unknown>>(),
+    requestedBy: varchar("requested_by", { length: 255 }),
+    approvedByUserId: varchar("approved_by_user_id", { length: 64 }),
   },
   (table) => ({
     txIdUniqueIdx: uniqueIndex("approval_queue_tx_id_idx").on(table.txId),

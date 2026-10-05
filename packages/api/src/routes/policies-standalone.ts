@@ -197,6 +197,7 @@ function normalizeSimulationRequest(body: SimulateBody): SimRequest | null {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
+import { isProtectedMinter } from "../services/prod-minter-boundary";
 export const policiesStandaloneRoutes = new Hono<{ Variables: AppVariables }>();
 
 // List policy templates for tenant
@@ -368,6 +369,12 @@ policiesStandaloneRoutes.post("/:id/assign", async (c) => {
   const body = await safeJsonParse<AssignBody>(c);
   if (!body || !Array.isArray(body.agentIds) || body.agentIds.length === 0) {
     return c.json<ApiResponse>({ ok: false, error: "agentIds must be a non-empty array" }, 400);
+  }
+  if (body.agentIds.some((agentId) => isProtectedMinter(tenantId, String(agentId)))) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: policy template assignment is refused" },
+      403,
+    );
   }
 
   const template = await getTemplate(tenantId, id);

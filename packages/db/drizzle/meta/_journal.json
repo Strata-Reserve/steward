@@ -197,6 +197,13 @@
       "when": 1786640400000,
       "tag": "0027_transactions_execution_ref",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1786726800000,
+      "tag": "0028_approval_queue_protected_review",
+      "breakpoints": true
     }
   ]
 }

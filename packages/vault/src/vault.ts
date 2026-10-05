@@ -44,6 +44,13 @@ import {
 
 import { type EncryptedKey, KeyStore } from "./keystore";
 import {
+  assertNotProtected,
+  computeProtectedReviewDigest,
+  consumeProtectedSigningPermit,
+  getProtectedSignerGuard,
+  ProtectedSignerError,
+} from "./protected-signer";
+import {
   generateSolanaKeypair,
   getSolanaBalance,
   restoreSolanaKeypair,
@@ -107,6 +114,14 @@ export interface SignTransactionOptions {
   txId?: string;
   policyResults?: PolicyResult[];
   status?: TxStatus;
+  /**
+   * STRATA-1499: one-use internal signing permit issued by the human-approval
+   * continuation. Required (and consumed) when the agent is the protected
+   * production minter; ignored for every other agent.
+   */
+  protectedPermit?: string;
+  /** Review digest the human approved; rechecked against the bytes signed. */
+  protectedReviewDigest?: string;
 }
 
 export interface EnsureApplicationWalletInput {
@@ -525,6 +540,65 @@ export class Vault {
     const chainFamilyToUse = isSolana ? "solana" : "evm";
     const shouldBroadcast = request.broadcast !== false;
 
+    // ── STRATA-1499: protected production minter ───────────────────────────
+    // Final gate before key decryption. Only the human-approved continuation
+    // holds a permit; the permit is bound to the review digest of the exact
+    // bytes, which are recomputed here from what is about to be signed.
+    const guard = getProtectedSignerGuard();
+    const protectedExpectedAddress =
+      guard?.isProtected(request.tenantId, request.agentId) === true
+        ? (guard.expectedAddress(request.tenantId, request.agentId) ?? "")
+        : null;
+    if (guard && protectedExpectedAddress !== null) {
+      if (!protectedExpectedAddress) {
+        throw new ProtectedSignerError("signer address is not pinned in the manifest");
+      }
+      if (isSolana || request.broadcast === false) {
+        throw new ProtectedSignerError("only broadcast EVM transactions are permitted");
+      }
+      if (request.nonce !== undefined || request.gasLimit !== undefined) {
+        throw new ProtectedSignerError("caller-supplied nonce/gas fields are refused");
+      }
+      if (!request.executionRef) {
+        throw new ProtectedSignerError("executionRef is required");
+      }
+      const digest = computeProtectedReviewDigest({
+        tenantId: request.tenantId,
+        agentId: request.agentId,
+        signerAddress: protectedExpectedAddress,
+        chainId,
+        to: request.to,
+        value: request.value,
+        data: request.data,
+        executionRef: request.executionRef,
+        manifestDigest: guard.manifestDigest(),
+      });
+      // Consume the permit FIRST: any failure below (or a digest mismatch
+      // here) burns it, so a permit can never be retried against other bytes.
+      const permit = consumeProtectedSigningPermit(options.protectedPermit, {
+        tenantId: request.tenantId,
+        agentId: request.agentId,
+        reviewDigest: digest,
+      });
+      if (!permit.ok) throw new ProtectedSignerError(permit.reason);
+      if (
+        !options.protectedReviewDigest ||
+        options.protectedReviewDigest.toLowerCase() !== digest.toLowerCase()
+      ) {
+        throw new ProtectedSignerError("review digest does not match the bytes to be signed");
+      }
+      const shape = guard.validateTransaction({
+        chainId,
+        to: request.to,
+        value: request.value,
+        data: request.data,
+      });
+      if (!shape.ok) throw new ProtectedSignerError(shape.reason);
+      if (agentRow.walletAddress.toLowerCase() !== protectedExpectedAddress.toLowerCase()) {
+        throw new ProtectedSignerError("stored wallet address does not match the manifest pin");
+      }
+    }
+
     // ── Resolve the correct signing key ─────────────────────────────────
     // 1. Try the multi-chain key table (new agents)
     // 2. Fall back to legacy single-key table (old EVM-only agents)
@@ -588,6 +662,14 @@ export class Vault {
       hash = await signSolanaTransaction(secretKey, request.to, BigInt(request.value), rpcUrl);
     } else {
       const account = privateKeyToAccount(secretKey as `0x${string}`);
+      if (
+        protectedExpectedAddress !== null &&
+        account.address.toLowerCase() !== protectedExpectedAddress.toLowerCase()
+      ) {
+        // STRATA-1499: the derived key must be the pinned signer, not merely
+        // whatever the agents row claims.
+        throw new ProtectedSignerError("derived account does not match the manifest pin");
+      }
       const chain = CHAINS[chainId];
       if (!chain) {
         throw new Error(`Unsupported EVM chain: ${chainId}`);
@@ -606,11 +688,12 @@ export class Vault {
           transport: http(rpcUrl),
         });
 
-        hash = await client.sendTransaction({
+        hash = await this.broadcastEvm(client, {
           to: request.to as `0x${string}`,
           value: BigInt(request.value),
           data: request.data as `0x${string}` | undefined,
           gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
+          chainId,
         });
       } else {
         // Sign without broadcasting - return the serialized signed transaction
@@ -674,6 +757,29 @@ export class Vault {
       });
 
     return hash;
+  }
+
+  /**
+   * Final EVM broadcast seam. Tests replace this to observe the exact bytes
+   * handed to the network without touching an RPC. Production behaviour is a
+   * plain `sendTransaction`.
+   */
+  protected async broadcastEvm(
+    client: ReturnType<typeof createWalletClient>,
+    tx: {
+      to: `0x${string}`;
+      value: bigint;
+      data?: `0x${string}`;
+      gas?: bigint;
+      chainId: number;
+    },
+  ): Promise<`0x${string}`> {
+    return client.sendTransaction({
+      to: tx.to,
+      value: tx.value,
+      data: tx.data,
+      gas: tx.gas,
+    } as Parameters<typeof client.sendTransaction>[0]);
   }
 
   /**
@@ -782,6 +888,7 @@ export class Vault {
     privateKey: string,
     chainType: "evm" | "solana",
   ): Promise<{ walletAddress: string }> {
+    assertNotProtected(tenantId, agentId, "key import");
     const db = getDb();
 
     let walletAddress: string;
@@ -897,6 +1004,7 @@ export class Vault {
    * based on the agent's wallet address format.
    */
   async signMessage(tenantId: string, agentId: string, message: string): Promise<string> {
+    assertNotProtected(tenantId, agentId, "message signing");
     const db = getDb();
 
     // Verify agent exists for this tenant
@@ -976,6 +1084,7 @@ export class Vault {
     s: `0x${string}`;
     yParity: 0 | 1;
   }> {
+    assertNotProtected(tenantId, agentId, "EIP-7702 authorization signing");
     if (!/^0x[0-9a-fA-F]{40}$/.test(params.contractAddress)) {
       throw new Error("contractAddress must be a 20-byte hex address");
     }
@@ -1044,6 +1153,7 @@ export class Vault {
    * Used for DEX approvals, ERC-20 permits, and structured data signatures.
    */
   async signTypedData(request: SignTypedDataRequest): Promise<string> {
+    assertNotProtected(request.tenantId, request.agentId, "typed-data signing");
     const db = getDb();
 
     // Verify agent exists for this tenant
@@ -1132,6 +1242,7 @@ export class Vault {
     chainId: number;
     caip2?: string;
   }> {
+    assertNotProtected(request.tenantId, request.agentId, "Solana signing");
     const db = getDb();
 
     // Verify agent exists
@@ -1240,6 +1351,7 @@ export class Vault {
     evm?: { privateKey: string; address: string };
     solana?: { privateKey: string; address: string };
   }> {
+    assertNotProtected(tenantId, agentId, "key export");
     const db = getDb();
 
     // Verify agent belongs to this tenant

@@ -17,6 +17,7 @@ import {
   safeJsonParse,
   transactions,
 } from "../services/context";
+import { isProtectedMinter } from "../services/prod-minter-boundary";
 import { dispatchWebhook } from "../services/webhook-dispatch";
 
 export const approvalRoutes = new Hono<{ Variables: AppVariables }>();
@@ -137,6 +138,17 @@ approvalRoutes.post("/:txId/approve", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Approval not found" }, 404);
   }
 
+  if (isProtectedMinter(entry.tenantId, entry.agentId)) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error:
+          "Protected signer: use POST /vault/:agentId/approve/:txId or /reject/:txId with a human owner/admin session",
+      },
+      403,
+    );
+  }
+
   if (entry.status !== "pending") {
     return c.json<ApiResponse>({ ok: false, error: `Approval already ${entry.status}` }, 400);
   }
@@ -202,6 +214,17 @@ approvalRoutes.post("/:txId/deny", async (c) => {
 
   if (!entry) {
     return c.json<ApiResponse>({ ok: false, error: "Approval not found" }, 404);
+  }
+
+  if (isProtectedMinter(entry.tenantId, entry.agentId)) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error:
+          "Protected signer: use POST /vault/:agentId/approve/:txId or /reject/:txId with a human owner/admin session",
+      },
+      403,
+    );
   }
 
   if (entry.status !== "pending") {
