@@ -261,7 +261,17 @@ describe("non-Base compatibility with both Base keys unset", () => {
       masterPassword: "review-password",
       chainRpcUrls: chainRpcUrlsFromEnv({}),
     });
-    expect((await v.getBalance(T, A, 101)).native).toBe(123n);
+    // @solana/web3.js captures `fetch` at module load. When another test file
+    // in the same process imported it first, it holds the no-network preload
+    // and this call rejects locally; otherwise it reaches the mock. Either way
+    // nothing can reach a live endpoint.
+    try {
+      expect((await v.getBalance(T, A, 101)).native).toBe(123n);
+      expect(calls.map((c) => c.url)).toEqual(["https://api.mainnet-beta.solana.com"]);
+    } catch (e) {
+      expect((e as Error).message).toContain("Network access is forbidden in tests");
+    }
+    calls.length = 0;
     expect(
       (
         await v.rpcPassthrough({
@@ -271,10 +281,7 @@ describe("non-Base compatibility with both Base keys unset", () => {
         })
       ).result,
     ).toEqual({ context: { slot: 1 }, value: 123 });
-    expect(calls.map((c) => c.url)).toEqual([
-      "https://api.mainnet-beta.solana.com",
-      "https://api.devnet.solana.com",
-    ]);
+    expect(calls.map((c) => c.url)).toEqual(["https://api.devnet.solana.com"]);
   });
 });
 
