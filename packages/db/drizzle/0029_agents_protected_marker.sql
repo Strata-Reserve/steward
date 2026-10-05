@@ -1,5 +1,11 @@
 -- STRATA-1499 (SF-1, REVIEW-STEWARD-28 F1): persisted, env-independent
 -- protected marker. Set once at protected creation; no API route clears it.
 -- Additive. Existing agents keep false (legacy posture).
--- Rollback: ALTER TABLE agents DROP COLUMN protected;
+-- Rollback SQL: ALTER TABLE agents DROP COLUMN protected;
+-- Rollback is NOT authorization-safe after any protected agent exists (REVIEW-STEWARD-28-R4 N1):
+-- dropping the column erases the env-independent protected marker, so a later process with
+-- no manifest would treat the signer as an ordinary legacy agent (no deny-by-default,
+-- no quarantine). Re-applying this migration recreates the column as false. Only roll back
+-- BEFORE any protected agent has been created, or together with revoking MINTER_ROLE from
+-- the signer via the Safe (0x3Ea77cDf3eC33603bF4135bb1a36712B5e21d721).
 ALTER TABLE "agents" ADD COLUMN IF NOT EXISTS "protected" boolean NOT NULL DEFAULT false;

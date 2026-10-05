@@ -3,5 +3,10 @@
 -- once; the claim is taken by CAS (status='approved' AND issuance_claimed_at IS NULL)
 -- before any key use, so a second issuance (or one racing an in-flight signing)
 -- is refused. Additive. Ordinary approvals keep NULL.
--- Rollback: ALTER TABLE approval_queue DROP COLUMN issuance_claimed_at;
+-- Rollback SQL: ALTER TABLE approval_queue DROP COLUMN issuance_claimed_at;
+-- Rollback is NOT authorization-safe after any protected approval (REVIEW-STEWARD-28-R4 N1):
+-- dropping the column discards every consumed one-use issuance claim, so an already-approved
+-- row would present as never-issued after re-apply (the anti-reissuance guarantee is lost).
+-- Only roll back BEFORE any protected approval has been issued, or together with revoking
+-- MINTER_ROLE from the signer via the Safe (0x3Ea77cDf3eC33603bF4135bb1a36712B5e21d721).
 ALTER TABLE "approval_queue" ADD COLUMN IF NOT EXISTS "issuance_claimed_at" timestamp with time zone;
