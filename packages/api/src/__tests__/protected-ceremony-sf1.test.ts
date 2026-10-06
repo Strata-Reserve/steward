@@ -317,7 +317,12 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     // that row is protected+quarantined there and never reaches this tenant.
     const other = await createProtected(bearer(otherOwnerToken), { id: "ceremony-other-minter" });
     expect(other.status).toBe(201);
-    expect((await json(other)).data.tenantId).toBe(OTHER_TENANT);
+    expect(Object.keys((await json(other)).data).sort()).toEqual(["id", "walletAddress"]);
+    const [otherPersisted] = await getDb()
+      .select()
+      .from(agents)
+      .where(eq(agents.id, "ceremony-other-minter"));
+    expect(otherPersisted?.tenantId).toBe(OTHER_TENANT);
     expect(await boundary.isQuarantinedProtectedAgent("ceremony-other-minter")).toBe(true);
     expect(await protectedRow("ceremony-other-minter")).toBeNull();
   });
@@ -327,14 +332,12 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     expect(r.status).toBe(201);
     const b = await json(r);
     expect(b.ok).toBe(true);
-    expect(Object.keys(b.data).sort()).toEqual(
-      ["id", "protected", "status", "tenantId", "walletAddress"].sort(),
-    );
+    // REVIEW-SF1-DELTA F2: exact key set, nothing else.
+    expect(Object.keys(b.data).sort()).toEqual(["id", "walletAddress"]);
     expect(b.data.id).toBe(AGENT);
-    expect(b.data.tenantId).toBe(TENANT);
-    expect(b.data.protected).toBe(true);
-    expect(b.data.status).toBe("inert");
     expect(b.data.walletAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
+    // Posture/tenant are persisted, not echoed (protectedRow filters on TENANT).
+    expect((await protectedRow())?.protected).toBe(true);
     // No chain authority, no Safe roles, no credentials, no Solana address.
     for (const k of [
       "token",

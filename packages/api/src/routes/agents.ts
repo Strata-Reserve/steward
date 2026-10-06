@@ -137,12 +137,11 @@ agentRoutes.post("/", async (c) => {
 // response carries only what the manifest needs: stable id + EVM address.
 // Nothing here funds, grants roles, dials RPC or touches a Safe.
 
+// REVIEW-SF1-DELTA F2: the response contract is exactly { id, walletAddress }.
+// Posture (protected/inert) and tenant are persisted + audited, not echoed.
 export interface ProtectedSignerBootstrap {
   id: string;
-  tenantId: string;
   walletAddress: string;
-  protected: true;
-  status: "inert";
 }
 
 agentRoutes.post("/protected", async (c) => {
@@ -204,10 +203,7 @@ agentRoutes.post("/protected", async (c) => {
     });
     const data: ProtectedSignerBootstrap = {
       id: identity.id,
-      tenantId: identity.tenantId,
       walletAddress: identity.walletAddress,
-      protected: true,
-      status: "inert",
     };
     return c.json<ApiResponse<ProtectedSignerBootstrap>>({ ok: true, data }, 201);
   } catch (e: unknown) {
