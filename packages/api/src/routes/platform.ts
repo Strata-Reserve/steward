@@ -29,7 +29,7 @@ import { KeyStore, Vault } from "@stwd/vault";
 import { and, count, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { trackAuditEvent } from "../services/audit";
-import { createAgentToken, parseAgentTokenScopes } from "../services/context";
+import { createAgentToken, parseAgentTokenScopes, validatePolicyConfig } from "../services/context";
 import { invalidateEmailAuthForTenant } from "./auth";
 
 function auditCtx(c: {
@@ -777,6 +777,9 @@ platform.put("/tenants/:id/policies", async (c) => {
     "allowed-chains",
     "reputation-threshold",
     "reputation-scaling",
+    "venue-allowlist",
+    "leverage-cap",
+    "calldata-amount-window",
   ] as const;
 
   for (const rule of body) {
@@ -812,6 +815,10 @@ platform.put("/tenants/:id/policies", async (c) => {
         },
         400,
       );
+    }
+    const configError = validatePolicyConfig(rule);
+    if (configError) {
+      return c.json<ApiResponse>({ ok: false, error: configError }, 400);
     }
   }
 

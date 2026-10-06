@@ -121,6 +121,33 @@ Restricts which blockchain networks an agent can use:
 }
 ```
 
+### Calldata Amount Window
+
+Caps the rolling-window **sum** of a decoded `uint256` calldata argument per contract and function selector. The sum is computed server-side from the agent's own prior signing records (pending, approved, signed, broadcast, confirmed), never from the request:
+
+```json
+{
+  "id": "mint-volume-cap",
+  "type": "calldata-amount-window",
+  "enabled": true,
+  "config": {
+    "rules": [
+      {
+        "contract": "0xDEAL_TOKEN",
+        "selector": "0x40c10f19",
+        "amountArgIndex": 1,
+        "maxPerWindow": "1000000000000000000000000",
+        "windowSeconds": 86400
+      }
+    ],
+    "unmatched": "pass",
+    "overCap": "reject"
+  }
+}
+```
+
+With `overCap: "manual-approval"` an over-cap request is queued for a human instead of rejected. Malformed config, undecodable calldata and history lookup failures always deny. See the [policy guide](/guides/policies#calldata-amount-window) for full semantics.
+
 ## Evaluation Flow
 
 ```
@@ -134,7 +161,8 @@ Incoming Request
     │   3. spending-limit    → DENY/ALLOW
     │   4. rate-limit        → DENY/ALLOW
     │   5. time-window       → DENY/ALLOW
-    │   6. auto-approve      → AUTO/QUEUE
+    │   6. calldata-amount-window → DENY/ALLOW (or QUEUE with overCap: manual-approval)
+    │   7. auto-approve      → AUTO/QUEUE
     │
     │   ALL must pass. First DENY short-circuits.
     │

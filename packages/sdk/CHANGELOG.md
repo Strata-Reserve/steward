@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Expands Hyperliquid trade asset types to include BNB, SOL, AVAX, ARB, and OP.
+- Adds `venue-allowlist`, `leverage-cap` and `calldata-amount-window` to the `PolicyType` union so typed clients can read and write these server-supported policies (STRATA-1499).
 
 ## 0.10.0
 

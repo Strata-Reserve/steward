@@ -13,6 +13,7 @@ import {
   type ApiResponse,
   type AppVariables,
   approvalQueue,
+  createCalldataHistoryLookup,
   db,
   ensureAgentForTenant,
   extractRpcErrorMessage,
@@ -368,6 +369,9 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
 
   const stats = await getTransactionStats(agentId);
 
+  // STRATA-1499: `calldata-amount-window` sums this agent's own prior rows
+  // server-side. The row reserved above (executionRef path) is excluded so a
+  // request never counts against itself.
   const evaluation = await policyEngine.evaluate(policySet, {
     request: signRequest,
     recentTxCount1h: stats.recentTxCount1h,
@@ -375,6 +379,9 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
     spentToday: stats.spentToday,
     spentThisWeek: stats.spentThisWeek,
     priceOracle,
+    calldataHistoryLookup: createCalldataHistoryLookup(agentId, {
+      ...(reserved ? { excludeTxId: txId } : {}),
+    }),
   });
 
   if (!evaluation.approved) {

@@ -11,6 +11,10 @@ import {
   type TimeWindowConfig,
   toCaip2,
 } from "@stwd/shared";
+import {
+  type CalldataHistoryLookup,
+  evaluateCalldataAmountWindow,
+} from "./evaluators/calldata-amount-window";
 import { evaluateLeverageCap } from "./evaluators/leverage-cap";
 import { evaluateReputationScaling } from "./evaluators/reputation-scaling";
 import { evaluateReputationThreshold } from "./evaluators/reputation-threshold";
@@ -43,6 +47,15 @@ export interface EvaluatorContext {
    * populate this so evaluators don't all re-quote the oracle.
    */
   valueUsd?: number;
+  /**
+   * STRATA-1499: server-side history lookup for `calldata-amount-window`.
+   * The API binds this to the current agent's own signing records. When a
+   * `calldata-amount-window` rule matches and this is absent, the rule
+   * denies (there is no safe default sum).
+   */
+  calldataHistoryLookup?: CalldataHistoryLookup;
+  /** Injectable clock for window computations (tests). */
+  now?: Date;
 }
 
 /**
@@ -90,6 +103,12 @@ export async function evaluatePolicy(
       return evaluateVenueAllowlist(rule, { venue: ctx.venue });
     case "leverage-cap":
       return evaluateLeverageCap(rule, { leverage: ctx.leverage });
+    case "calldata-amount-window":
+      return evaluateCalldataAmountWindow(rule, {
+        request: ctx.request,
+        calldataHistoryLookup: ctx.calldataHistoryLookup,
+        now: ctx.now,
+      });
     default:
       return {
         policyId: rule.id,

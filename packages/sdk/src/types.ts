@@ -28,7 +28,10 @@ export type PolicyType =
   | "rate-limit"
   | "allowed-chains"
   | "reputation-threshold"
-  | "reputation-scaling";
+  | "reputation-scaling"
+  | "venue-allowlist"
+  | "leverage-cap"
+  | "calldata-amount-window";
 
 export interface PolicyRule {
   id: string;

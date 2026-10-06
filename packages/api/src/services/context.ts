@@ -14,7 +14,11 @@ import {
   verifyToken,
 } from "@stwd/auth";
 import { getDb, policies, tenants, toPolicyRule, transactions, userTenants } from "@stwd/db";
-import { PolicyEngine } from "@stwd/policy-engine";
+import {
+  type CalldataHistoryLookup,
+  PolicyEngine,
+  validateCalldataAmountWindowConfig,
+} from "@stwd/policy-engine";
 import {
   type AgentIdentity,
   type ApiResponse,
@@ -26,7 +30,7 @@ import {
 } from "@stwd/shared";
 import { Vault } from "@stwd/vault";
 import { WebhookDispatcher } from "@stwd/webhooks";
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, ne, sql } from "drizzle-orm";
 import type { Context, Next } from "hono";
 import type { ApplicationPrincipalContext } from "./application-boundary";
 
@@ -146,6 +150,28 @@ export function isValidTenantId(id: unknown): id is string {
 
 export function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Type-specific config validation for policy writes (STRATA-1499).
+ *
+ * Runs after the generic shape checks (type known, enabled boolean, config
+ * object). Returns an error message or null. Only policy types with a strict
+ * schema are checked here; the rest keep their historical lenient handling.
+ * Disabled rules are validated too so a bad config cannot be stored now and
+ * flipped on later. The evaluator re-validates at evaluation time and denies
+ * on a malformed config, so this is a usability gate, not the safety gate.
+ */
+export function validatePolicyConfig(policy: {
+  id?: string;
+  type: string;
+  config: unknown;
+}): string | null {
+  if (policy.type === "calldata-amount-window") {
+    const result = validateCalldataAmountWindowConfig(policy.config);
+    if (!result.ok) return `Policy "${policy.id || policy.type}": ${result.error}`;
+  }
+  return null;
 }
 
 export function isValidAddress(value: unknown): boolean {
@@ -315,6 +341,60 @@ export async function getPolicySet(tenantId: string, agentId: string): Promise<P
 
   if (storedPolicies.length > 0) return storedPolicies.map(toPolicyRule);
   return tenantConfigs.get(tenantId)?.defaultPolicies || [];
+}
+
+/**
+ * Transaction statuses that count toward a `calldata-amount-window` sum
+ * (STRATA-1499). Anything that was, is, or may still be signed is counted:
+ * a reserved or queued-for-approval `pending` row holds its amount until it
+ * is resolved. `rejected` (policy deny or human reject) and `failed` (the
+ * signer threw; the reserved row is terminal and hashless) never produced a
+ * signature and are excluded.
+ */
+export const CALLDATA_WINDOW_COUNTED_STATUSES = [
+  "pending",
+  "approved",
+  "signed",
+  "broadcast",
+  "confirmed",
+] as const;
+
+/**
+ * Bind a `calldata-amount-window` history lookup to one agent's own
+ * `transactions` rows. The policy engine calls this with the (contract,
+ * selector, chainId, since) of a matching rule and sums the decoded amount
+ * of every returned row itself; the SQL here only narrows the candidate set.
+ *
+ * `excludeTxId` is the row reserved for the request under evaluation (the
+ * executionRef path inserts its `pending` row before policy runs); it must
+ * not count against itself. Storage errors propagate so the evaluator denies
+ * rather than under-counting.
+ */
+export function createCalldataHistoryLookup(
+  agentId: string,
+  options: { excludeTxId?: string } = {},
+): CalldataHistoryLookup {
+  return async (query) => {
+    const rows = await db
+      .select({
+        to: transactions.toAddress,
+        data: transactions.data,
+        chainId: transactions.chainId,
+      })
+      .from(transactions)
+      .where(
+        and(
+          eq(transactions.agentId, agentId),
+          eq(transactions.chainId, query.chainId),
+          sql`lower(${transactions.toAddress}) = ${query.contract}`,
+          sql`lower(left(coalesce(${transactions.data}, ''), 10)) = ${query.selector}`,
+          gte(transactions.createdAt, query.since),
+          inArray(transactions.status, [...CALLDATA_WINDOW_COUNTED_STATUSES]),
+          ...(options.excludeTxId ? [ne(transactions.id, options.excludeTxId)] : []),
+        ),
+      );
+    return rows;
+  };
 }
 
 export async function getTransactionStats(agentId: string) {

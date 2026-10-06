@@ -179,7 +179,8 @@ export type PolicyType =
   | "reputation-threshold"
   | "reputation-scaling"
   | "venue-allowlist"
-  | "leverage-cap";
+  | "leverage-cap"
+  | "calldata-amount-window";
 
 export interface PolicyRule {
   id: string;
@@ -243,6 +244,46 @@ export interface VenueAllowlistConfig {
  */
 export interface LeverageCapConfig {
   maxLeverage: number;
+}
+
+/**
+ * One rule of a `calldata-amount-window` policy (STRATA-1499 / SF-1).
+ *
+ * Caps the SUM of a decoded `uint256` calldata argument for calls to
+ * (`contract`, `selector`) over a rolling window. The canonical use is a
+ * rolling mint-volume cap on `DealTokenV1.mint(address,uint256)`.
+ */
+export interface CalldataAmountWindowRule {
+  /** Target contract address (0x + 40 hex). Compared case-insensitively. */
+  contract: string;
+  /** 4-byte function selector (0x + 8 hex), e.g. `0x40c10f19` for mint(address,uint256). */
+  selector: string;
+  /** 0-based index of the uint256 argument to sum, counted in 32-byte static words after the selector. */
+  amountArgIndex: number;
+  /** Cap on the window sum, uint256 as a decimal string (raw token units, not scaled). */
+  maxPerWindow: string;
+  /** Rolling window length in seconds (> 0). */
+  windowSeconds: number;
+  /** Optional: only apply this rule on this chain. History is always scoped to the request's chain. */
+  chainId?: number;
+}
+
+/**
+ * `calldata-amount-window` policy config.
+ *
+ * - `rules`: at least one rule. Every rule whose (contract, selector[, chainId])
+ *   matches the request is evaluated and must pass.
+ * - `unmatched`: verdict when no rule matches the request. Default `"pass"`
+ *   (this policy only constrains the listed calls; pair it with an address /
+ *   contract allowlist to deny everything else).
+ * - `overCap`: `"reject"` (default) hard-denies a request that would push the
+ *   window sum over `maxPerWindow`; `"manual-approval"` queues it instead.
+ *   Config errors and history-lookup failures always hard-deny regardless.
+ */
+export interface CalldataAmountWindowConfig {
+  rules: CalldataAmountWindowRule[];
+  unmatched?: "pass" | "deny";
+  overCap?: "reject" | "manual-approval";
 }
 
 // ─── Transactions ───
@@ -352,6 +393,13 @@ export interface PolicyResult {
   type: PolicyType;
   passed: boolean;
   reason?: string;
+  /**
+   * How the engine should treat a failed result. Absent (or `"reject"`) means
+   * a hard failure: the request is denied. `"manual-approval"` means the
+   * request may be queued for a human instead, the same way a failed
+   * `auto-approve-threshold` is handled. Only meaningful when `passed` is false.
+   */
+  disposition?: "reject" | "manual-approval";
 }
 
 // ─── API Responses ───

@@ -1,3 +1,13 @@
+export type { DecodeResult } from "./calldata-decoder";
+export {
+  decodeUint256Arg,
+  extractSelector,
+  isHexAddress,
+  isHexSelector,
+  normalizeHexData,
+  parseUint256Decimal,
+  UINT256_MAX,
+} from "./calldata-decoder";
 export type {
   AuditHook,
   PolicyEngineOptions,
@@ -10,6 +20,16 @@ export type {
 export { PolicyEngine } from "./engine";
 export type { EvaluatorContext } from "./evaluators";
 export { evaluatePolicy } from "./evaluators";
+export type {
+  CalldataAmountWindowContext,
+  CalldataHistoryLookup,
+  CalldataHistoryQuery,
+  CalldataHistoryRow,
+} from "./evaluators/calldata-amount-window";
+export {
+  evaluateCalldataAmountWindow,
+  validateCalldataAmountWindowConfig,
+} from "./evaluators/calldata-amount-window";
 export type { LeverageCapContext } from "./evaluators/leverage-cap";
 export { evaluateLeverageCap } from "./evaluators/leverage-cap";
 export type { ReputationScalingConfig } from "./evaluators/reputation-scaling";

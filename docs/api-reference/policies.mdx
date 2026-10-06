@@ -92,6 +92,7 @@ Array<{
 | `time-window` | Restrict to specific hours |
 | `rate-limit` | Max transactions per minute/hour |
 | `allowed-chains` | Restrict to specific chain IDs |
+| `calldata-amount-window` | Rolling-window cap on the sum of a decoded calldata amount per contract + selector |
 
 **Response:**
 
@@ -159,6 +160,7 @@ The API validates each policy:
 - `type` must be one of the valid types listed above
 - `enabled` must be a boolean
 - `config` must be a non-null object
+- `calldata-amount-window` configs are schema-checked (addresses, selectors, uint256 decimals, window bounds); a malformed config is rejected with `400` naming the policy id
 
 Invalid policies return `400`:
 
