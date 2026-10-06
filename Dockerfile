@@ -36,8 +36,10 @@ ARG CACHE_BUST=1
 # Copy manifests only — layer-cached until lockfile changes
 COPY package.json bun.lock turbo.json tsconfig.json ./
 
-# Create stub for excluded workspaces so bun doesn't fail on missing references
-RUN mkdir -p web && echo '{"name":"web","version":"0.0.0","private":true}' > web/package.json
+# Real manifest for the excluded `web` workspace (not a stub): --frozen-lockfile
+# compares every workspace manifest against bun.lock, so the stub made the
+# lockfile "change" and forced --no-frozen-lockfile (STRATA-1499 sec sweep).
+COPY web/package.json web/package.json
 
 # Package manifests for every workspace package. ALL package.json files declared
 # by the `workspaces` glob in the root package.json must be present, or
@@ -61,7 +63,7 @@ COPY packages/venue-hyperliquid/package.json packages/venue-hyperliquid/package.
 COPY packages/webhooks/package.json          packages/webhooks/package.json
 COPY packages/examples/                      packages/examples/
 
-RUN BUN_FROZEN_LOCKFILE=0 bun install --no-frozen-lockfile --ignore-scripts
+RUN bun install --frozen-lockfile --ignore-scripts
 
 # ── Stage 2: Build ────────────────────────────────────────────────────────────
 FROM base AS build
@@ -89,11 +91,13 @@ COPY packages/venue-hyperliquid/package.json packages/venue-hyperliquid/package.
 COPY packages/webhooks/package.json          packages/webhooks/package.json
 COPY packages/examples/                      packages/examples/
 
-# Create stub for excluded workspaces
-RUN mkdir -p web && echo '{"name":"web","version":"0.0.0","private":true}' > web/package.json
+# Real manifest for the excluded `web` workspace (not a stub): --frozen-lockfile
+# compares every workspace manifest against bun.lock, so the stub made the
+# lockfile "change" and forced --no-frozen-lockfile (STRATA-1499 sec sweep).
+COPY web/package.json web/package.json
 
 # Install deps fresh in build stage (bun symlinks don't survive COPY --from in BuildKit)
-RUN BUN_FROZEN_LOCKFILE=0 bun install --no-frozen-lockfile --ignore-scripts
+RUN bun install --frozen-lockfile --ignore-scripts
 
 # Copy full source for all packages needed by api + proxy
 COPY packages/api         packages/api
@@ -137,8 +141,10 @@ ENV PORT=3200
 # Install production dependencies only (no dev/build tools)
 COPY package.json bun.lock turbo.json tsconfig.json ./
 
-# Create stub for excluded workspaces
-RUN mkdir -p web && echo '{"name":"web","version":"0.0.0","private":true}' > web/package.json
+# Real manifest for the excluded `web` workspace (not a stub): --frozen-lockfile
+# compares every workspace manifest against bun.lock, so the stub made the
+# lockfile "change" and forced --no-frozen-lockfile (STRATA-1499 sec sweep).
+COPY web/package.json web/package.json
 
 COPY packages/agent-trader/package.json      packages/agent-trader/package.json
 COPY packages/api/package.json               packages/api/package.json
@@ -160,7 +166,7 @@ COPY packages/webhooks/package.json          packages/webhooks/package.json
 COPY packages/examples/                      packages/examples/
 
 COPY --from=deps /app/bun.lock ./bun.lock
-RUN BUN_FROZEN_LOCKFILE=0 bun install --production --no-frozen-lockfile --ignore-scripts
+RUN bun install --production --frozen-lockfile --ignore-scripts
 
 # Copy compiled output from build stage
 COPY --from=build /app/packages/api         packages/api
