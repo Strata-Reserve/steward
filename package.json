@@ -37,6 +37,9 @@
   },
   "//overrides": "Transitive CVE pins. Each entry corresponds to one or more GHSA advisories surfaced by `bun audit`; bump (or remove) once upstream parents publish fixed releases. See docs/security/threat-model.mdx#known-accepted-cves for details.",
   "overrides": {
+    "source-map-js": "^1.2.2",
+    "tinypool": "2.1.2",
+    "vite": "7.3.5",
     "axios": "^1.20.0",
     "langsmith": "^0.7.1",
     "lodash": "^4.17.23",
@@ -54,7 +57,7 @@
     "form-data": "^4.0.6",
     "socket.io-parser": "^4.2.7",
     "ip-address": "^10.5.0",
-    "shell-quote": "^1.10.0",
+    "shell-quote": "1.11.0",
     "linkify-it": "^6.1.0",
     "pdfjs-dist": "^6.2.108",
     "browserslist": "^4.28.7",

@@ -11,9 +11,17 @@
  *   mint(address,uint256)                                   0x40c10f19
  *     to      = a manifest-verified Avera deal token
  *
- * chainId must be exactly 8453, value exactly 0, calldata canonical with no
- * trailing bytes. Everything else is refused. No API route can change the
- * manifest; changing it is a Steward release/config change.
+ * chainId must be exactly the manifest's single pinned chain (8453 production;
+ * 84532 only for a separately deployed rehearsal), value exactly 0, calldata
+ * canonical with no trailing bytes. Everything else is refused. No API route
+ * can change the manifest; changing it is a Steward release/config change.
+ *
+ * Chain binding (B1): one manifest == one signer == ONE chain. A process
+ * installs exactly one manifest, so a protected signer can never sign or
+ * propose for any chain but the one its manifest names. The chainId is part
+ * of the manifest digest, so an 84532 manifest can never consume an 8453
+ * review/permit or vice versa. There is no multi-chain manifest and no
+ * per-request chain selection.
  *
  * Manifest source (env, read once at startup; absence == no protected signer):
  *   STEWARD_PROTECTED_MINTER_TENANT     tenant id (e.g. "strata")
@@ -24,6 +32,13 @@
  *                                       each `address@provenance` where
  *                                       provenance is the independently
  *                                       verified deploy tx hash / receipt ref
+ *   STEWARD_PROTECTED_MINTER_CHAIN_ID   OPTIONAL. Unset => 8453 (production,
+ *                                       byte-identical to before this knob
+ *                                       existed). If set it must be exactly
+ *                                       "8453" or "84532"; any other value
+ *                                       (empty, a list, another chain, hex)
+ *                                       is a malformed manifest and refuses
+ *                                       startup.
  *   STEWARD_PROTECTED_MINTER_APPROVERS  comma-separated stable user IDs (the
  *                                       `users.id` UUID) of the ONLY humans who
  *                                       may approve for this signer. Email is
@@ -62,7 +77,25 @@ import { encodeFunctionData, keccak256, parseAbi, stringToHex, toFunctionSelecto
 
 /** 2-of-3 Safe that holds DEFAULT_ADMIN_ROLE on every deal token. Fixed. */
 export const PROTECTED_MINTER_SAFE_ADMIN = "0x3Ea77cDf3eC33603bF4135bb1a36712B5e21d721";
+/** Production chain. The default and the only chain when no chain is configured. */
 export const PROTECTED_MINTER_CHAIN_ID = 8453;
+/** Base Sepolia rehearsal chain. Only reachable via an explicit, separately deployed manifest. */
+export const PROTECTED_MINTER_REHEARSAL_CHAIN_ID = 84532;
+export type ProtectedMinterChainId =
+  | typeof PROTECTED_MINTER_CHAIN_ID
+  | typeof PROTECTED_MINTER_REHEARSAL_CHAIN_ID;
+export const PROTECTED_MINTER_ALLOWED_CHAIN_IDS: readonly ProtectedMinterChainId[] = Object.freeze([
+  PROTECTED_MINTER_CHAIN_ID,
+  PROTECTED_MINTER_REHEARSAL_CHAIN_ID,
+]);
+
+export function isProtectedMinterChainId(v: unknown): v is ProtectedMinterChainId {
+  return (
+    typeof v === "number" &&
+    Number.isInteger(v) &&
+    (PROTECTED_MINTER_ALLOWED_CHAIN_IDS as readonly number[]).includes(v)
+  );
+}
 
 export const SELECTOR_CREATE_DEAL_TOKEN = toFunctionSelector(
   "createDealToken(string,string,address,address,bytes32)",
@@ -85,7 +118,8 @@ export interface ProtectedMinterManifest {
   tenantId: string;
   agentId: string;
   signerAddress: string;
-  chainId: 8453;
+  /** Exactly ONE chain. 8453 in production; 84532 only in the rehearsal deployment. */
+  chainId: ProtectedMinterChainId;
   safeAdmin: string;
   factories: string[];
   verifiedTokens: VerifiedToken[];
@@ -109,7 +143,13 @@ export function validateManifest(m: ProtectedMinterManifest): void {
   if (!ADDRESS_RE.test(m.signerAddress)) throw new Error("protected minter: bad signerAddress");
   if (lower(m.signerAddress) === ZERO_ADDRESS)
     throw new Error("protected minter: signerAddress is zero");
-  if (m.chainId !== PROTECTED_MINTER_CHAIN_ID) throw new Error("protected minter: chainId != 8453");
+  // B1: exactly one chain, and it must be a member of the fixed allowlist. A
+  // missing chain, an array ("two chains"), a string or any other chain id is
+  // a malformed manifest.
+  if (!isProtectedMinterChainId(m.chainId))
+    throw new Error(
+      `protected minter: chainId must be exactly one of ${PROTECTED_MINTER_ALLOWED_CHAIN_IDS.join("|")}`,
+    );
   if (lower(m.safeAdmin) !== lower(PROTECTED_MINTER_SAFE_ADMIN))
     throw new Error("protected minter: safeAdmin is not the fixed Safe");
   if (lower(m.safeAdmin) === lower(m.signerAddress))
@@ -160,6 +200,28 @@ function parseList(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/**
+ * B1: unset => production 8453 (unchanged behaviour). Set => must be the exact
+ * decimal string of ONE allowed chain. Anything else throws (malformed
+ * manifest => startup refused). Validation runs again in validateManifest.
+ */
+export function parseChainIdEnv(raw: string | undefined): ProtectedMinterChainId {
+  if (raw === undefined) return PROTECTED_MINTER_CHAIN_ID;
+  const allowed = PROTECTED_MINTER_ALLOWED_CHAIN_IDS.join("|");
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `protected minter: STEWARD_PROTECTED_MINTER_CHAIN_ID must be exactly one of ${allowed}`,
+    );
+  }
+  const n = Number(raw);
+  if (!isProtectedMinterChainId(n) || String(n) !== raw) {
+    throw new Error(
+      `protected minter: STEWARD_PROTECTED_MINTER_CHAIN_ID must be exactly one of ${allowed}`,
+    );
+  }
+  return n;
+}
+
 export function manifestFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): ProtectedMinterManifest | null {
@@ -173,7 +235,12 @@ export function manifestFromEnv(
     // an approvers-only (partial or malformed) config is fatal, never ignored.
     "STEWARD_PROTECTED_MINTER_APPROVERS",
   ];
-  if (!keys.some((k) => env[k] !== undefined && env[k] !== "")) return null;
+  // B1 / REVIEW-SF1-DELTA F1: the chain knob is an exact-string contract, so
+  // mere presence (even "" or whitespace) activates validation and is fatal
+  // when malformed. Only a truly unset key keeps the 8453 default. A chain-only
+  // env is a partial manifest and fatal, never ignored.
+  const chainPresent = env.STEWARD_PROTECTED_MINTER_CHAIN_ID !== undefined;
+  if (!chainPresent && !keys.some((k) => env[k] !== undefined && env[k] !== "")) return null;
   const tokens = parseList(env.STEWARD_PROTECTED_MINTER_TOKENS).map((entry) => {
     const [address, provenance] = entry.split("@");
     return { address: address ?? "", provenance: provenance ?? "" };
@@ -182,7 +249,7 @@ export function manifestFromEnv(
     tenantId: env.STEWARD_PROTECTED_MINTER_TENANT ?? "",
     agentId: env.STEWARD_PROTECTED_MINTER_AGENT ?? "",
     signerAddress: env.STEWARD_PROTECTED_MINTER_ADDRESS ?? "",
-    chainId: PROTECTED_MINTER_CHAIN_ID,
+    chainId: parseChainIdEnv(env.STEWARD_PROTECTED_MINTER_CHAIN_ID),
     safeAdmin: PROTECTED_MINTER_SAFE_ADMIN,
     factories: parseList(env.STEWARD_PROTECTED_MINTER_FACTORIES),
     verifiedTokens: tokens,
@@ -398,8 +465,9 @@ export function validateProtectedShape(
   manifest: ProtectedMinterManifest,
   tx: ProtectedTransactionShape & { executionRef?: string },
 ): ProtectedShapeResult {
-  if (typeof tx.chainId !== "number" || tx.chainId !== PROTECTED_MINTER_CHAIN_ID) {
-    return { ok: false, reason: `chainId must be exactly ${PROTECTED_MINTER_CHAIN_ID}` };
+  // B1: bound to the manifest's single chain, never to a global constant.
+  if (typeof tx.chainId !== "number" || tx.chainId !== manifest.chainId) {
+    return { ok: false, reason: `chainId must be exactly ${manifest.chainId}` };
   }
   let value: bigint;
   try {
