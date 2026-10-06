@@ -175,12 +175,13 @@ agentRoutes.post("/protected", async (c) => {
   }
   const name = isNonEmptyString(body.name) ? body.name : body.id;
 
-  // One key per identity: an existing row (protected or not) is never
-  // regenerated, rebound or upgraded through this route.
+  // One key per identity: an existing row (protected or not, in ANY tenant;
+  // agent ids are globally unique) is never regenerated, rebound or upgraded
+  // through this route, and another tenant cannot squat the id.
   const [existing] = await db
     .select({ id: agents.id })
     .from(agents)
-    .where(and(eq(agents.id, body.id), eq(agents.tenantId, tenantId)));
+    .where(eq(agents.id, body.id));
   if (existing) {
     return c.json<ApiResponse>(
       { ok: false, error: "Protected signer: agent id already exists; keys are never regenerated" },
