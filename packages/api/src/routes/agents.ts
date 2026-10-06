@@ -123,6 +123,100 @@ agentRoutes.post("/", async (c) => {
   }
 });
 
+// ─── Create PROTECTED, INERT signer (STRATA-1499 SF-1 ceremony) ───────────────
+//
+// Admin-only bootstrap for the protected-minter ceremony:
+//   create protected+inert -> obtain address -> install manifest pinned to that
+//   exact address (env/startup only) -> verify -> activate -> Safe grant (human).
+//
+// The row is persisted with `protected=true` in the SAME transaction as its
+// key material (vault.createAgent). Until a manifest exactly covers it (tenant
+// + agent + this address) it is quarantined: every sign/export/import/proxy/
+// token/wallet path refuses it (protectedBearerGuard, protectedAgentDispatch,
+// Vault assertProtectedPostureIntact). No route can clear the marker. The
+// response carries only what the manifest needs: stable id + EVM address.
+// Nothing here funds, grants roles, dials RPC or touches a Safe.
+
+export interface ProtectedSignerBootstrap {
+  id: string;
+  tenantId: string;
+  walletAddress: string;
+  protected: true;
+  status: "inert";
+}
+
+agentRoutes.post("/protected", async (c) => {
+  const tenantId = c.get("tenantId");
+  // Human owner/admin session ONLY: tenant API keys, agent tokens, dashboard
+  // JWTs and application principals are refused before any key is generated.
+  const adminUserId = requireHumanOwnerAdmin(c);
+  if (!adminUserId) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: "Protected signer: creation requires a human owner/admin session",
+      },
+      403,
+    );
+  }
+
+  const body = await safeJsonParse<{ id: string; name?: string }>(c);
+  if (!body) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
+  }
+  if (!isValidAgentId(body.id)) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: "Invalid agent id — must be 1-128 alphanumeric characters (plus _ - . :)",
+      },
+      400,
+    );
+  }
+  const name = isNonEmptyString(body.name) ? body.name : body.id;
+
+  // One key per identity: an existing row (protected or not) is never
+  // regenerated, rebound or upgraded through this route.
+  const [existing] = await db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.id, body.id), eq(agents.tenantId, tenantId)));
+  if (existing) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: agent id already exists; keys are never regenerated" },
+      409,
+    );
+  }
+
+  try {
+    const identity = await vault.createAgent(tenantId, body.id, name, undefined, undefined, {
+      protected: true,
+    });
+    trackAuditEvent({
+      tenantId,
+      actorType: "user",
+      actorId: adminUserId,
+      action: "agent.create_protected",
+      resourceType: "agent",
+      resourceId: body.id,
+      metadata: { name, walletAddress: identity.walletAddress, status: "inert" },
+      ipAddress: c.req.header("x-forwarded-for") ?? null,
+      userAgent: c.req.header("user-agent") ?? null,
+      requestId: c.get("requestId") ?? null,
+    });
+    const data: ProtectedSignerBootstrap = {
+      id: identity.id,
+      tenantId: identity.tenantId,
+      walletAddress: identity.walletAddress,
+      protected: true,
+      status: "inert",
+    };
+    return c.json<ApiResponse<ProtectedSignerBootstrap>>({ ok: true, data }, 201);
+  } catch (e: unknown) {
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 400);
+  }
+});
+
 // ─── List agents ──────────────────────────────────────────────────────────────
 
 agentRoutes.get("/", async (c) => {
