@@ -19,15 +19,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it, type Mock, spyOn } from "bun:test";
 import { generateApiKey, signAccessToken, signAgentToken } from "@stwd/auth";
-import {
-  approvalQueue,
-  closeDb,
-  getDb,
-  tenants,
-  transactions,
-  users,
-  userTenants,
-} from "@stwd/db";
+import { approvalQueue, closeDb, getDb, tenants, transactions, users, userTenants } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
 import { eq } from "drizzle-orm";
 import type { Hono } from "hono";
@@ -60,22 +52,36 @@ const rootHeaders = () => ({
   "X-Steward-Tenant": TENANT,
   "X-Steward-Key": rootKey,
 });
-const bearer = (t: string) => ({ "Content-Type": "application/json", Authorization: `Bearer ${t}` });
+const bearer = (t: string) => ({
+  "Content-Type": "application/json",
+  Authorization: `Bearer ${t}`,
+});
 
 function mintCalldata(to = RECIPIENT, amount = 1000n * 10n ** 18n) {
-  return encodeFunctionData({ abi: TOKEN_ABI, functionName: "mint", args: [to as `0x${string}`, amount] });
+  return encodeFunctionData({
+    abi: TOKEN_ABI,
+    functionName: "mint",
+    args: [to as `0x${string}`, amount],
+  });
 }
 async function sign(body: Record<string, unknown>, headers: Record<string, string>) {
-  return app.request(`/vault/${AGENT}/sign`, { method: "POST", headers, body: JSON.stringify(body) });
+  return app.request(`/vault/${AGENT}/sign`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
 }
-async function approve(txId: string, headers: Record<string, string>, body: Record<string, unknown>) {
+async function approve(
+  txId: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+) {
   return app.request(`/vault/${AGENT}/approve/${txId}`, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
   });
 }
-// biome-ignore lint/suspicious/noExplicitAny: test helper
 async function json<T = any>(r: Response): Promise<T> {
   return (await r.json()) as T;
 }
@@ -168,7 +174,25 @@ describe("B1 unit: one manifest, exactly one chain", () => {
   });
 
   it("env: no chain, two chains, another chain, hex, padded, signed => malformed manifest", () => {
-    for (const raw of ["", " ", "8453,84532", "84532,8453", "8453 84532", "1", "0x2105", "0x14a34", "08453", " 8453", "8453 ", "+8453", "-8453", "8453.0", "1e4", "NaN", "undefined"]) {
+    for (const raw of [
+      "",
+      " ",
+      "8453,84532",
+      "84532,8453",
+      "8453 84532",
+      "1",
+      "0x2105",
+      "0x14a34",
+      "08453",
+      " 8453",
+      "8453 ",
+      "+8453",
+      "-8453",
+      "8453.0",
+      "1e4",
+      "NaN",
+      "undefined",
+    ]) {
       expect(() => boundary.parseChainIdEnv(raw)).toThrow(/must be exactly one of 8453\|84532/);
     }
   });
@@ -183,19 +207,44 @@ describe("B1 unit: one manifest, exactly one chain", () => {
       STEWARD_PROTECTED_MINTER_APPROVERS: OWNER_USER,
     };
     expect(boundary.manifestFromEnv(env)?.chainId).toBe(8453);
-    expect(boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: "8453" })?.chainId).toBe(8453);
-    expect(boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: "84532" })?.chainId).toBe(84532);
+    expect(
+      boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: "8453" })?.chainId,
+    ).toBe(8453);
+    expect(
+      boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: "84532" })?.chainId,
+    ).toBe(84532);
     for (const bad of ["", "8453,84532", "1", "0x2105"]) {
-      expect(() => boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: bad })).toThrow();
+      expect(() =>
+        boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: bad }),
+      ).toThrow();
     }
     // The chain knob alone still activates validation (R5-F1 posture kept): a
     // chain-only env is a partial manifest and fatal, not ignored.
-    expect(() => boundary.manifestFromEnv({ STEWARD_PROTECTED_MINTER_CHAIN_ID: "84532" })).toThrow();
+    expect(() =>
+      boundary.manifestFromEnv({ STEWARD_PROTECTED_MINTER_CHAIN_ID: "84532" }),
+    ).toThrow();
   });
 
   it("validateManifest: missing chain, null, string, array of two chains, other chain all refused", () => {
-    for (const chain of [undefined, null, "8453", "84532", [8453, 84532], [8453], 1, 0, 8453.5, NaN, 10, 42161, 84531, {}]) {
-      expect(() => boundary.validateManifest(baseManifest(chain))).toThrow(/chainId must be exactly one of/);
+    for (const chain of [
+      undefined,
+      null,
+      "8453",
+      "84532",
+      [8453, 84532],
+      [8453],
+      1,
+      0,
+      8453.5,
+      NaN,
+      10,
+      42161,
+      84531,
+      {},
+    ]) {
+      expect(() => boundary.validateManifest(baseManifest(chain))).toThrow(
+        /chainId must be exactly one of/,
+      );
     }
     expect(() => boundary.validateManifest(baseManifest(8453))).not.toThrow();
     expect(() => boundary.validateManifest(baseManifest(84532))).not.toThrow();
@@ -204,7 +253,12 @@ describe("B1 unit: one manifest, exactly one chain", () => {
   it("validateProtectedShape is bound to the manifest chain in BOTH directions", () => {
     const m8453 = baseManifest(8453);
     const m84532 = baseManifest(84532);
-    const tx = (chainId: unknown) => ({ chainId: chainId as number, to: TOKEN, value: "0", data: mintCalldata() });
+    const tx = (chainId: unknown) => ({
+      chainId: chainId as number,
+      to: TOKEN,
+      value: "0",
+      data: mintCalldata(),
+    });
     expect(boundary.validateProtectedShape(m8453, tx(8453)).ok).toBe(true);
     expect(boundary.validateProtectedShape(m84532, tx(84532)).ok).toBe(true);
     const a = boundary.validateProtectedShape(m8453, tx(84532));

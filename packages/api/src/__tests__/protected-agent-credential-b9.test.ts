@@ -60,7 +60,10 @@ const rootHeaders = (key = rootKey, tenant = TENANT) => ({
   "X-Steward-Tenant": tenant,
   "X-Steward-Key": key,
 });
-const bearer = (t: string) => ({ "Content-Type": "application/json", Authorization: `Bearer ${t}` });
+const bearer = (t: string) => ({
+  "Content-Type": "application/json",
+  Authorization: `Bearer ${t}`,
+});
 
 function mintCalldata() {
   return encodeFunctionData({
@@ -69,12 +72,21 @@ function mintCalldata() {
     args: [RECIPIENT as `0x${string}`, 1000n * 10n ** 18n],
   });
 }
-const validBody = () => ({ to: TOKEN, value: "0", data: mintCalldata(), chainId: 8453, executionRef: ref() });
+const validBody = () => ({
+  to: TOKEN,
+  value: "0",
+  data: mintCalldata(),
+  chainId: 8453,
+  executionRef: ref(),
+});
 
 async function sign(agent: string, headers: Record<string, string>, body = validBody()) {
-  return app.request(`/vault/${agent}/sign`, { method: "POST", headers, body: JSON.stringify(body) });
+  return app.request(`/vault/${agent}/sign`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
 }
-// biome-ignore lint/suspicious/noExplicitAny: test helper
 async function json<T = any>(r: Response): Promise<T> {
   return (await r.json()) as T;
 }
@@ -152,7 +164,11 @@ afterAll(async () => {
 describe("B9: issuance of the protected agent's own credential", () => {
   it("tenant API key and agent tokens cannot issue it; api:proxy refused; human owner issues scope=agent", async () => {
     const issue = (headers: Record<string, string>, body: unknown = {}) =>
-      app.request(`/agents/${AGENT}/token`, { method: "POST", headers, body: JSON.stringify(body) });
+      app.request(`/agents/${AGENT}/token`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
 
     expect((await issue(rootHeaders())).status).toBe(403);
     expect((await issue(bearer(otherAgentJwt))).status).toBe(403);
@@ -182,8 +198,12 @@ describe("B9: issuance of the protected agent's own credential", () => {
     expect(r.status).toBe(202);
     expect((await json(r)).data.status).toBe("pending_approval");
     // allowlisted reads
-    expect((await app.request(`/agents/${AGENT}`, { headers: bearer(issuedAgentJwt) })).status).toBe(200);
-    expect((await app.request(`/vault/${AGENT}/addresses`, { headers: bearer(issuedAgentJwt) })).status).toBe(200);
+    expect(
+      (await app.request(`/agents/${AGENT}`, { headers: bearer(issuedAgentJwt) })).status,
+    ).toBe(200);
+    expect(
+      (await app.request(`/vault/${AGENT}/addresses`, { headers: bearer(issuedAgentJwt) })).status,
+    ).toBe(200);
     // outside the allowlist: 403 before any handler
     for (const [method, path] of [
       ["GET", "/agents"],
@@ -192,7 +212,11 @@ describe("B9: issuance of the protected agent's own credential", () => {
       ["GET", `/agents/${OTHER_AGENT}`],
       ["GET", "/health"],
     ] as const) {
-      const r2 = await app.request(path, { method, headers: bearer(issuedAgentJwt), body: method === "POST" ? "{}" : undefined });
+      const r2 = await app.request(path, {
+        method,
+        headers: bearer(issuedAgentJwt),
+        body: method === "POST" ? "{}" : undefined,
+      });
       expect(r2.status).toBe(403);
     }
   });
@@ -248,10 +272,16 @@ describe("B9: agent A's credential cannot propose for agent B", () => {
     const before = await pendingCount(AGENT);
     expect((await sign(AGENT, bearer(crossTenant))).status).not.toBe(202);
     // A agent-token minted with B's agentId but presented against A's path.
-    const bAsA = await signAgentToken({ agentId: OTHER_AGENT, tenantId: TENANT, scopes: ["agent", "api:proxy"] }, "1h");
+    const bAsA = await signAgentToken(
+      { agentId: OTHER_AGENT, tenantId: TENANT, scopes: ["agent", "api:proxy"] },
+      "1h",
+    );
     expect((await sign(AGENT, bearer(bAsA))).status).toBe(403);
     // A token missing the agent scope marker is not an agent credential at all.
-    const noScope = await signAccessToken({ address: `0x${"2".repeat(40)}`, tenantId: TENANT, userId: crypto.randomUUID() } as never, "1h");
+    const noScope = await signAccessToken(
+      { address: `0x${"2".repeat(40)}`, tenantId: TENANT, userId: crypto.randomUUID() } as never,
+      "1h",
+    );
     expect((await sign(AGENT, bearer(noScope))).status).not.toBe(202);
     expect(await pendingCount(AGENT)).toBe(before);
   });
