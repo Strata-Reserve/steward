@@ -135,7 +135,10 @@ export const AUDIT_EXCEPTIONS: readonly AuditException[] = [
       "the runtime image package allowlist changes",
       "the reachability checker changes or fails",
     ],
-    expectedAbsentFromAudit: false,
+    // STRATA-1499: remediated by root override vite@7.3.5 (first patched for
+    // GHSA-fx2h-pf6j-xcff); entry kept as a deliberate cleanup marker until
+    // the next registry review deletes it.
+    expectedAbsentFromAudit: true,
   },
   {
     // STRATA-1494. TEMPORARY CLASS B acceptance approved by JJ (#development,
