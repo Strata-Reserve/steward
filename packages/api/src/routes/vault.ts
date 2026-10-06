@@ -116,16 +116,19 @@ async function handleProtectedSign(
   if (!executionRef) {
     return protectedRefused(c, "executionRef is required", 400);
   }
-  if (rawRequest.chainId !== 8453) {
-    return protectedRefused(c, "chainId must be exactly 8453");
-  }
   const manifest = getProtectedMinterManifest();
   if (!manifest) return protectedRefused(c, "manifest not installed");
+  // B1: the proposal chain is the manifest's single pinned chain (8453 in
+  // production). A request for any other chain, including the rehearsal
+  // chain against a production manifest and vice versa, is refused here.
+  if (rawRequest.chainId !== manifest.chainId) {
+    return protectedRefused(c, `chainId must be exactly ${manifest.chainId}`);
+  }
 
   const to = String(rawRequest.to);
   const value = String(rawRequest.value);
   const data = typeof rawRequest.data === "string" ? rawRequest.data : undefined;
-  const chainId = 8453;
+  const chainId: number = manifest.chainId;
 
   const incoming = normalizeSignPayload({ to, value, data, chainId });
   const existing = await findByExecutionRef(tenantId, agentId, executionRef);
