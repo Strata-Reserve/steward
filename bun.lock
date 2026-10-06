@@ -225,6 +225,7 @@
       },
       "devDependencies": {
         "@simplewebauthn/browser": "^13.0.0",
+        "@types/node": "^22.0.0",
       },
     },
     "packages/seed": {
