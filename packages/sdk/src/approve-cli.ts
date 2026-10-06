@@ -37,7 +37,7 @@ export interface ApproveCliEnv {
   STEWARD_TENANT_ID?: string;
   STEWARD_APPROVER_ALLOWLIST?: string;
   STEWARD_APPROVER_EMAIL?: string;
-  /** Optional claimed user ID, for allowlists pinned by ID; re-verified against the session after login. */
+  /** Optional claimed user ID for ID-pinned allowlists. The pre-network check on it is a convenience, not a control: the server-returned identity is re-checked after login and the server enforces the approver list itself. */
   STEWARD_APPROVER_USER_ID?: string;
 }
 
@@ -175,7 +175,7 @@ export async function runApproveCli(
   }
 
   function fail(label: string, status: number): number {
-    io.err(`${label} failed: HTTP ${status}`);
+    io.err(`${label} failed: ${status === 0 ? "network error" : `HTTP ${status}`}`);
     return EXIT.FAIL;
   }
 
@@ -213,7 +213,8 @@ export async function runApproveCli(
   const first = await fetchPending();
   if (typeof first === "number") return first;
   if (cmd === "pending") {
-    if (first.length === 0) io.out("no pending protected actions");
+    if (first.length === 0)
+      io.out("no pending protected actions (rows without reviewDigest are ignored)");
     first.forEach((item, i) => {
       io.out(`--- pending #${i + 1} ---`);
       for (const line of renderPending(item)) io.out(line);
