@@ -15,7 +15,9 @@ import {
   getTenantPayload,
   isNonEmptyString,
   isValidTenantId,
+  POLICY_WRITE_FORBIDDEN_ERROR,
   type PolicyRule,
+  requirePolicyWriteAuthority,
   safeJsonParse,
   type Tenant,
   type TenantConfig,
@@ -141,6 +143,15 @@ tenantRoutes.put("/:id/webhook", requireTenantId, async (c) => {
 
   if (body.defaultPolicies !== undefined && !Array.isArray(body.defaultPolicies)) {
     return c.json<ApiResponse>({ ok: false, error: "defaultPolicies must be an array" }, 400);
+  }
+
+  // Tenant defaultPolicies are the fallback policy set applied to any agent with
+  // no per-agent rows (see getPolicySet), so writing them is a policy write and
+  // needs owner/admin session authority — not merely a tenant key. Gate only
+  // when the caller is actually changing defaultPolicies; a webhook-only update
+  // stays at tenant-level.
+  if (body.defaultPolicies !== undefined && !requirePolicyWriteAuthority(c)) {
+    return c.json<ApiResponse>({ ok: false, error: POLICY_WRITE_FORBIDDEN_ERROR }, 403);
   }
 
   const updatedConfig: TenantConfig = {

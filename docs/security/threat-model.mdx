@@ -132,16 +132,22 @@ problem is semantic, not authentication.
 - API scope: agent tokens can be issued with specific scopes; the
   LLM cannot call admin routes with an agent token.
 
-**What Steward does NOT defend:**
+**What Steward now enforces by default (STRATA-1499):**
 
-- **Policies that aren't configured.** If the operator did not set a
-  `spending-limit`, the LLM can drain up to the on-chain balance
-  within one transaction. The policy engine's "no policies ⇒
-  everything auto-approved" behavior (`engine.ts` line ~35) is
-  documented-as-dangerous but still permissive.
+- **No policy ⇒ no authority (fail-closed).** An agent with an empty
+  policy set, or a set whose every rule is disabled, is **denied** on
+  every signing request — the inverse of the old "no policies ⇒
+  everything auto-approved" default. Disabling all rules is therefore
+  not equivalent to an allow-all. A missing policy is now an implicit
+  **deny**, not an implicit allow.
+
+**What Steward still does NOT defend:**
+
 - **Scopes granted too broadly.** An agent token with
-  "sign on any chain, for any address" is bounded only by the
-  policies attached to it. A missing policy ≠ an implicit deny.
+  "sign on any chain, for any address" is still bounded only by the
+  policies attached to it. Fail-closed means the agent cannot sign at
+  all until at least one enabling policy exists, but a broad enabling
+  policy is still broad.
 - **Transactions inside policy bounds.** A $99 malicious withdrawal
   to a policy-allowed address passes. Policies constrain the
   envelope; they do not distinguish legitimate from illegitimate
@@ -149,9 +155,12 @@ problem is semantic, not authentication.
 
 **Mitigation (operator):**
 
+- Seed every agent with its policy set **before** it is expected to
+  sign; under fail-closed it can do nothing until then.
 - Always configure at least one spending limit on every agent.
-- Use approved-address lists for agents that should only interact
-  with known counterparties.
+- Use approved-address lists (and `contract-allowlist`, where
+  available) for agents that should only interact with known
+  counterparties.
 - Set auto-approve thresholds low enough that surprising
   transactions require a human.
 - Prefer many narrow agents with tight scopes over one all-powerful

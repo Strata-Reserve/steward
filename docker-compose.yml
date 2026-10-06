@@ -58,6 +58,10 @@ services:
       STEWARD_AUDIT_HMAC_KEY: "${STEWARD_AUDIT_HMAC_KEY:-}"
       SIWE_ALLOWED_DOMAINS: "${SIWE_ALLOWED_DOMAINS:-}"
       STEWARD_ALLOW_INSECURE_DB: "${STEWARD_ALLOW_INSECURE_DB:-}"
+      # Default off. When "true", tenant API keys (never agent tokens) may perform
+      # policy / key-material writes. Prod should leave this unset; use an
+      # owner/admin session instead (STRATA-1499).
+      STEWARD_ALLOW_API_KEY_POLICY_WRITES: "${STEWARD_ALLOW_API_KEY_POLICY_WRITES:-}"
     ports:
       - "127.0.0.1:${PORT:-3200}:3200"
     healthcheck:

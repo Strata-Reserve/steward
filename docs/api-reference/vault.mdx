@@ -334,7 +334,7 @@ Import an existing private key into the vault.
 POST /vault/:agentId/import
 ```
 
-**Auth:** Tenant API key only
+**Auth:** Owner/admin session only. Tenant API keys are rejected unless `STEWARD_ALLOW_API_KEY_POLICY_WRITES=true` is set; agent JWTs are never permitted (STRATA-1499).
 
 **Request Body:**
 

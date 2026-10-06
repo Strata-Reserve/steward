@@ -166,6 +166,9 @@ jobs:
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          # Scripted-operator policy seeding via tenant key (STRATA-1499). Set on
+          # the server only; the in-process `bun test` runner stays default-off.
+          STEWARD_ALLOW_API_KEY_POLICY_WRITES: "true"
         run: |
           bun run packages/api/src/index.ts > /tmp/steward-api-integration.log 2>&1 &
           echo $! > /tmp/steward-api-integration.pid
@@ -233,6 +236,7 @@ jobs:
           STEWARD_PLATFORM_KEYS: "ci-platform-key"
           STEWARD_JWT_SECRET: "ci-jwt-secret-must-be-at-least-32-chars-long"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          STEWARD_ALLOW_API_KEY_POLICY_WRITES: "true"
           # Deterministic email capture for the OTP-gated passkey smoke flow:
           # exposes the mock inbox at GET /auth/test/inbox/:email so the smoke
           # test can read the emailed 6-digit OTP code. Non-production only
@@ -296,6 +300,7 @@ jobs:
           STEWARD_KDF_SALT: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           STEWARD_ALLOW_INSECURE_DB: "true"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          STEWARD_ALLOW_API_KEY_POLICY_WRITES: "true"
           PORT: "3200"
           STEWARD_PROXY_PORT: "8080"
         run: |

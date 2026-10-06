@@ -9,10 +9,28 @@ The Policy Engine evaluates declarative policies before every agent action. It e
 
 ## Design Principles
 
-- **Default deny** — new agents can't do anything until policies are assigned
+- **Default deny (fail-closed)** — new agents can't do anything until policies are assigned. An agent with **no policies**, or one whose policies are **all disabled**, is denied on every signing request. Disabling every rule is not an allow-all; it is treated exactly like having no rules. At least one *enabled* rule that passes is required to approve.
 - **Declarative** — JSON-based policy definitions, no custom DSL to learn
 - **Composable** — multiple policies evaluated in order; ALL must pass
 - **Fast** — < 5ms evaluation, cached in Redis
+
+## Who can change policies
+
+Writing an agent's policy set, or exporting/importing its key material, is a
+privileged operation. By default these require a **human owner/admin session**
+(a dashboard/session JWT whose tenant role is `owner` or `admin`):
+
+- `PUT /agents/:agentId/policies`
+- `POST /agents/batch` (when `applyPolicies` is supplied)
+- `POST /policies/:id/assign` and template `apply`
+- tenant `defaultPolicies` writes
+- `POST /vault/:agentId/export` and `POST /vault/:agentId/import`
+
+A **tenant API key** is rejected on these routes unless the operator explicitly
+sets `STEWARD_ALLOW_API_KEY_POLICY_WRITES=true` (off by default, intended only
+for scripted operator seeding). An **agent token is never** permitted on these
+routes, even with the opt-in. This closes the path where a single signing
+credential could also rewrite the policies that bound it, or export its own key.
 
 ## Policy Types
 

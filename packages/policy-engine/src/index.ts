@@ -7,7 +7,7 @@ export type {
   ProxySimulationRequest,
   TransactionSimulationRequest,
 } from "./engine";
-export { PolicyEngine } from "./engine";
+export { NO_EFFECTIVE_POLICY_RESULT, PolicyEngine } from "./engine";
 export type { EvaluatorContext } from "./evaluators";
 export { evaluatePolicy } from "./evaluators";
 export type { LeverageCapContext } from "./evaluators/leverage-cap";

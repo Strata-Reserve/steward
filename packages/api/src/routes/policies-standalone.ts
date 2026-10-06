@@ -13,10 +13,12 @@ import {
   db,
   ensureAgentForTenant,
   isNonEmptyString,
+  POLICY_WRITE_FORBIDDEN_ERROR,
   type PolicyRule,
   policies,
   policyEngine,
   priceOracle,
+  requirePolicyWriteAuthority,
   requireTenantLevel,
   safeJsonParse,
   toPolicyRule,
@@ -358,11 +360,10 @@ policiesStandaloneRoutes.post("/:id/assign", async (c) => {
   const tenantId = c.get("tenantId");
   const id = c.req.param("id");
 
-  if (!requireTenantLevel(c)) {
-    return c.json<ApiResponse>(
-      { ok: false, error: "Agent tokens cannot assign policy templates" },
-      403,
-    );
+  // Assigning a template rewrites agents' policy sets — a policy write that
+  // needs owner/admin session authority, not merely a tenant key.
+  if (!requirePolicyWriteAuthority(c)) {
+    return c.json<ApiResponse>({ ok: false, error: POLICY_WRITE_FORBIDDEN_ERROR }, 403);
   }
 
   const body = await safeJsonParse<AssignBody>(c);
