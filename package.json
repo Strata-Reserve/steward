@@ -37,6 +37,9 @@
   },
   "//overrides": "Transitive CVE pins. Each entry corresponds to one or more GHSA advisories surfaced by `bun audit`; bump (or remove) once upstream parents publish fixed releases. See docs/security/threat-model.mdx#known-accepted-cves for details.",
   "overrides": {
+    "source-map-js": "^1.2.2",
+    "tinypool": "2.1.2",
+    "vite": "7.3.5",
     "axios": "^1.20.0",
     "langsmith": "^0.7.1",
     "lodash": "^4.17.23",
