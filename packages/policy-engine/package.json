@@ -10,7 +10,8 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@stwd/shared": "workspace:*"
+    "@stwd/shared": "workspace:*",
+    "viem": "^2.30.0"
   },
   "description": "Composable policy evaluation engine — spending limits, address filters, rate limits, time windows"
 }

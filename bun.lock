@@ -124,6 +124,7 @@
       "version": "0.4.0",
       "dependencies": {
         "@stwd/shared": "workspace:*",
+        "viem": "^2.30.0",
       },
     },
     "packages/proxy": {

@@ -11,6 +11,7 @@ import {
   type TimeWindowConfig,
   toCaip2,
 } from "@stwd/shared";
+import { evaluateContractAllowlist } from "./evaluators/contract-allowlist";
 import { evaluateLeverageCap } from "./evaluators/leverage-cap";
 import { evaluateReputationScaling } from "./evaluators/reputation-scaling";
 import { evaluateReputationThreshold } from "./evaluators/reputation-threshold";
@@ -90,6 +91,12 @@ export async function evaluatePolicy(
       return evaluateVenueAllowlist(rule, { venue: ctx.venue });
     case "leverage-cap":
       return evaluateLeverageCap(rule, { leverage: ctx.leverage });
+    case "contract-allowlist":
+      return evaluateContractAllowlist(rule, {
+        to: ctx.request.to,
+        value: ctx.request.value,
+        data: ctx.request.data,
+      });
     default:
       return {
         policyId: rule.id,

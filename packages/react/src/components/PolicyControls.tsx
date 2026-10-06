@@ -13,6 +13,9 @@ const DEFAULT_LABELS: Record<PolicyType, string> = {
   "allowed-chains": "Allowed Chains",
   "reputation-threshold": "Reputation Threshold",
   "reputation-scaling": "Reputation Scaling",
+  "venue-allowlist": "Venue Allowlist",
+  "leverage-cap": "Leverage Cap",
+  "contract-allowlist": "Contract Allowlist",
 };
 
 const POLICY_DESCRIPTIONS: Record<PolicyType, string> = {
@@ -24,9 +27,26 @@ const POLICY_DESCRIPTIONS: Record<PolicyType, string> = {
   "allowed-chains": "Restrict which blockchain networks can be used.",
   "reputation-threshold": "Require a minimum reputation score before an action can proceed.",
   "reputation-scaling": "Scale the allowed transaction size based on the current reputation score.",
+  "venue-allowlist": "Allow trading only on the listed venues.",
+  "leverage-cap": "Cap the leverage an agent may request on a trade.",
+  "contract-allowlist":
+    "Restrict signing to listed contracts and function selectors, with optional argument caps.",
 };
 
-const ALL_POLICY_TYPES = Object.keys(DEFAULT_LABELS) as PolicyType[];
+// Types rendered by this component. Policies without a config editor
+// (venue-allowlist, leverage-cap, contract-allowlist) are deliberately not
+// listed: a bare toggle would submit an empty config, which the API rejects
+// for contract-allowlist. Manage those via the SDK/API until editors exist.
+const ALL_POLICY_TYPES: PolicyType[] = [
+  "spending-limit",
+  "approved-addresses",
+  "auto-approve-threshold",
+  "time-window",
+  "rate-limit",
+  "allowed-chains",
+  "reputation-threshold",
+  "reputation-scaling",
+];
 
 /**
  * Human-friendly policy toggles. Respects tenant exposure config.
