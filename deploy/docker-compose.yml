@@ -28,6 +28,10 @@ services:
       STEWARD_JWT_SECRET: "${STEWARD_JWT_SECRET:-}"
       STEWARD_PLATFORM_KEYS: "${STEWARD_PLATFORM_KEYS:-}"
       RPC_URL: "${RPC_URL:-https://mainnet.base.org}"
+      # STRATA-1499: REQUIRED for Base (8453 / 84532). Explicit https endpoint only;
+      # the vault has no fallback to RPC_URL or a public URL. Set in .env.
+      RPC_URL_8453: "${RPC_URL_8453:-}"
+      RPC_URL_84532: "${RPC_URL_84532:-}"
       CHAIN_ID: "${CHAIN_ID:-8453}"
       STEWARD_PLATFORM_KEY: "${STEWARD_PLATFORM_KEY:-}"
       SOLANA_RPC_URL: "${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}"

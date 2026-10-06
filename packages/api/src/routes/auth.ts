@@ -76,7 +76,7 @@ import {
   userTenants,
 } from "@stwd/db";
 import type { ApiResponse } from "@stwd/shared";
-import { KeyStore, provisionUserWallet, Vault } from "@stwd/vault";
+import { chainRpcUrlsFromEnv, KeyStore, provisionUserWallet, Vault } from "@stwd/vault";
 import bs58 from "bs58";
 import { and, eq, gte, lt } from "drizzle-orm";
 import { type Context, Hono } from "hono";
@@ -84,7 +84,27 @@ import { generateNonce, SiweMessage } from "siwe";
 import { getAddress, verifyMessage as viemVerifyMessage } from "viem";
 import { trackAuditEvent } from "../services/audit";
 import { verifyEip1271 } from "../services/eip1271";
+import {
+  isPersistedProtectedAgent,
+  isProtectedMinterAgentId,
+} from "../services/prod-minter-boundary";
 import { getGracedSuccessor, rememberRotation } from "../services/refresh-rotation-grace";
+
+/**
+ * STRATA-1499 (REVIEW-STEWARD-28-R2 R2-3): /auth/session and /auth/logout
+ * must never handle the protected signer identity. The global bearer guard
+ * already 403s it before routing; this is the in-handler backstop.
+ */
+async function isProtectedAgentPayload(payload: {
+  scope?: unknown;
+  agentId?: unknown;
+}): Promise<boolean> {
+  if (payload.scope !== "agent" || typeof payload.agentId !== "string" || !payload.agentId)
+    return false;
+  return (
+    isProtectedMinterAgentId(payload.agentId) || (await isPersistedProtectedAgent(payload.agentId))
+  );
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -843,6 +863,9 @@ function getVault(): Vault {
     masterPassword,
     rpcUrl: process.env.RPC_URL || "https://sepolia.base.org",
     chainId: parseInt(process.env.CHAIN_ID || "84532", 10),
+    // STRATA-1499: explicit per-chain endpoints (RPC_URL_8453 / RPC_URL_84532).
+    // Base chains never fall back to RPC_URL or a public endpoint.
+    chainRpcUrls: chainRpcUrlsFromEnv(),
   });
 }
 
@@ -1780,6 +1803,12 @@ auth.get("/session", async (c) => {
   const token = authHeader.slice(7);
   const payload = await verifySessionToken(token);
   if (!payload) return c.json({ authenticated: false });
+  if (await isProtectedAgentPayload(payload as { scope?: unknown; agentId?: unknown })) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: this credential has no session" },
+      403,
+    );
+  }
 
   return c.json({
     authenticated: true,
@@ -1805,7 +1834,15 @@ auth.post("/logout", async (c) => {
         exp?: number;
         userId?: string;
         tenantId?: string;
+        scope?: unknown;
+        agentId?: unknown;
       };
+      if (await isProtectedAgentPayload(payload)) {
+        return c.json<ApiResponse>(
+          { ok: false, error: "Protected signer: this credential cannot be logged out" },
+          403,
+        );
+      }
       if (typeof payload.jti === "string" && typeof payload.exp === "number") {
         await revocationStore.revokeToken(payload.jti, payload.exp);
         auditCtx = {

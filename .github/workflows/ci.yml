@@ -296,6 +296,9 @@ jobs:
           STEWARD_KDF_SALT: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           STEWARD_ALLOW_INSECURE_DB: "true"
           SIWE_ALLOWED_DOMAINS: "steward.fi,localhost"
+          # STRATA-1499: explicit Base endpoints are test config, not a code fallback.
+          RPC_URL_8453: "https://mainnet.base.org"
+          RPC_URL_84532: "https://sepolia.base.org"
           PORT: "3200"
           STEWARD_PROXY_PORT: "8080"
         run: |

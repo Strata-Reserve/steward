@@ -18,6 +18,10 @@ FROM oven/bun:1.3-alpine
 WORKDIR /app
 COPY --from=builder /app/package.json /app/bun.lock* /app/bunfig.toml* /app/turbo.json ./
 COPY --from=builder /app/packages/ packages/
+# STRATA-1499 (REVIEW-STEWARD-27 F3): agent-trader is a standalone bot, not
+# reachable from the API/proxy call graph. Keep its manifest (workspace link)
+# but drop its source so its RPC fallback never ships in this runtime image.
+RUN rm -rf packages/agent-trader/src
 COPY --from=builder /app/node_modules/ node_modules/
 
 ENV PORT=3200 NODE_ENV=production

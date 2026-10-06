@@ -27,6 +27,7 @@ import {
   parseAgentTokenScopes,
   policies,
   requireAgentAccess,
+  requireHumanOwnerAdmin,
   requireTenantLevel,
   safeJsonParse,
   sanitizeErrorMessage,
@@ -34,6 +35,7 @@ import {
   transactions,
   vault,
 } from "../services/context";
+import { isProtectedMinter, isProtectedMinterAgentId } from "../services/prod-minter-boundary";
 
 export const agentRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -57,6 +59,19 @@ agentRoutes.post("/", async (c) => {
     platformId?: string;
   }>(c);
 
+  if (body && typeof body.id === "string" && isProtectedMinterAgentId(body.id)) {
+    if (!isProtectedMinter(tenantId, body.id) || !requireHumanOwnerAdmin(c)) {
+      return c.json<ApiResponse>(
+        {
+          ok: false,
+          error:
+            "Protected signer: creation requires a human owner/admin session in the manifest tenant",
+        },
+        403,
+      );
+    }
+  }
+
   if (!body) {
     return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
   }
@@ -79,7 +94,16 @@ agentRoutes.post("/", async (c) => {
   }
 
   try {
-    const identity = await vault.createAgent(tenantId, body.id, body.name, body.platformId);
+    const identity = await vault.createAgent(
+      tenantId,
+      body.id,
+      body.name,
+      body.platformId,
+      undefined,
+      {
+        protected: isProtectedMinter(tenantId, body.id),
+      },
+    );
     trackAuditEvent({
       tenantId,
       actorType: "user",
@@ -96,6 +120,94 @@ agentRoutes.post("/", async (c) => {
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "Unknown error";
     return c.json<ApiResponse>({ ok: false, error: message }, 400);
+  }
+});
+
+// ─── Create PROTECTED, INERT signer (STRATA-1499 SF-1 ceremony) ───────────────
+//
+// Admin-only bootstrap for the protected-minter ceremony:
+//   create protected+inert -> obtain address -> install manifest pinned to that
+//   exact address (env/startup only) -> verify -> activate -> Safe grant (human).
+//
+// The row is persisted with `protected=true` in the SAME transaction as its
+// key material (vault.createAgent). Until a manifest exactly covers it (tenant
+// + agent + this address) it is quarantined: every sign/export/import/proxy/
+// token/wallet path refuses it (protectedBearerGuard, protectedAgentDispatch,
+// Vault assertProtectedPostureIntact). No route can clear the marker. The
+// response carries only what the manifest needs: stable id + EVM address.
+// Nothing here funds, grants roles, dials RPC or touches a Safe.
+
+// REVIEW-SF1-DELTA F2: the response contract is exactly { id, walletAddress }.
+// Posture (protected/inert) and tenant are persisted + audited, not echoed.
+export interface ProtectedSignerBootstrap {
+  id: string;
+  walletAddress: string;
+}
+
+agentRoutes.post("/protected", async (c) => {
+  const tenantId = c.get("tenantId");
+  // Human owner/admin session ONLY: tenant API keys, agent tokens, dashboard
+  // JWTs and application principals are refused before any key is generated.
+  const adminUserId = requireHumanOwnerAdmin(c);
+  if (!adminUserId) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: "Protected signer: creation requires a human owner/admin session",
+      },
+      403,
+    );
+  }
+
+  const body = await safeJsonParse<{ id: string; name?: string }>(c);
+  if (!body) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
+  }
+  if (!isValidAgentId(body.id)) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: "Invalid agent id — must be 1-128 alphanumeric characters (plus _ - . :)",
+      },
+      400,
+    );
+  }
+  const name = isNonEmptyString(body.name) ? body.name : body.id;
+
+  // One key per identity: an existing row (protected or not, in ANY tenant;
+  // agent ids are globally unique) is never regenerated, rebound or upgraded
+  // through this route, and another tenant cannot squat the id.
+  const [existing] = await db.select({ id: agents.id }).from(agents).where(eq(agents.id, body.id));
+  if (existing) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: agent id already exists; keys are never regenerated" },
+      409,
+    );
+  }
+
+  try {
+    const identity = await vault.createAgent(tenantId, body.id, name, undefined, undefined, {
+      protected: true,
+    });
+    trackAuditEvent({
+      tenantId,
+      actorType: "user",
+      actorId: adminUserId,
+      action: "agent.create_protected",
+      resourceType: "agent",
+      resourceId: body.id,
+      metadata: { name, walletAddress: identity.walletAddress, status: "inert" },
+      ipAddress: c.req.header("x-forwarded-for") ?? null,
+      userAgent: c.req.header("user-agent") ?? null,
+      requestId: c.get("requestId") ?? null,
+    });
+    const data: ProtectedSignerBootstrap = {
+      id: identity.id,
+      walletAddress: identity.walletAddress,
+    };
+    return c.json<ApiResponse<ProtectedSignerBootstrap>>({ ok: true, data }, 201);
+  } catch (e: unknown) {
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 400);
   }
 });
 
@@ -135,9 +247,30 @@ agentRoutes.post("/:agentId/token", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
   }
 
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    if (!requireHumanOwnerAdmin(c)) {
+      return c.json<ApiResponse>(
+        {
+          ok: false,
+          error: "Protected signer: token issuance requires a human owner/admin session",
+        },
+        403,
+      );
+    }
+  }
   const body = await safeJsonParse<{ expiresIn?: string; scopes?: string[] | string }>(c);
   const expiresIn = body?.expiresIn || AGENT_TOKEN_EXPIRY;
   const scopes = parseAgentTokenScopes(body?.scopes ?? c.req.query("scopes"));
+  if (
+    scopes &&
+    isProtectedMinter(c.get("tenantId"), c.req.param("agentId")) &&
+    scopes.includes("api:proxy")
+  ) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: api:proxy scope is refused" },
+      403,
+    );
+  }
   if (!scopes) {
     return c.json<ApiResponse>(
       { ok: false, error: "Invalid scopes — supported values: agent, api:proxy" },
@@ -195,6 +328,12 @@ agentRoutes.post("/:agentId/wallets", async (c) => {
   if (!requireTenantLevel(c)) {
     return c.json<ApiResponse>(
       { ok: false, error: "Venue wallet creation requires tenant-level authentication" },
+      403,
+    );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: wallet provisioning is refused" },
       403,
     );
   }
@@ -289,6 +428,12 @@ agentRoutes.delete("/:agentId", async (c) => {
         ok: false,
         error: "Agent deletion requires tenant-level authentication",
       },
+      403,
+    );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: deletion is refused for every credential" },
       403,
     );
   }
@@ -454,6 +599,16 @@ agentRoutes.post("/batch", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
   }
 
+  if (
+    Array.isArray(body.agents) &&
+    body.agents.some((a) => a && isProtectedMinterAgentId(String(a.id)))
+  ) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Protected signer: batch creation/policy assignment is refused" },
+      403,
+    );
+  }
+
   if (!Array.isArray(body.agents) || body.agents.length === 0) {
     return c.json<ApiResponse>(
       { ok: false, error: "agents array is required and must not be empty" },
@@ -574,6 +729,16 @@ agentRoutes.put("/:agentId/policies", async (c) => {
   if (!requireAgentAccess(c)) {
     return c.json<ApiResponse>(
       { ok: false, error: "Forbidden: token scope does not match agent" },
+      403,
+    );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error:
+          "Protected signer: policy is a deployment-controlled manifest; changes require a Steward release",
+      },
       403,
     );
   }

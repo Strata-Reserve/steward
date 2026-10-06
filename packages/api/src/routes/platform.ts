@@ -25,11 +25,17 @@ import {
   userTenants,
 } from "@stwd/db";
 import type { AgentIdentity, ApiResponse, PolicyRule, Tenant } from "@stwd/shared";
-import { KeyStore, Vault } from "@stwd/vault";
+import { chainRpcUrlsFromEnv, KeyStore, Vault } from "@stwd/vault";
 import { and, count, eq } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { trackAuditEvent } from "../services/audit";
 import { createAgentToken, parseAgentTokenScopes } from "../services/context";
+import {
+  getProtectedMinterManifest,
+  isPersistedProtectedAgent,
+  isProtectedMinter,
+  isProtectedMinterAgentId,
+} from "../services/prod-minter-boundary";
 import { invalidateEmailAuthForTenant } from "./auth";
 
 function auditCtx(c: {
@@ -64,6 +70,9 @@ function getVault(): Vault {
     masterPassword: masterPassword || "dev-secret",
     rpcUrl: process.env.RPC_URL || "https://sepolia.base.org",
     chainId: parseInt(process.env.CHAIN_ID || "84532", 10),
+    // STRATA-1499: explicit per-chain endpoints (RPC_URL_8453 / RPC_URL_84532).
+    // Base chains never fall back to RPC_URL or a public endpoint.
+    chainRpcUrls: chainRpcUrlsFromEnv(),
   });
 }
 
@@ -183,6 +192,54 @@ const platform = new Hono();
 
 // All platform routes require a valid platform key
 platform.use("*", platformAuthMiddleware());
+
+// STRATA-1499: the platform key cannot delete the protected tenant/agent,
+// rewrite its posture via batch policy, or issue its tokens.
+async function protectedTenantTouched(tenantId: string): Promise<boolean> {
+  const m = getProtectedMinterManifest();
+  if (m && m.tenantId === tenantId) return true;
+  const rows = await getDb()
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.tenantId, tenantId), eq(agents.protected, true)));
+  return rows.length > 0;
+}
+const protectedRefused = (c: Context, what: string) =>
+  c.json<ApiResponse>(
+    { ok: false, error: `Protected signer: ${what} is refused for the platform key` },
+    403,
+  );
+platform.use("/tenants/:id", async (c, next) => {
+  if (c.req.method === "DELETE" && (await protectedTenantTouched(c.req.param("id"))))
+    return protectedRefused(c, "tenant deletion");
+  return next();
+});
+platform.use("/tenants/:id/policies", async (c, next) => {
+  if (c.req.method === "PUT" && (await protectedTenantTouched(c.req.param("id"))))
+    return protectedRefused(c, "tenant batch policy");
+  return next();
+});
+platform.use("/tenants/:id/agents/batch", async (c, next) => {
+  if (c.req.method === "POST" && (await protectedTenantTouched(c.req.param("id"))))
+    return protectedRefused(c, "batch agent/policy mutation");
+  return next();
+});
+platform.use("/tenants/:id/agents/:agentId/token", async (c, next) => {
+  const agentId = c.req.param("agentId");
+  if (
+    isProtectedMinter(c.req.param("id"), agentId) ||
+    isProtectedMinterAgentId(agentId) ||
+    (await isPersistedProtectedAgent(agentId))
+  )
+    return protectedRefused(c, "token issuance");
+  return next();
+});
+platform.use("/agents/:id/revoke-tokens", async (c, next) => {
+  const agentId = c.req.param("id");
+  if (isProtectedMinterAgentId(agentId) || (await isPersistedProtectedAgent(agentId)))
+    return protectedRefused(c, "token revocation");
+  return next();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform stats

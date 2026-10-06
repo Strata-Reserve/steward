@@ -2,6 +2,27 @@ export type { EncryptedKey } from "./keystore";
 export { KeyStore } from "./keystore";
 export type { KeystoreBackend, KeystoreContext } from "./keystore-backend";
 export { backendFromKeyStore } from "./keystore-backend";
+export type {
+  ProtectedSignerGuard,
+  ProtectedTransactionShape,
+  ProtectedValidation,
+  ReviewDigestInput,
+} from "./protected-signer";
+export {
+  assertNotProtected,
+  assertProtectedPostureIntact,
+  computeProtectedReviewDigest,
+  consumeProtectedSigningPermit,
+  getProtectedSignerGuard,
+  isPersistedProtected,
+  isProtectedIssuanceClaimed,
+  isProtectedSigner,
+  issueProtectedSigningPermit,
+  isUndefinedColumn,
+  outstandingProtectedPermits,
+  ProtectedSignerError,
+  registerProtectedSignerGuard,
+} from "./protected-signer";
 export type { MatchedRoute } from "./route-matcher";
 export {
   findMatchingRoute,
@@ -28,4 +49,14 @@ export {
   USER_WALLET_DEFAULT_POLICIES,
 } from "./user-wallet";
 export type { VaultConfig } from "./vault";
-export { Vault, Vault as VaultClient } from "./vault";
+export {
+  assertChainRpcReady,
+  chainRpcEnvKey,
+  chainRpcUrlsFromEnv,
+  EXPLICIT_RPC_CHAINS,
+  redactRpcEndpoints,
+  redactRpcError,
+  resolveEvmRpcUrl,
+  Vault,
+  Vault as VaultClient,
+} from "./vault";

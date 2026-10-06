@@ -5,6 +5,7 @@
  * Mount: app.route("/vault", vaultRoutes)
  */
 
+import { issueProtectedSigningPermit } from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { enforceRateLimit, recordVaultSpend } from "../middleware/redis-enforcement";
@@ -14,6 +15,7 @@ import {
   type AppVariables,
   approvalQueue,
   db,
+  describeRpcError,
   ensureAgentForTenant,
   extractRpcErrorMessage,
   getPolicySet,
@@ -28,7 +30,9 @@ import {
   priceOracle,
   type RpcRequest,
   type RpcResponse,
+  redactRpcMessage,
   requireAgentAccess,
+  requireHumanOwnerAdmin,
   requireTenantLevel,
   type SignRequest,
   type SignTypedDataRequest,
@@ -39,9 +43,415 @@ import {
   transactions,
   vault,
 } from "../services/context";
+import {
+  getProtectedMinterManifest,
+  getProtectedMinterManifestDigest,
+  isProtectedMinter,
+  isProtectedMinterApprover,
+  protectedReviewDigest,
+  validateProtectedShape,
+} from "../services/prod-minter-boundary";
 import { dispatchWebhook } from "../services/webhook-dispatch";
 
 export const vaultRoutes = new Hono<{ Variables: AppVariables }>();
+
+// ─── Protected production minter (STRATA-1499 SF-1) ────────────────────────────
+//
+// For the manifest-protected signer every valid proposal queues; nothing is
+// ever auto-signed. The queue entry freezes a review digest over the exact
+// immutable payload plus the manifest digest. Only a verified human
+// owner/admin session can consume the approval (CAS), after which the stored
+// payload is re-validated, its digest recomputed and compared, and a one-use
+// internal permit is handed to the vault which rechecks everything again
+// before key use.
+
+const PROTECTED_SIGN_FIELDS = new Set([
+  "to",
+  "value",
+  "data",
+  "chainId",
+  "executionRef",
+  "broadcast",
+]);
+
+function protectedRefused(
+  c: Context<{ Variables: AppVariables }>,
+  error: string,
+  status: 403 | 400 = 403,
+) {
+  return c.json<ApiResponse>({ ok: false, error: `Protected signer: ${error}` }, status);
+}
+
+/** Caller may propose for the protected signer: its own agent JWT, or a human owner/admin session. */
+function protectedProposerIdentity(
+  c: Context<{ Variables: AppVariables }>,
+  agentId: string,
+): string | null {
+  const authType = c.get("authType");
+  if (authType === "agent-token" && c.get("agentScope") === agentId) return `agent:${agentId}`;
+  const userId = requireHumanOwnerAdmin(c);
+  if (userId) return `user:${userId}`;
+  return null;
+}
+
+async function handleProtectedSign(
+  c: Context<{ Variables: AppVariables }>,
+  tenantId: string,
+  agentId: string,
+  rawRequest: Record<string, unknown>,
+  executionRef: string | undefined,
+  requestedBy: string,
+) {
+  for (const key of Object.keys(rawRequest)) {
+    if (!PROTECTED_SIGN_FIELDS.has(key)) {
+      return protectedRefused(c, `unknown request field '${key}' is refused`, 400);
+    }
+  }
+  if (rawRequest.broadcast !== undefined && rawRequest.broadcast !== true) {
+    return protectedRefused(
+      c,
+      "broadcast:false is refused (no signed raw transaction is released)",
+    );
+  }
+  if (!executionRef) {
+    return protectedRefused(c, "executionRef is required", 400);
+  }
+  const manifest = getProtectedMinterManifest();
+  if (!manifest) return protectedRefused(c, "manifest not installed");
+  // B1: the proposal chain is the manifest's single pinned chain (8453 in
+  // production). A request for any other chain, including the rehearsal
+  // chain against a production manifest and vice versa, is refused here.
+  if (rawRequest.chainId !== manifest.chainId) {
+    return protectedRefused(c, `chainId must be exactly ${manifest.chainId}`);
+  }
+
+  const to = String(rawRequest.to);
+  const value = String(rawRequest.value);
+  const data = typeof rawRequest.data === "string" ? rawRequest.data : undefined;
+  const chainId: number = manifest.chainId;
+
+  const incoming = normalizeSignPayload({ to, value, data, chainId });
+  const existing = await findByExecutionRef(tenantId, agentId, executionRef);
+  if (existing) return replayExistingAction(c, existing, incoming);
+
+  const shape = validateProtectedShape(manifest, { chainId, to, value, data, executionRef });
+  if (!shape.ok) {
+    trackAuditEvent({
+      tenantId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "vault.sign.protected_refused",
+      resourceType: "agent",
+      resourceId: agentId,
+      metadata: {
+        chainId,
+        to,
+        value,
+        data: data ?? null,
+        executionRef,
+        reason: shape.reason,
+        requestedBy,
+      },
+      ipAddress: c.req.header("x-forwarded-for") ?? null,
+      userAgent: c.req.header("user-agent") ?? null,
+      requestId: c.get("requestId") ?? null,
+    });
+    return protectedRefused(c, shape.reason);
+  }
+
+  const reviewDigest = protectedReviewDigest({
+    tenantId,
+    agentId,
+    chainId,
+    to,
+    value,
+    data,
+    executionRef,
+  });
+  const manifestDigest = getProtectedMinterManifestDigest();
+  const txId = crypto.randomUUID();
+  const queueId = crypto.randomUUID();
+
+  const inserted = await db.transaction(async (tx) => {
+    const rows = await tx
+      .insert(transactions)
+      .values({
+        id: txId,
+        agentId,
+        tenantId,
+        executionRef,
+        status: "pending",
+        toAddress: to,
+        value,
+        data,
+        chainId,
+        policyResults: [],
+      })
+      .onConflictDoNothing({
+        target: [transactions.tenantId, transactions.agentId, transactions.executionRef],
+      })
+      .returning({ id: transactions.id });
+    if (rows.length === 0) return false;
+    await tx.insert(approvalQueue).values({
+      id: queueId,
+      txId,
+      agentId,
+      status: "pending",
+      reviewDigest,
+      manifestDigest,
+      reviewProjection: shape.projection as unknown as Record<string, unknown>,
+      requestedBy,
+    });
+    return true;
+  });
+  if (!inserted) {
+    const winner = await findByExecutionRef(tenantId, agentId, executionRef);
+    if (!winner) {
+      return c.json<ApiResponse>(
+        { ok: false, error: "Execution reference reservation failed; retry" },
+        503,
+      );
+    }
+    return replayExistingAction(c, winner, incoming);
+  }
+
+  trackAuditEvent({
+    tenantId,
+    actorType: "agent",
+    actorId: agentId,
+    action: "vault.sign.protected_queued",
+    resourceType: "transaction",
+    resourceId: txId,
+    metadata: {
+      queueId,
+      executionRef,
+      reviewDigest,
+      manifestDigest,
+      requestedBy,
+      review: shape.projection,
+    },
+    ipAddress: c.req.header("x-forwarded-for") ?? null,
+    userAgent: c.req.header("user-agent") ?? null,
+    requestId: c.get("requestId") ?? null,
+  });
+  dispatchWebhook(tenantId, agentId, "approval_required", { txId, executionRef, reviewDigest });
+
+  return c.json<ApiResponse>(
+    {
+      ok: false,
+      error: "Transaction requires manual approval",
+      data: {
+        txId,
+        executionRef,
+        status: "pending_approval",
+        results: [],
+        reviewDigest,
+        manifestDigest,
+        review: shape.projection,
+      },
+    },
+    202,
+  );
+}
+
+type QueueRow = typeof approvalQueue.$inferSelect;
+
+async function handleProtectedApprove(
+  c: Context<{ Variables: AppVariables }>,
+  tenantId: string,
+  agentId: string,
+  txId: string,
+) {
+  const userId = requireHumanOwnerAdmin(c);
+  if (!userId) {
+    return protectedRefused(c, "approval requires an authenticated human owner/admin session");
+  }
+  // STRATA-1499 SF-1 (R3 platform-promotion finding): owner/admin membership
+  // is necessary but not sufficient. The approver must also be pinned by
+  // stable user ID in the deployment-controlled manifest allowlist. Platform
+  // membership administration can promote a user; it cannot add them here.
+  if (!isProtectedMinterApprover(userId)) {
+    return protectedRefused(c, "approver is not in the pinned manifest allowlist");
+  }
+  const body = await safeJsonParse<{ reviewDigest?: unknown }>(c);
+  const echoed = typeof body?.reviewDigest === "string" ? body.reviewDigest.toLowerCase() : null;
+  if (!echoed) return protectedRefused(c, "approval must echo the reviewed 'reviewDigest'", 400);
+
+  const [row] = await db
+    .select({ transaction: transactions, queue: approvalQueue })
+    .from(transactions)
+    .innerJoin(approvalQueue, eq(approvalQueue.txId, transactions.id))
+    .where(
+      and(
+        eq(transactions.id, txId),
+        eq(transactions.agentId, agentId),
+        eq(transactions.tenantId, tenantId),
+        eq(approvalQueue.agentId, agentId),
+      ),
+    );
+  if (!row) return c.json<ApiResponse>({ ok: false, error: "Transaction not found" }, 404);
+  const transaction = row.transaction;
+  const queue: QueueRow = row.queue;
+
+  if (queue.requestedBy === `user:${userId}`) {
+    return protectedRefused(c, "requester cannot approve their own proposal");
+  }
+  if (!queue.reviewDigest || !queue.manifestDigest || !transaction.executionRef) {
+    return protectedRefused(c, "queue entry lacks a frozen review digest");
+  }
+  if (queue.manifestDigest.toLowerCase() !== getProtectedMinterManifestDigest().toLowerCase()) {
+    return protectedRefused(c, "manifest changed since this proposal was reviewed; re-propose");
+  }
+  if (queue.reviewDigest.toLowerCase() !== echoed) {
+    return protectedRefused(c, "echoed reviewDigest does not match the pending review");
+  }
+  // Recompute from the stored immutable payload: any substitution after
+  // queueing (DB edit, replaced row) changes the digest and is refused.
+  const recomputed = protectedReviewDigest({
+    tenantId,
+    agentId,
+    chainId: transaction.chainId,
+    to: transaction.toAddress,
+    value: transaction.value,
+    data: transaction.data,
+    executionRef: transaction.executionRef,
+  });
+  if (recomputed.toLowerCase() !== queue.reviewDigest.toLowerCase()) {
+    return protectedRefused(c, "stored payload no longer matches the reviewed digest");
+  }
+  const manifest = getProtectedMinterManifest();
+  if (!manifest) return protectedRefused(c, "manifest not installed");
+  const shape = validateProtectedShape(manifest, {
+    chainId: transaction.chainId,
+    to: transaction.toAddress,
+    value: transaction.value,
+    data: transaction.data,
+    executionRef: transaction.executionRef,
+  });
+  if (!shape.ok) return protectedRefused(c, `stored payload fails current scope: ${shape.reason}`);
+
+  // STRATA-1499 (F1, #27 x #28 integration): RPC readiness preflight BEFORE
+  // the pending approval is claimed and BEFORE the one-use issuance claim /
+  // permit are taken. A deterministic configuration error leaves the approval
+  // pending, the issuance claim free and the transaction row unchanged, so the
+  // same approval succeeds once RPC_URL_<chainId> is fixed. Vault.signTransaction
+  // re-runs the same check above its permit consume as a second line.
+  try {
+    vault.assertChainRpcReady(transaction.chainId);
+  } catch (e: unknown) {
+    const requestId = c.get("requestId") || "unknown";
+    console.error(
+      `[${requestId}] Protected approve preflight failed for agent ${agentId}, tx ${txId}: ${describeRpcError(e)}`,
+    );
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
+  }
+
+  const resolvedAt = new Date();
+  const claim = await db
+    .update(approvalQueue)
+    .set({ status: "approved", resolvedAt, resolvedBy: `user:${userId}`, approvedByUserId: userId })
+    .where(
+      and(
+        eq(approvalQueue.id, queue.id),
+        eq(approvalQueue.txId, txId),
+        eq(approvalQueue.status, "pending"),
+        eq(approvalQueue.reviewDigest, queue.reviewDigest),
+      ),
+    )
+    .returning({ id: approvalQueue.id });
+  if (claim.length === 0) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Transaction already processed or not found" },
+      409,
+    );
+  }
+
+  trackAuditEvent({
+    tenantId,
+    actorType: "user",
+    actorId: userId,
+    action: "vault.approve.protected_claimed",
+    resourceType: "transaction",
+    resourceId: txId,
+    metadata: {
+      agentId,
+      executionRef: transaction.executionRef,
+      reviewDigest: queue.reviewDigest,
+      review: shape.projection,
+    },
+    ipAddress: c.req.header("x-forwarded-for") ?? null,
+    userAgent: c.req.header("user-agent") ?? null,
+    requestId: c.get("requestId") ?? null,
+  });
+
+  try {
+    const permit = await issueProtectedSigningPermit({
+      tenantId,
+      agentId,
+      txId,
+      reviewDigest: queue.reviewDigest,
+    });
+    const txHash = await vault.signTransaction(
+      { ...toSignRequest(transaction), tenantId, broadcast: true },
+      {
+        txId,
+        policyResults: transaction.policyResults,
+        status: "signed",
+        protectedPermit: permit,
+        protectedReviewDigest: queue.reviewDigest,
+      },
+    );
+    await db
+      .update(transactions)
+      .set({ status: "signed", txHash, signedAt: resolvedAt })
+      .where(eq(transactions.id, txId));
+    trackAuditEvent({
+      tenantId,
+      actorType: "user",
+      actorId: userId,
+      action: "vault.approve",
+      resourceType: "transaction",
+      resourceId: txId,
+      metadata: {
+        agentId,
+        chainId: transaction.chainId,
+        txHash,
+        reviewDigest: queue.reviewDigest,
+        protected: true,
+      },
+      ipAddress: c.req.header("x-forwarded-for") ?? null,
+      userAgent: c.req.header("user-agent") ?? null,
+      requestId: c.get("requestId") ?? null,
+    });
+    dispatchWebhook(tenantId, agentId, "tx_signed", { txId, txHash });
+    return c.json<ApiResponse<{ txId: string; txHash: string; executionRef: string }>>({
+      ok: true,
+      data: { txId, txHash, executionRef: transaction.executionRef },
+    });
+  } catch (e: unknown) {
+    // Same fail-closed rule as #24: the claim is consumed and never released.
+    const requestId = c.get("requestId") || "unknown";
+    const rawMessage = e instanceof Error ? e.message : "Unknown error";
+    console.error(`[${requestId}] Protected approve failed for agent ${agentId}, tx ${txId}:`, e);
+    await db
+      .update(transactions)
+      .set({ status: "failed" })
+      .where(and(eq(transactions.id, txId), eq(transactions.status, "pending")))
+      .catch((updateErr) =>
+        console.error(`[${requestId}] Failed to mark approved tx ${txId} failed:`, updateErr),
+      );
+    dispatchWebhook(tenantId, agentId, "tx_failed", {
+      txId,
+      executionRef: transaction.executionRef,
+      error: rawMessage,
+      requestId,
+    });
+    if (isRpcError(e)) {
+      return c.json<ApiResponse>({ ok: false, error: extractRpcErrorMessage(e) }, 502);
+    }
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
+  }
+}
 
 // ─── Execution reference (STRATA-1486) ───────────────────────────────────────
 //
@@ -255,6 +665,18 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
   }
 
+  const protectedMinter = isProtectedMinter(tenantId, agentId);
+  let protectedRequester: string | null = null;
+  if (protectedMinter) {
+    protectedRequester = protectedProposerIdentity(c, agentId);
+    if (!protectedRequester) {
+      return protectedRefused(
+        c,
+        "only the signer's own agent token or a human owner/admin session may propose",
+      );
+    }
+  }
+
   const request = await safeJsonParse<Omit<SignRequest, "agentId" | "tenantId">>(c);
   if (!request) {
     return c.json<ApiResponse>({ ok: false, error: "Invalid JSON in request body" }, 400);
@@ -285,6 +707,17 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
   }
   const executionRef = refResolution.executionRef;
 
+  if (protectedMinter && protectedRequester) {
+    return handleProtectedSign(
+      c,
+      tenantId,
+      agentId,
+      request as unknown as Record<string, unknown>,
+      executionRef,
+      protectedRequester,
+    );
+  }
+
   const resolvedChainId = request.chainId || parseInt(process.env.CHAIN_ID || "8453", 10);
   const signRequest: SignRequest = {
     ...request,
@@ -305,6 +738,22 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
   if (executionRef) {
     const existing = await findByExecutionRef(tenantId, agentId, executionRef);
     if (existing) return replayExistingAction(c, existing, incomingPayload);
+  }
+
+  // STRATA-1499 (F1): RPC readiness preflight BEFORE anything is reserved,
+  // rate-limited, evaluated, queued or decrypted. A missing/non-https
+  // RPC_URL_<chainId> for an explicit chain is a deterministic configuration
+  // error: it makes no row change and consumes nothing, so the same request
+  // succeeds once the operator fixes the configuration. Replay by
+  // executionRef (above) stays first and unchanged.
+  try {
+    vault.assertChainRpcReady(resolvedChainId);
+  } catch (e: unknown) {
+    const requestId = c.get("requestId") || "unknown";
+    console.error(
+      `[${requestId}] Sign preflight failed for agent ${agentId}: ${describeRpcError(e)}`,
+    );
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
   }
 
   const policySet = await getPolicySet(tenantId, agentId);
@@ -558,8 +1007,9 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    const rawMessage = e instanceof Error ? e.message : "Unknown error";
-    console.error(`[${requestId}] Sign transaction failed for agent ${agentId}:`, e);
+    // STRATA-1499 (F2): one redacted message for log, webhook and HTTP body.
+    const safeMessage = describeRpcError(e);
+    console.error(`[${requestId}] Sign transaction failed for agent ${agentId}: ${safeMessage}`);
 
     if (reserved) {
       // The reservation stays bound to this reference as a terminal failure.
@@ -577,7 +1027,7 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
     dispatchWebhook(tenantId, agentId, "tx_failed", {
       txId,
       ...(executionRef ? { executionRef } : {}),
-      error: rawMessage,
+      error: safeMessage,
       requestId,
     });
 
@@ -609,12 +1059,31 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
   }
 
+  if (isProtectedMinter(tenantId, agentId)) {
+    return handleProtectedApprove(c, tenantId, agentId, txId);
+  }
+
   const [transaction] = await db
     .select()
     .from(transactions)
     .where(and(eq(transactions.id, txId), eq(transactions.agentId, agentId)));
   if (!transaction) {
     return c.json<ApiResponse>({ ok: false, error: "Transaction not found" }, 404);
+  }
+
+  // STRATA-1499 (F1): RPC readiness preflight BEFORE the pending approval is
+  // claimed. A deterministic configuration error leaves the approval pending
+  // and the transaction row unchanged, so the same approval succeeds once the
+  // endpoint is configured. Anything thrown after the claim below is treated
+  // as ambiguous (see the catch) and is never released.
+  try {
+    vault.assertChainRpcReady(transaction.chainId);
+  } catch (e: unknown) {
+    const requestId = c.get("requestId") || "unknown";
+    console.error(
+      `[${requestId}] Approve preflight failed for agent ${agentId}, tx ${txId}: ${describeRpcError(e)}`,
+    );
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
   }
 
   const resolvedAt = new Date();
@@ -692,8 +1161,11 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    const rawMessage = e instanceof Error ? e.message : "Unknown error";
-    console.error(`[${requestId}] Approve transaction failed for agent ${agentId}, tx ${txId}:`, e);
+    // STRATA-1499 (F2): one redacted message for log, webhook and HTTP body.
+    const safeMessage = describeRpcError(e);
+    console.error(
+      `[${requestId}] Approve transaction failed for agent ${agentId}, tx ${txId}: ${safeMessage}`,
+    );
 
     // STRATA-1499: fail closed. The approval claim has been consumed and the
     // broadcaster was invoked; an RPC can accept a transaction and still
@@ -718,7 +1190,7 @@ vaultRoutes.post("/:agentId/approve/:txId", async (c) => {
     dispatchWebhook(tenantId, agentId, "tx_failed", {
       txId,
       ...(transaction.executionRef ? { executionRef: transaction.executionRef } : {}),
-      error: rawMessage,
+      error: safeMessage,
       requestId,
     });
 
@@ -748,6 +1220,10 @@ vaultRoutes.post("/:agentId/reject/:txId", async (c) => {
 
   if (!agent) {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
+  }
+
+  if (isProtectedMinter(tenantId, agentId) && !requireHumanOwnerAdmin(c)) {
+    return protectedRefused(c, "rejection requires an authenticated human owner/admin session");
   }
 
   const rejectResult = await db
@@ -835,11 +1311,23 @@ vaultRoutes.get("/:agentId/pending", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
   }
 
+  const protectedView = isProtectedMinter(tenantId, agentId);
+  if (protectedView && !requireHumanOwnerAdmin(c)) {
+    return protectedRefused(
+      c,
+      "pending review requires an authenticated human owner/admin session",
+    );
+  }
+
   const pendingTransactions = await db
     .select({
       queueId: approvalQueue.id,
       status: approvalQueue.status,
       requestedAt: approvalQueue.requestedAt,
+      reviewDigest: approvalQueue.reviewDigest,
+      manifestDigest: approvalQueue.manifestDigest,
+      reviewProjection: approvalQueue.reviewProjection,
+      requestedBy: approvalQueue.requestedBy,
       transaction: transactions,
     })
     .from(approvalQueue)
@@ -859,6 +1347,17 @@ vaultRoutes.get("/:agentId/pending", async (c) => {
       status: entry.status,
       requestedAt: entry.requestedAt,
       transaction: toTxRecord(entry.transaction),
+      ...(protectedView
+        ? {
+            protected: true,
+            reviewDigest: entry.reviewDigest,
+            manifestDigest: entry.manifestDigest,
+            requestedBy: entry.requestedBy,
+            review: entry.reviewProjection,
+            originalCalldata: entry.transaction.data,
+            executionRef: entry.transaction.executionRef,
+          }
+        : {}),
     })),
   });
 });
@@ -906,6 +1405,9 @@ vaultRoutes.post("/:agentId/sign-message", async (c) => {
       403,
     );
   }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return protectedRefused(c, "message signing is refused for every credential");
+  }
   const tenantId = c.get("tenantId");
   const agentId = c.req.param("agentId");
   const agent = await ensureAgentForTenant(tenantId, agentId);
@@ -937,6 +1439,9 @@ vaultRoutes.post("/:agentId/sign-typed-data", async (c) => {
       { ok: false, error: "Forbidden: token scope does not match agent" },
       403,
     );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return protectedRefused(c, "typed-data signing is refused for every credential");
   }
   const tenantId = c.get("tenantId");
   const agentId = c.req.param("agentId");
@@ -1182,6 +1687,9 @@ vaultRoutes.post("/:agentId/sign-solana", async (c) => {
       { ok: false, error: "Forbidden: token scope does not match agent" },
       403,
     );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return protectedRefused(c, "Solana signing is refused for every credential");
   }
   const tenantId = c.get("tenantId");
   const agentId = c.req.param("agentId");
@@ -1444,10 +1952,11 @@ vaultRoutes.post("/:agentId/sign-solana", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    console.error(`[${requestId}] Solana sign failed for agent ${agentId}:`, e);
+    const safeMessage = describeRpcError(e);
+    console.error(`[${requestId}] Solana sign failed for agent ${agentId}: ${safeMessage}`);
 
     dispatchWebhook(tenantId, agentId, "tx_failed", {
-      error: e instanceof Error ? e.message : "Unknown error",
+      error: safeMessage,
       requestId,
     });
 
@@ -1500,8 +2009,11 @@ vaultRoutes.post("/:agentId/rpc", async (c) => {
     });
   } catch (e: unknown) {
     const requestId = c.get("requestId") || "unknown";
-    const message = e instanceof Error ? e.message : "Unknown error";
-    console.error(`[${requestId}] RPC passthrough failed for agent ${agentId}:`, e);
+    // STRATA-1499 (F2): passthrough errors name the endpoint; redact for both.
+    const message = e instanceof Error ? redactRpcMessage(e.message) : "Unknown error";
+    console.error(
+      `[${requestId}] RPC passthrough failed for agent ${agentId}: ${describeRpcError(e)}`,
+    );
     return c.json<ApiResponse>({ ok: false, error: message }, 400);
   }
 });
@@ -1549,6 +2061,9 @@ vaultRoutes.post("/:agentId/import", async (c) => {
       { ok: false, error: "Key import requires tenant-level authentication" },
       403,
     );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return protectedRefused(c, "key import is refused for every credential");
   }
 
   const tenantId = c.get("tenantId");
@@ -1601,6 +2116,9 @@ vaultRoutes.post("/:agentId/export", async (c) => {
       { ok: false, error: "Key export requires tenant-level authentication" },
       403,
     );
+  }
+  if (isProtectedMinter(c.get("tenantId"), c.req.param("agentId"))) {
+    return protectedRefused(c, "key export is refused for every credential");
   }
 
   const tenantId = c.get("tenantId");

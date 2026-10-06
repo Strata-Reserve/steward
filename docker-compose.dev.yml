@@ -41,6 +41,10 @@ services:
       STEWARD_DEFAULT_TENANT_KEY: "${STEWARD_DEFAULT_TENANT_KEY:-dev_tenant_key}"
       AGENT_TOKEN_EXPIRY: "7d"
       RPC_URL: "${RPC_URL:-https://sepolia.base.org}"
+      # STRATA-1499: explicit Base endpoints. Dev-only public defaults; these are
+      # explicit test config, not a code fallback (the vault has none).
+      RPC_URL_8453: "${RPC_URL_8453:-https://mainnet.base.org}"
+      RPC_URL_84532: "${RPC_URL_84532:-https://sepolia.base.org}"
       CHAIN_ID: "${CHAIN_ID:-84532}"
     volumes:
       # Mount entire monorepo source (live edits, no rebuild needed)

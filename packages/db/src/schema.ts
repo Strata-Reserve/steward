@@ -170,6 +170,12 @@ export const agents = pgTable(
     erc8004TokenId: varchar("erc8004_token_id", { length: 255 }),
     ownerUserId: uuid("owner_user_id"),
     walletType: varchar("wallet_type", { length: 32 }).default("agent"),
+    /**
+     * STRATA-1499: persisted protected-signer marker. Set at protected
+     * creation, independent of env; no API route can clear it. A protected
+     * agent with no valid installed manifest is refused everywhere.
+     */
+    protected: boolean("protected").notNull().default(false),
     ...timestamps,
   },
   (table) => ({
@@ -624,6 +630,24 @@ export const approvalQueue = pgTable(
     requestedAt: timestamp("requested_at", { withTimezone: true }).notNull().defaultNow(),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
     resolvedBy: varchar("resolved_by", { length: 255 }),
+    /**
+     * STRATA-1499 protected-minter review evidence. NULL for ordinary
+     * approvals. `review_digest` binds the exact immutable payload (chain,
+     * to, value, data, agentId, executionRef, manifest digest); the human
+     * approval must echo it and the signer rechecks it before key use.
+     */
+    reviewDigest: varchar("review_digest", { length: 66 }),
+    manifestDigest: varchar("manifest_digest", { length: 66 }),
+    reviewProjection: jsonb("review_projection").$type<Record<string, unknown>>(),
+    requestedBy: varchar("requested_by", { length: 255 }),
+    approvedByUserId: varchar("approved_by_user_id", { length: 64 }),
+    /**
+     * REVIEW-STEWARD-28-R2 R2-1: durable single-use issuance claim. Set by
+     * CAS when the one internal signing permit for this approval is issued.
+     * Non-NULL means signing already happened or is in flight; no further
+     * permit may ever be issued for this row.
+     */
+    issuanceClaimedAt: timestamp("issuance_claimed_at", { withTimezone: true }),
   },
   (table) => ({
     txIdUniqueIdx: uniqueIndex("approval_queue_tx_id_idx").on(table.txId),

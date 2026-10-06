@@ -16,6 +16,7 @@
 import { getDb } from "@stwd/db";
 import { sql } from "drizzle-orm";
 import { trackAuditEvent } from "./audit";
+import { getProtectedMinterManifest } from "./prod-minter-boundary";
 
 const SYSTEM_TENANT_ID = "system";
 
@@ -87,10 +88,20 @@ async function sweepRefreshTokens(): Promise<SweepResult> {
 async function sweepFailedTransactions(): Promise<SweepResult> {
   const days = readPositiveInt("STEWARD_RETENTION_FAILED_TX_DAYS") ?? DEFAULT_FAILED_TX_DAYS;
   // Only terminal-failure states. Signed/broadcast/confirmed are kept for ledger continuity.
+  // STRATA-1499: consumed protected-minter executionRef tombstones are never
+  // swept; deleting them would re-open a reference for a second proposal.
+  const manifest = getProtectedMinterManifest();
   const deleted = await deleteRows(sql`
     DELETE FROM transactions
     WHERE status IN ('rejected', 'failed')
       AND created_at < now() - make_interval(days => ${days})
+      AND NOT (
+        execution_ref IS NOT NULL
+        AND (
+          (tenant_id = ${manifest?.tenantId ?? ""} AND agent_id = ${manifest?.agentId ?? ""})
+          OR agent_id IN (SELECT id FROM agents WHERE protected = true)
+        )
+      )
   `);
   return { table: "transactions", deleted };
 }
