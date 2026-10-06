@@ -225,6 +225,39 @@ describe("B1 unit: one manifest, exactly one chain", () => {
     ).toThrow();
   });
 
+  it("REVIEW-SF1-DELTA F1: chain knob present but empty/whitespace is fatal (fail closed); unset stays 8453", () => {
+    // Chain-only env: presence alone (even empty) must activate validation and throw.
+    for (const raw of ["", " ", "\t", "\n", " 8453", "84532 "]) {
+      expect(() => boundary.manifestFromEnv({ STEWARD_PROTECTED_MINTER_CHAIN_ID: raw })).toThrow(
+        /must be exactly one of 8453\|84532/,
+      );
+    }
+    // Truly unset => null (no manifest) exactly as before.
+    expect(boundary.manifestFromEnv({})).toBeNull();
+    expect(boundary.manifestFromEnv({ STEWARD_PROTECTED_MINTER_CHAIN_ID: undefined })).toBeNull();
+    // With a full manifest, the same presence rule holds; exact strings unchanged.
+    const env: NodeJS.ProcessEnv = {
+      STEWARD_PROTECTED_MINTER_TENANT: TENANT,
+      STEWARD_PROTECTED_MINTER_AGENT: AGENT,
+      STEWARD_PROTECTED_MINTER_ADDRESS: `0x${"b".repeat(40)}`,
+      STEWARD_PROTECTED_MINTER_FACTORIES: FACTORY,
+      STEWARD_PROTECTED_MINTER_TOKENS: `${TOKEN}@0xprov`,
+      STEWARD_PROTECTED_MINTER_APPROVERS: OWNER_USER,
+    };
+    for (const raw of ["", "  "]) {
+      expect(() =>
+        boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: raw }),
+      ).toThrow(/must be exactly one of 8453\|84532/);
+    }
+    expect(boundary.manifestFromEnv(env)?.chainId).toBe(8453);
+    expect(
+      boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: "8453" })?.chainId,
+    ).toBe(8453);
+    expect(
+      boundary.manifestFromEnv({ ...env, STEWARD_PROTECTED_MINTER_CHAIN_ID: "84532" })?.chainId,
+    ).toBe(84532);
+  });
+
   it("validateManifest: missing chain, null, string, array of two chains, other chain all refused", () => {
     for (const chain of [
       undefined,

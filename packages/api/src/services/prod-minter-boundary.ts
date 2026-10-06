@@ -234,10 +234,13 @@ export function manifestFromEnv(
     // REVIEW-STEWARD-28-R5 F1: every manifest field activates validation, so
     // an approvers-only (partial or malformed) config is fatal, never ignored.
     "STEWARD_PROTECTED_MINTER_APPROVERS",
-    // B1: a chain-only env is a partial manifest and fatal, never ignored.
-    "STEWARD_PROTECTED_MINTER_CHAIN_ID",
   ];
-  if (!keys.some((k) => env[k] !== undefined && env[k] !== "")) return null;
+  // B1 / REVIEW-SF1-DELTA F1: the chain knob is an exact-string contract, so
+  // mere presence (even "" or whitespace) activates validation and is fatal
+  // when malformed. Only a truly unset key keeps the 8453 default. A chain-only
+  // env is a partial manifest and fatal, never ignored.
+  const chainPresent = env.STEWARD_PROTECTED_MINTER_CHAIN_ID !== undefined;
+  if (!chainPresent && !keys.some((k) => env[k] !== undefined && env[k] !== "")) return null;
   const tokens = parseList(env.STEWARD_PROTECTED_MINTER_TOKENS).map((entry) => {
     const [address, provenance] = entry.split("@");
     return { address: address ?? "", provenance: provenance ?? "" };
