@@ -98,12 +98,7 @@ function manifest(
     ...overrides,
   };
 }
-async function call(
-  method: string,
-  path: string,
-  headers: Record<string, string>,
-  body?: unknown,
-) {
+async function call(method: string, path: string, headers: Record<string, string>, body?: unknown) {
   return app.request(path, {
     method,
     headers,
@@ -152,18 +147,43 @@ async function assertZeroCapability(label: string) {
     ["propose:apiKey", () => propose(AGENT, rootHeaders(), 8453)],
     ["addresses:agentJwt", () => call("GET", `/vault/${AGENT}/addresses`, bearer(jwt))],
     ["own:agentJwt", () => call("GET", `/agents/${AGENT}`, bearer(jwt))],
-    ["signMessage:apiKey", () => call("POST", `/vault/${AGENT}/sign-message`, rootHeaders(), { message: "x" })],
-    ["signMessage:owner", () => call("POST", `/vault/${AGENT}/sign-message`, bearer(ownerToken), { message: "x" })],
+    [
+      "signMessage:apiKey",
+      () => call("POST", `/vault/${AGENT}/sign-message`, rootHeaders(), { message: "x" }),
+    ],
+    [
+      "signMessage:owner",
+      () => call("POST", `/vault/${AGENT}/sign-message`, bearer(ownerToken), { message: "x" }),
+    ],
     ["export:apiKey", () => call("POST", `/vault/${AGENT}/export`, rootHeaders(), {})],
     ["export:owner", () => call("POST", `/vault/${AGENT}/export`, bearer(ownerToken), {})],
-    ["import:owner", () => call("POST", `/vault/${AGENT}/import`, bearer(ownerToken), { privateKey: `0x${"2".repeat(64)}` })],
-    ["rpc:apiKey", () => call("POST", `/vault/${AGENT}/rpc`, rootHeaders(), { method: "eth_chainId", params: [] })],
+    [
+      "import:owner",
+      () =>
+        call("POST", `/vault/${AGENT}/import`, bearer(ownerToken), {
+          privateKey: `0x${"2".repeat(64)}`,
+        }),
+    ],
+    [
+      "rpc:apiKey",
+      () =>
+        call("POST", `/vault/${AGENT}/rpc`, rootHeaders(), { method: "eth_chainId", params: [] }),
+    ],
     ["token:owner", () => call("POST", `/agents/${AGENT}/token`, bearer(ownerToken), {})],
     ["token:apiKey", () => call("POST", `/agents/${AGENT}/token`, rootHeaders(), {})],
-    ["wallets:owner", () => call("POST", `/agents/${AGENT}/wallets`, bearer(ownerToken), { chainFamily: "evm" })],
+    [
+      "wallets:owner",
+      () => call("POST", `/agents/${AGENT}/wallets`, bearer(ownerToken), { chainFamily: "evm" }),
+    ],
     ["delete:owner", () => call("DELETE", `/agents/${AGENT}`, bearer(ownerToken))],
     ["delete:apiKey", () => call("DELETE", `/agents/${AGENT}`, rootHeaders())],
-    ["approve:owner", () => call("POST", `/vault/${AGENT}/approve/none`, bearer(ownerToken), { reviewDigest: `0x${"0".repeat(64)}` })],
+    [
+      "approve:owner",
+      () =>
+        call("POST", `/vault/${AGENT}/approve/none`, bearer(ownerToken), {
+          reviewDigest: `0x${"0".repeat(64)}`,
+        }),
+    ],
   ];
   for (const [name, fn] of probes) {
     const r = await fn();
@@ -221,14 +241,12 @@ beforeAll(async () => {
     { id: TENANT, name: "Strata ceremony", apiKeyHash: k.hash },
     { id: OTHER_TENANT, name: "Other ceremony", apiKeyHash: k2.hash },
   ]);
-  await db
-    .insert(users)
-    .values(
-      [OWNER_USER, ADMIN_USER, MEMBER_USER, OTHER_OWNER_USER].map((id) => ({
-        id,
-        email: `${id}@example.test`,
-      })),
-    );
+  await db.insert(users).values(
+    [OWNER_USER, ADMIN_USER, MEMBER_USER, OTHER_OWNER_USER].map((id) => ({
+      id,
+      email: `${id}@example.test`,
+    })),
+  );
   await db.insert(userTenants).values([
     { userId: OWNER_USER, tenantId: TENANT, role: "owner" },
     { userId: ADMIN_USER, tenantId: TENANT, role: "admin" },
@@ -318,7 +336,15 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     expect(b.data.status).toBe("inert");
     expect(b.data.walletAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
     // No chain authority, no Safe roles, no credentials, no Solana address.
-    for (const k of ["token", "roles", "safe", "safeAdmin", "minterRole", "chainId", "walletAddresses"]) {
+    for (const k of [
+      "token",
+      "roles",
+      "safe",
+      "safeAdmin",
+      "minterRole",
+      "chainId",
+      "walletAddresses",
+    ]) {
       expect(b.data[k]).toBeUndefined();
     }
     signerAddress = b.data.walletAddress;
@@ -363,7 +389,10 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
       ["noChain", { ...manifest(signerAddress), chainId: undefined }],
       ["twoChains", { ...manifest(signerAddress), chainId: [8453, 84532] }],
       ["wrongSafe", manifest(signerAddress, 8453, { safeAdmin: RECIPIENT })],
-      ["noProvenance", manifest(signerAddress, 8453, { verifiedTokens: [{ address: TOKEN, provenance: "" }] })],
+      [
+        "noProvenance",
+        manifest(signerAddress, 8453, { verifiedTokens: [{ address: TOKEN, provenance: "" }] }),
+      ],
       ["badApprover", manifest(signerAddress, 8453, { approvers: ["owner"] })],
       ["emptyIds", manifest(signerAddress, 8453, { tenantId: "", agentId: "" })],
     ];
@@ -391,7 +420,14 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     try {
       for (const [name, m] of postures) {
         boundary.installProtectedMinterManifest(m);
-        expect([name, boundary.isProtectedMinterCovered({ tenantId: TENANT, id: AGENT, walletAddress: signerAddress })]).toEqual([name, false]);
+        expect([
+          name,
+          boundary.isProtectedMinterCovered({
+            tenantId: TENANT,
+            id: AGENT,
+            walletAddress: signerAddress,
+          }),
+        ]).toEqual([name, false]);
         expect([name, await boundary.isQuarantinedProtectedAgent(AGENT)]).toEqual([name, true]);
         await assertZeroCapability(name);
       }
@@ -432,7 +468,13 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
 
   it("[T6] correct 84532 manifest pinned to the exact address activates: only the Sepolia-authorized operation is possible", async () => {
     boundary.installProtectedMinterManifest(manifest(signerAddress, 84532));
-    expect(boundary.isProtectedMinterCovered({ tenantId: TENANT, id: AGENT, walletAddress: signerAddress })).toBe(true);
+    expect(
+      boundary.isProtectedMinterCovered({
+        tenantId: TENANT,
+        id: AGENT,
+        walletAddress: signerAddress,
+      }),
+    ).toBe(true);
     expect(await boundary.isQuarantinedProtectedAgent(AGENT)).toBe(false);
     expect(
       (await boundary.assertProtectedPostureAtStartup()).filter((e) => e.tenantId === TENANT),
@@ -441,11 +483,30 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
 
     // Still no ordinary capability for the activated signer.
     for (const [name, fn] of [
-      ["signMessage", () => call("POST", `/vault/${AGENT}/sign-message`, bearer(ownerToken), { message: "x" })],
+      [
+        "signMessage",
+        () => call("POST", `/vault/${AGENT}/sign-message`, bearer(ownerToken), { message: "x" }),
+      ],
       ["export", () => call("POST", `/vault/${AGENT}/export`, bearer(ownerToken), {})],
-      ["import", () => call("POST", `/vault/${AGENT}/import`, bearer(ownerToken), { privateKey: `0x${"2".repeat(64)}` })],
+      [
+        "import",
+        () =>
+          call("POST", `/vault/${AGENT}/import`, bearer(ownerToken), {
+            privateKey: `0x${"2".repeat(64)}`,
+          }),
+      ],
       ["delete", () => call("DELETE", `/agents/${AGENT}`, bearer(ownerToken))],
-      ["unshapedCall", () => call("POST", `/vault/${AGENT}/sign`, bearer(jwt), { to: RECIPIENT, value: "1", data: "0x", chainId: 84532, executionRef: ref() })],
+      [
+        "unshapedCall",
+        () =>
+          call("POST", `/vault/${AGENT}/sign`, bearer(jwt), {
+            to: RECIPIENT,
+            value: "1",
+            data: "0x",
+            chainId: 84532,
+            executionRef: ref(),
+          }),
+      ],
       ["apiKeyPropose", () => propose(AGENT, rootHeaders(), 84532)],
     ] as Array<[string, () => Promise<Response>]>) {
       const r = await fn();
@@ -461,9 +522,13 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     const txId = b.data.txId as string;
 
     // A member of the tenant (not in the allowlist) cannot approve; the pinned owner can.
-    const member = await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(memberToken), { reviewDigest: b.data.reviewDigest });
+    const member = await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(memberToken), {
+      reviewDigest: b.data.reviewDigest,
+    });
     expect(member.status).toBe(403);
-    const ok = await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(ownerToken), { reviewDigest: b.data.reviewDigest });
+    const ok = await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(ownerToken), {
+      reviewDigest: b.data.reviewDigest,
+    });
     expect(ok.status).toBe(200);
     expect(signedBytes).toHaveLength(1);
     expect(signedBytes[0]!.chainId).toBe(84532);
@@ -484,7 +549,9 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     expect(r.status).toBe(202);
     const b = await json(r);
     expect(b.data.review.chainId).toBe(8453);
-    const ok = await call("POST", `/vault/${AGENT}/approve/${b.data.txId}`, bearer(adminToken), { reviewDigest: b.data.reviewDigest });
+    const ok = await call("POST", `/vault/${AGENT}/approve/${b.data.txId}`, bearer(adminToken), {
+      reviewDigest: b.data.reviewDigest,
+    });
     expect(ok.status).toBe(200);
     expect(signedBytes).toHaveLength(2);
     expect(signedBytes[1]!.chainId).toBe(8453);
@@ -508,8 +575,12 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
         verifiedTokens: [{ address: TOKEN, provenance: "0xdeploytx:8453:re-verified" }],
       }),
     );
-    expect(boundary.getProtectedMinterManifestDigest().toLowerCase()).not.toBe(digestA.toLowerCase());
-    const stale = await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(ownerToken), { reviewDigest: b.data.reviewDigest });
+    expect(boundary.getProtectedMinterManifestDigest().toLowerCase()).not.toBe(
+      digestA.toLowerCase(),
+    );
+    const stale = await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(ownerToken), {
+      reviewDigest: b.data.reviewDigest,
+    });
     expect(stale.status).toBe(403);
     expect((await json(stale)).error).toMatch(/manifest changed/);
     const [qb] = await getDb().select().from(approvalQueue).where(eq(approvalQueue.txId, txId));
@@ -519,7 +590,13 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     // Replacing with an address-mismatched manifest quarantines again, even
     // though the previous manifest was valid: approval and proposal both 403.
     boundary.installProtectedMinterManifest(manifest(`0x${"b".repeat(40)}`, 8453));
-    expect((await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(ownerToken), { reviewDigest: b.data.reviewDigest })).status).toBe(403);
+    expect(
+      (
+        await call("POST", `/vault/${AGENT}/approve/${txId}`, bearer(ownerToken), {
+          reviewDigest: b.data.reviewDigest,
+        })
+      ).status,
+    ).toBe(403);
     expect((await propose(AGENT, bearer(await freshAgentJwt()), 8453)).status).toBe(403);
     boundary.installProtectedMinterManifest(manifest(signerAddress, 8453));
   });
@@ -527,7 +604,9 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
   it("[T8] an ordinary agent cannot get protected-minter authority through this endpoint", async () => {
     boundary.installProtectedMinterManifest(manifest(signerAddress, 8453));
     // Ordinary agent's credential: refused by the endpoint outright.
-    expect((await createProtected(bearer(ordinaryAgentJwt), { id: "ceremony-escalate" })).status).toBe(403);
+    expect(
+      (await createProtected(bearer(ordinaryAgentJwt), { id: "ceremony-escalate" })).status,
+    ).toBe(403);
     expect(await protectedRow("ceremony-escalate")).toBeNull();
     // Ordinary rows stay ordinary: marker false, and the manifest does not cover them.
     expect((await protectedRow(ORDINARY))?.protected).toBe(false);
@@ -538,9 +617,15 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     const second = await createProtected(bearer(ownerToken), { id: "ceremony-second" });
     expect(second.status).toBe(201);
     expect(await boundary.isQuarantinedProtectedAgent("ceremony-second")).toBe(true);
-    expect((await propose("ceremony-second", bearer(await freshAgentJwt("ceremony-second")), 8453)).status).toBe(403);
+    expect(
+      (await propose("ceremony-second", bearer(await freshAgentJwt("ceremony-second")), 8453))
+        .status,
+    ).toBe(403);
     expect((await propose("ceremony-second", rootHeaders(), 8453)).status).toBe(403);
-    expect((await call("POST", `/vault/ceremony-second/sign-message`, rootHeaders(), { message: "x" })).status).toBe(403);
+    expect(
+      (await call("POST", `/vault/ceremony-second/sign-message`, rootHeaders(), { message: "x" }))
+        .status,
+    ).toBe(403);
     // The ordinary agent itself cannot propose for the protected signer.
     expect((await propose(AGENT, bearer(ordinaryAgentJwt), 8453)).status).toBe(403);
   });
@@ -551,17 +636,27 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     expect((await propose(AGENT, key, 8453)).status).toBe(403);
     expect((await call("POST", `/agents/${AGENT}/token`, key, {})).status).toBe(403);
     expect((await call("POST", `/vault/${AGENT}/export`, key, {})).status).toBe(403);
-    expect((await call("POST", `/vault/${AGENT}/sign-message`, key, { message: "x" })).status).toBe(403);
+    expect((await call("POST", `/vault/${AGENT}/sign-message`, key, { message: "x" })).status).toBe(
+      403,
+    );
     expect((await call("DELETE", `/agents/${AGENT}`, key)).status).toBe(403);
-    expect((await call("POST", `/agents/${AGENT}/wallets`, key, { chainFamily: "evm" })).status).toBe(403);
-    expect((await call("POST", "/agents/batch", key, { agents: [{ id: AGENT, name: AGENT }] })).status).toBe(403);
+    expect(
+      (await call("POST", `/agents/${AGENT}/wallets`, key, { chainFamily: "evm" })).status,
+    ).toBe(403);
+    expect(
+      (await call("POST", "/agents/batch", key, { agents: [{ id: AGENT, name: AGENT }] })).status,
+    ).toBe(403);
     // Other tenant's owner/API key: no visibility, no activation.
     expect([403, 404]).toContain((await propose(AGENT, bearer(otherOwnerToken), 8453)).status);
-    expect((await createProtected(rootHeaders(otherRootKey, OTHER_TENANT), { id: AGENT })).status).toBe(403);
+    expect(
+      (await createProtected(rootHeaders(otherRootKey, OTHER_TENANT), { id: AGENT })).status,
+    ).toBe(403);
     // Agent ids are global: another tenant's owner cannot squat or rebind the protected id.
     expect((await createProtected(bearer(otherOwnerToken), { id: AGENT })).status).toBe(409);
     // Vault-level: import/export refuse; createAgent refuses the existing id.
-    await expect(vault.importKey(TENANT, AGENT, `0x${"2".repeat(64)}`, "evm")).rejects.toThrow(/Protected signer:/);
+    await expect(vault.importKey(TENANT, AGENT, `0x${"2".repeat(64)}`, "evm")).rejects.toThrow(
+      /Protected signer:/,
+    );
     await expect(vault.exportPrivateKey(TENANT, AGENT)).rejects.toThrow(/Protected signer:/);
     await expect(vault.createAgent(TENANT, AGENT, AGENT)).rejects.toThrow(/already exists/);
     const row = await protectedRow();
@@ -593,6 +688,7 @@ describe.serial("SF-1 ceremony: POST /agents/protected", () => {
     const r = await call("GET", `/agents/${AGENT}`, bearer(ownerToken));
     expect(r.status).toBe(200);
     const b = await json(r);
-    for (const k of ["roles", "minterRole", "safe", "safeAdmin"]) expect(b.data?.[k]).toBeUndefined();
+    for (const k of ["roles", "minterRole", "safe", "safeAdmin"])
+      expect(b.data?.[k]).toBeUndefined();
   });
 });
