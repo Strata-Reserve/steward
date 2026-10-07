@@ -9,11 +9,14 @@
  *   - No DATABASE_URL set     → fall back to PGLite
  *   - STEWARD_PGLITE_PATH    → persistence directory (default ~/.steward/data)
  *   - STEWARD_PGLITE_MEMORY  → if "true", use in-memory (no persistence)
+ *   - STEWARD_PGLITE_SNAPSHOT → test boot path only (NODE_ENV=test + memory://):
+ *                               "0" disables the migrated-snapshot cache
  */
 
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
@@ -24,6 +27,9 @@ import * as schemaAuth from "./schema-auth";
 export type PGLiteDb = ReturnType<typeof drizzle<typeof schema & typeof schemaAuth>>;
 
 let globalPGLite: { client: PGlite; db: PGLiteDb } | undefined;
+
+const MIGRATIONS_FOLDER = new URL("../drizzle", import.meta.url).pathname;
+const MEMORY_TARGET = "memory://";
 
 /**
  * Resolve the data directory for PGLite persistence.
@@ -52,8 +58,13 @@ export function shouldUsePGLite(): boolean {
  * The `__steward_migrations` table tracks which files have already been applied
  * so restarts with a persistent data dir don't re-run migrations.
  */
+async function listMigrationFiles(): Promise<string[]> {
+  const files = await readdir(MIGRATIONS_FOLDER);
+  return files.filter((f) => f.endsWith(".sql") && !f.startsWith(".")).sort();
+}
+
 async function runPGLiteMigrations(client: PGlite): Promise<void> {
-  const migrationsFolder = new URL("../drizzle", import.meta.url).pathname;
+  const migrationsFolder = MIGRATIONS_FOLDER;
 
   // Create tracking table
   await client.exec(`
@@ -70,8 +81,7 @@ async function runPGLiteMigrations(client: PGlite): Promise<void> {
   const appliedSet = new Set(applied.rows.map((r) => r.tag));
 
   // Read all SQL files (skip meta/ directory and non-.sql)
-  const files = await readdir(migrationsFolder);
-  const sqlFiles = files.filter((f) => f.endsWith(".sql") && !f.startsWith(".")).sort();
+  const sqlFiles = await listMigrationFiles();
 
   for (const file of sqlFiles) {
     const tag = file.replace(/\.sql$/, "");
@@ -107,6 +117,79 @@ async function runPGLiteMigrations(client: PGlite): Promise<void> {
   }
 }
 
+// ─── Test boot path: migrated-snapshot cache ─────────────────────────────────
+//
+// Every in-memory PGLite boot pays for initdb (~2 s of WASM work) plus a full
+// replay of drizzle/*.sql. Under `bun test --isolate` each test file boots its
+// own instance, so with dozens of PGLite-backed files that cost dominates the
+// per-file beforeAll. In tests we instead build the migrated data dir once,
+// dump it to a tarball keyed by the migration contents + PGLite version, and
+// boot every later instance from that tarball via `loadDataDir` (~0.25 s).
+//
+// The cache is only consulted for `memory://` targets when NODE_ENV=test (set
+// by `bun test`); persistent/desktop boots are untouched. Migrations are still
+// run after a snapshot load, so drizzle/*.sql stays the source of truth — on a
+// warm snapshot that is a single SELECT against __steward_migrations.
+
+function snapshotEnabled(connectionTarget: string): boolean {
+  if (connectionTarget !== MEMORY_TARGET) return false;
+  if (process.env.NODE_ENV !== "test") return false;
+  return process.env.STEWARD_PGLITE_SNAPSHOT !== "0";
+}
+
+async function pgliteVersion(): Promise<string> {
+  try {
+    const pkgUrl = import.meta.resolve("@electric-sql/pglite/package.json");
+    const pkg = JSON.parse(await readFile(new URL(pkgUrl), "utf-8")) as { version?: string };
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/** Content hash of every migration file + PGLite version: the snapshot key. */
+async function snapshotPath(): Promise<string> {
+  const hash = createHash("sha256");
+  hash.update(`pglite:${await pgliteVersion()}\n`);
+  for (const file of await listMigrationFiles()) {
+    hash.update(`${file}\n`);
+    hash.update(await readFile(join(MIGRATIONS_FOLDER, file)));
+    hash.update("\n");
+  }
+  const dir = process.env.STEWARD_PGLITE_SNAPSHOT_DIR ?? tmpdir();
+  return join(dir, `steward-pglite-snapshot-${hash.digest("hex").slice(0, 16)}.tar`);
+}
+
+/** Cold boot + migrate + dump. Written atomically so parallel workers never read a torn file. */
+async function buildSnapshot(path: string): Promise<void> {
+  const started = performance.now();
+  const client = new PGlite(MEMORY_TARGET);
+  try {
+    await runPGLiteMigrations(client);
+    await client.exec("CHECKPOINT");
+    const dump = await client.dumpDataDir("none");
+    const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+    await mkdir(resolve(path, ".."), { recursive: true });
+    await writeFile(tmp, new Uint8Array(await dump.arrayBuffer()));
+    await rename(tmp, path);
+  } finally {
+    await client.close();
+  }
+  console.log(
+    `[pglite] Built migrated snapshot in ${Math.round(performance.now() - started)}ms: ${path}`,
+  );
+}
+
+async function bootFromSnapshot(): Promise<PGlite> {
+  const path = await snapshotPath();
+  if (!existsSync(path)) {
+    await buildSnapshot(path);
+  }
+  const bytes = await readFile(path);
+  const loadDataDir = new Blob([new Uint8Array(bytes)], { type: "application/x-tar" });
+  return new PGlite({ dataDir: MEMORY_TARGET, loadDataDir });
+}
+
 /**
  * Create a PGLite-backed Drizzle instance.
  *
@@ -129,10 +212,14 @@ export async function createPGLiteDb(dataDir?: string): Promise<{ client: PGlite
   }
 
   console.log(`[pglite] Initializing PGLite at: ${connectionTarget}`);
-  const client = new PGlite(connectionTarget);
+  const started = performance.now();
+  const client = snapshotEnabled(connectionTarget)
+    ? await bootFromSnapshot()
+    : new PGlite(connectionTarget);
 
-  // Run migrations
+  // Run migrations (no-op after a snapshot load: every tag is already recorded)
   await runPGLiteMigrations(client);
+  console.log(`[pglite] Ready in ${Math.round(performance.now() - started)}ms`);
 
   const db = drizzle(client, {
     schema: { ...schema, ...schemaAuth },
