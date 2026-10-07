@@ -669,24 +669,44 @@ function isMockEmailEnabled(): boolean {
   return process.env.EMAIL_PROVIDER === "mock" && process.env.NODE_ENV !== "production";
 }
 
-function buildGlobalEmailAuth(overrides?: { baseUrl?: string; callbackPath?: string }): EmailAuth {
+/**
+ * Non-secret per-tenant fields that must survive even when the tenant sends
+ * through the global (env-backed) Resend provider. STRATA-1448: a
+ * magic-link-only tenant (no per-tenant apiKeyEncrypted) previously lost
+ * templateId/subjectOverride/replyTo here, so its sign-in email rendered with
+ * the default Steward subject/heading/logo.
+ */
+interface GlobalEmailAuthOverrides {
+  baseUrl?: string;
+  callbackPath?: string;
+  templateId?: string;
+  subjectOverride?: string;
+  replyTo?: string;
+}
+
+function buildGlobalEmailAuth(overrides?: GlobalEmailAuthOverrides): EmailAuth {
   const resendKey = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM || "login@steward.fi";
   // Mock takes precedence in non-production for deterministic e2e testing.
   const provider = isMockEmailEnabled()
     ? new MockEmailProvider()
     : resendKey
       ? new ResendProvider({
           apiKey: resendKey,
-          from: process.env.EMAIL_FROM || "login@steward.fi",
+          from,
+          replyTo: overrides?.replyTo,
         })
       : undefined;
 
   return new EmailAuth({
-    from: process.env.EMAIL_FROM || "login@steward.fi",
+    from,
     baseUrl: overrides?.baseUrl?.replace(/\/$/, "") || process.env.APP_URL || "https://steward.fi",
     callbackPath: overrides?.callbackPath,
     provider,
     tokenStore: getTokenStore(),
+    templateId: overrides?.templateId,
+    subjectOverride: overrides?.subjectOverride,
+    replyTo: overrides?.replyTo,
   });
 }
 
@@ -759,10 +779,14 @@ async function createEmailAuthForTenant(tenantId: string): Promise<EmailAuth> {
   if (!emailConfig || !emailConfig.apiKeyEncrypted) {
     // No per-tenant Resend config (or only magic-link override) — use the
     // global env-backed provider but still honor the per-tenant magic-link
-    // overrides if present.
+    // routing AND branding overrides if present. Branding (templateId /
+    // subjectOverride / replyTo) is independent of who holds the Resend key.
     return buildGlobalEmailAuth({
       baseUrl: magicLinkBaseUrl,
       callbackPath,
+      templateId: emailConfig?.templateId,
+      subjectOverride: emailConfig?.subjectOverride,
+      replyTo: emailConfig?.replyTo,
     });
   }
 
