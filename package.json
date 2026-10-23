@@ -9,10 +9,10 @@
   "scripts": {
     "dev": "turbo dev",
     "build": "turbo build",
-    "lint": "bunx @biomejs/biome check packages web scripts package.json turbo.json",
-    "lint:fix": "bunx @biomejs/biome check --write packages web scripts package.json turbo.json",
-    "format": "bunx @biomejs/biome format --write packages web scripts package.json turbo.json",
-    "format:check": "bunx @biomejs/biome format packages web scripts package.json turbo.json",
+    "lint": "bunx @biomejs/biome@2.4.11 check packages web scripts package.json turbo.json",
+    "lint:fix": "bunx @biomejs/biome@2.4.11 check --write packages web scripts package.json turbo.json",
+    "format": "bunx @biomejs/biome@2.4.11 format --write packages web scripts package.json turbo.json",
+    "format:check": "bunx @biomejs/biome@2.4.11 format packages web scripts package.json turbo.json",
     "typecheck": "bunx turbo run build --filter='./packages/*' && bunx tsc --noEmit --project web/tsconfig.json",
     "verify": "bun run lint && bun run typecheck && bun run test",
     "test": "turbo test && bun run test:e2e:all",
@@ -39,7 +39,7 @@
   "overrides": {
     "source-map-js": "^1.2.2",
     "tinypool": "2.1.2",
-    "vite": "7.3.5",
+    "vite": "7.3.7",
     "axios": "^1.20.0",
     "langsmith": "^0.7.1",
     "lodash": "^4.17.23",
@@ -61,7 +61,10 @@
     "linkify-it": "^6.1.0",
     "pdfjs-dist": "^6.2.108",
     "browserslist": "^4.28.7",
-    "toml": "^4.2.0",
-    "metro": "^0.84.6"
+    "toml": "^5.0.1",
+    "metro": "^0.84.6",
+    "follow-redirects": "^1.16.1",
+    "handlebars": "^4.7.10",
+    "markdown-it": "^14.3.3"
   }
 }
