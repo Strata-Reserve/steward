@@ -566,6 +566,8 @@ function getPasskeyAuth(requestOrigin?: string): PasskeyAuth {
 // ─── EmailAuth cache ──────────────────────────────────────────────────────────
 
 const _emailAuthByTenant = new Map<string, Promise<EmailAuth>>();
+/** STRATA-1596: per-{tenant, request-origin} EmailAuth, keyed `${tenantId}\u0000${origin}`. */
+const _emailAuthByTenantOrigin = new Map<string, Promise<EmailAuth>>();
 let _emailKeyStore: KeyStore | null = null;
 let _oauthKeyStore: KeyStore | null = null;
 
@@ -726,6 +728,99 @@ async function loadTenantEmailConfig(tenantId: string): Promise<TenantEmailConfi
 }
 
 /**
+ * STRATA-1596: pick the magic-link base URL for THIS request.
+ *
+ * A tenant can serve its app from more than one origin (Strata: the staging
+ * app plus the public Base Sepolia demo at markets.stratareserve.co, both
+ * backed by the same staging Steward tenant). `magicLinkBaseUrl` is a single
+ * value, so a user who starts sign-in on origin B gets a link that lands on
+ * origin A. The callback then verifies fine but the session is written to
+ * A's localStorage and B never sees it (JJ's report: "authenticated to
+ * staging and cannot access markets subdomain").
+ *
+ * Rule: if the request carries an `Origin` header that is an EXACT entry in
+ * the tenant's `allowedOrigins` (the same list tenant-cors consults, so the
+ * browser could only have made this call from an origin the tenant already
+ * trusts), build the link against that origin with the tenant's configured
+ * `magicLinkCallbackPath`. Otherwise fall back to the stored
+ * `magicLinkBaseUrl` behaviour unchanged.
+ *
+ * Deliberately NOT: a wildcard match (`*` in allowedOrigins does not make an
+ * arbitrary Origin a valid link target), a lookup failure falling through to
+ * the request origin (a failed policy read is not evidence the origin is
+ * trusted), or any change when the tenant has no `magicLinkBaseUrl` (those
+ * tenants use Steward's own callback and are untouched).
+ */
+async function resolveRequestMagicLinkOrigin(
+  tenantId: string,
+  requestOrigin: string | undefined,
+): Promise<string | null> {
+  if (!requestOrigin) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(requestOrigin);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+  if (parsed.origin !== requestOrigin) return null; // must be a bare origin
+
+  let allowedOrigins: string[];
+  try {
+    const [row] = await getDb()
+      .select({ allowedOrigins: tenantConfigs.allowedOrigins })
+      .from(tenantConfigs)
+      .where(eq(tenantConfigs.tenantId, tenantId));
+    allowedOrigins = row?.allowedOrigins ?? [];
+  } catch (err) {
+    console.error(
+      "[auth] Failed to load tenant allowedOrigins for magic-link origin; using configured base URL:",
+      err,
+    );
+    return null;
+  }
+
+  // Exact entry only, same comparison as the tenant CORS gate (tenant-cors.ts
+  // `origins.includes(origin)`). No trimming or normalisation: a padded or
+  // otherwise non-canonical stored entry is not an allowlisted origin.
+  return allowedOrigins.includes(requestOrigin) ? requestOrigin : null;
+}
+
+/**
+ * Return an EmailAuth whose magic link points at `origin` instead of the
+ * tenant's stored `magicLinkBaseUrl`. Only applies when the tenant already
+ * opted into app-hosted callbacks (has a `magicLinkBaseUrl`); every other
+ * provider/template setting is inherited from the tenant's normal EmailAuth.
+ * Cached per {tenant, origin} alongside the per-tenant cache so a hot login
+ * path does not rebuild providers on every request.
+ */
+async function getEmailAuthForTenantOrigin(
+  tenantId: string,
+  requestOrigin: string | undefined,
+): Promise<EmailAuth> {
+  const emailConfig = await loadTenantEmailConfig(tenantId);
+  if (!emailConfig?.magicLinkBaseUrl) return getEmailAuthForTenant(tenantId);
+
+  const origin = await resolveRequestMagicLinkOrigin(tenantId, requestOrigin);
+  if (!origin || origin === emailConfig.magicLinkBaseUrl.replace(/\/$/, "")) {
+    return getEmailAuthForTenant(tenantId);
+  }
+
+  const cacheKey = `${tenantId}\u0000${origin}`;
+  const cached = _emailAuthByTenantOrigin.get(cacheKey);
+  if (cached) return cached;
+
+  const pending = createEmailAuthForTenant(tenantId, { magicLinkBaseUrl: origin }).catch(
+    (error) => {
+      _emailAuthByTenantOrigin.delete(cacheKey);
+      throw error;
+    },
+  );
+  _emailAuthByTenantOrigin.set(cacheKey, pending);
+  return pending;
+}
+
+/**
  * Resolve a tenant's human display name (e.g. "Strata") for branding the
  * verification-code email's subject/copy. Returns null when the tenant has no
  * row or no name, in which case the caller falls back to a neutral default.
@@ -743,7 +838,10 @@ async function loadTenantDisplayName(tenantId: string): Promise<string | null> {
   }
 }
 
-async function createEmailAuthForTenant(tenantId: string): Promise<EmailAuth> {
+async function createEmailAuthForTenant(
+  tenantId: string,
+  overrides?: { magicLinkBaseUrl?: string },
+): Promise<EmailAuth> {
   const emailConfig = await loadTenantEmailConfig(tenantId);
 
   // Per-tenant magic-link override: when a tenant supplies its own
@@ -751,7 +849,9 @@ async function createEmailAuthForTenant(tenantId: string): Promise<EmailAuth> {
   // lands on the tenant's app (e.g. https://waifu.fun/auth/email/verify)
   // instead of Steward's built-in callback (which redirects to
   // EMAIL_AUTH_REDIRECT_BASE_URL and is hard-defaulted to elizacloud.ai).
-  const magicLinkBaseUrl = emailConfig?.magicLinkBaseUrl;
+  // STRATA-1596: a per-request override (the validated request Origin) may
+  // replace the stored base URL; the callback path is still the tenant's.
+  const magicLinkBaseUrl = overrides?.magicLinkBaseUrl ?? emailConfig?.magicLinkBaseUrl;
   const callbackPath = magicLinkBaseUrl
     ? emailConfig?.magicLinkCallbackPath || "/auth/email/verify"
     : undefined; // let EmailAuth fall through to its DEFAULT_CALLBACK
@@ -810,10 +910,14 @@ export async function getEmailAuthForTenant(tenantId: string): Promise<EmailAuth
 
 export function invalidateEmailAuthForTenant(tenantId: string): void {
   _emailAuthByTenant.delete(tenantId);
+  for (const key of _emailAuthByTenantOrigin.keys()) {
+    if (key.startsWith(`${tenantId}\u0000`)) _emailAuthByTenantOrigin.delete(key);
+  }
 }
 
 export function clearEmailAuthTenantCacheForTests(): void {
   _emailAuthByTenant.clear();
+  _emailAuthByTenantOrigin.clear();
 }
 
 export function clearOAuthTokenKeyStoreForTests(): void {
@@ -2405,7 +2509,10 @@ auth.post("/email/send", async (c) => {
 
   const email = body.email.toLowerCase().trim();
   const resolvedTenantId = c.req.header("X-Steward-Tenant") || body.tenantId || _DEFAULT_TENANT_ID;
-  const emailAuth = await getEmailAuthForTenant(resolvedTenantId);
+  // STRATA-1596: send the link back to the origin the user is actually on,
+  // when that origin is in the tenant's allowlist. See
+  // resolveRequestMagicLinkOrigin for the exact rule.
+  const emailAuth = await getEmailAuthForTenantOrigin(resolvedTenantId, c.req.header("origin"));
   const { expiresAt } = await emailAuth.sendMagicLink(email);
 
   return c.json<ApiResponse<{ expiresAt: string }>>({
