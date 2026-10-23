@@ -22,6 +22,7 @@ import { invalidateTenantCorsCache } from "../middleware/tenant-cors";
 import { trackAuditEvent } from "../services/audit";
 import { type ApiResponse, type AppVariables, db, safeJsonParse } from "../services/context";
 import { isProtectedMinter } from "../services/prod-minter-boundary";
+import { invalidateEmailAuthForTenant } from "./auth";
 import { requireTenantId } from "./tenants";
 export const tenantConfigRoutes = new Hono<{ Variables: AppVariables }>();
 
@@ -131,8 +132,11 @@ tenantConfigRoutes.put("/:id/config", requireTenantId, async (c) => {
     })
     .returning();
 
-  // Evict the cached origins so the next request picks up the new config
+  // Evict the cached origins so the next request picks up the new config.
+  // STRATA-1596: the per-{tenant, origin} magic-link EmailAuth cache is keyed
+  // on the same allowlist, so a removed origin must stop producing links too.
   invalidateTenantCorsCache(tenantId);
+  invalidateEmailAuthForTenant(tenantId);
 
   trackAuditEvent({
     tenantId,
