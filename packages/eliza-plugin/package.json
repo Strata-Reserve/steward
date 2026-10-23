@@ -31,7 +31,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "lint": "bunx @biomejs/biome check src package.json tsconfig.json tsup.config.ts vitest.config.ts",
+    "lint": "bunx @biomejs/biome@2.4.11 check src package.json tsconfig.json tsup.config.ts vitest.config.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   }
