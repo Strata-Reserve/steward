@@ -144,6 +144,19 @@ describe("POST /email/send magic-link origin (STRATA-1596)", () => {
     expect(lastLink(email).startsWith(`${STORED_BASE}/auth/callback?`)).toBe(true);
   });
 
+  it("does not match a padded allowlist entry (exact comparison, same as tenant CORS)", async () => {
+    await setTenantConfig({
+      magicLinkBaseUrl: STORED_BASE,
+      magicLinkCallbackPath: "/auth/callback",
+      allowedOrigins: [STORED_BASE, ` ${OTHER_ALLOWED} `],
+    });
+    const email = "padded-entry@example.test";
+    expect((await sendMagicLink(email, OTHER_ALLOWED)).status).toBe(200);
+    const link = lastLink(email);
+    expect(link.startsWith(`${STORED_BASE}/auth/callback?`)).toBe(true);
+    expect(link).not.toContain("markets.example.test");
+  });
+
   it("ignores a non-https Origin even when it is allowlisted", async () => {
     const httpOrigin = "http://localhost:5173";
     await setTenantConfig({

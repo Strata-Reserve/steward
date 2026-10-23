@@ -780,7 +780,10 @@ async function resolveRequestMagicLinkOrigin(
     return null;
   }
 
-  return allowedOrigins.some((o) => o.trim() === requestOrigin) ? requestOrigin : null;
+  // Exact entry only, same comparison as the tenant CORS gate (tenant-cors.ts
+  // `origins.includes(origin)`). No trimming or normalisation: a padded or
+  // otherwise non-canonical stored entry is not an allowlisted origin.
+  return allowedOrigins.includes(requestOrigin) ? requestOrigin : null;
 }
 
 /**
