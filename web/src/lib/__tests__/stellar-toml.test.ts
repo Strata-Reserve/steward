@@ -1,5 +1,5 @@
 /**
- * STRATA-1494 regression: the root `overrides` pins `toml` to ^4 while
+ * STRATA-1494 regression: the root `overrides` pins `toml` to ^5 while
  * @stellar/stellar-sdk declares ^3. The sdk reaches web only through the Trezor
  * Solana adapter chain and calls exactly one toml API, `toml.parse(text)`, on the
  * fetched `/.well-known/stellar.toml` (lib/stellartoml/index.js:55). This test
@@ -47,9 +47,9 @@ is_asset_anchored = true
 describe("stellar.toml parsing via the toml the stellar-sdk resolves", () => {
   const req = sdkRequire();
 
-  test("the sdk resolves the overridden toml 4.x, not its declared 3.x", () => {
+  test("the sdk resolves the overridden toml 5.x, not its declared 3.x", () => {
     const { version } = req("toml/package.json") as { version: string };
-    expect(version.split(".")[0]).toBe("4");
+    expect(version.split(".")[0]).toBe("5");
   });
 
   test("toml.parse yields the fields the sdk's StellarToml.Resolver returns", () => {
