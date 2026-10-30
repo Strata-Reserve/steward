@@ -21,7 +21,14 @@ import { beforeEach, describe, expect, it, mock } from "bun:test";
 // ─── Mock the config lookup ───────────────────────────────────────────────────
 // `behaviour` is reassigned per test to select the scenario under exercise.
 
-type Behaviour = { kind: "origins"; origins: string[] } | { kind: "throw"; error: Error };
+// `norow` models the condition that CAUSED the outage: the query SUCCEEDS and
+// returns zero rows, which is different from both "row with empty list" and
+// "query threw". The original suite had no way to express it, which is exactly
+// why 12 passing tests still shipped a broken prod login.
+type Behaviour =
+  | { kind: "origins"; origins: string[] }
+  | { kind: "norow" }
+  | { kind: "throw"; error: Error };
 
 let behaviour: Behaviour = { kind: "origins", origins: [] };
 let selectCalls = 0;
@@ -32,6 +39,7 @@ const db = {
       where: () => {
         selectCalls += 1;
         if (behaviour.kind === "throw") return Promise.reject(behaviour.error);
+        if (behaviour.kind === "norow") return Promise.resolve([]);
         return Promise.resolve([{ allowedOrigins: behaviour.origins }]);
       },
     }),
@@ -44,7 +52,7 @@ mock.module("@stwd/db", () => ({
   eq: () => true,
 }));
 
-const { tenantCors } = await import("../middleware/tenant-cors");
+const { tenantCors, invalidateTenantCorsCache } = await import("../middleware/tenant-cors");
 
 // ─── Minimal Hono-shaped context ──────────────────────────────────────────────
 
@@ -220,6 +228,119 @@ describe("explicit allowlist behaviour is PRESERVED", () => {
     expect(inv.status).toBe(204);
     expect(acao(inv)).toBe("https://anything.example.com");
     expect(inv.headers.Vary).toBe("Origin");
+  });
+});
+
+describe("STRATA-1115 follow-up: the two config authorities must AGREE", () => {
+  // The outage: `GET /tenants/strata/config` reported a healthy config out of
+  // DEFAULT_TENANT_CONFIGS while the CORS middleware queried the DB directly,
+  // found no row, and denied everything. Two sources of truth, one of them
+  // invisible to the control that actually enforced.
+  //
+  // These cases must all use the REAL tenant id `strata`, because the fallback
+  // is keyed on it — so unlike the suites above they cannot rely on a distinct
+  // id per test to dodge the 60s cache. They evict explicitly instead. Without
+  // this, case 1 would cache the default and every later case would assert
+  // against a stale entry rather than against the code under test.
+  beforeEach(() => {
+    invalidateTenantCorsCache("strata");
+    invalidateTenantCorsCache("tenant-that-does-not-exist");
+  });
+
+  it("REGRESSION: a tenant with a code default but NO DB row is ALLOWED", async () => {
+    // This is the exact prod condition. Pre-fix this denied, breaking login.
+    behaviour = { kind: "norow" };
+    const inv = await invoke({
+      method: "OPTIONS",
+      origin: "https://app.stratareserve.co",
+      tenantId: "strata",
+    });
+
+    expect(inv.status).toBe(204);
+    expect(acao(inv)).toBe("https://app.stratareserve.co");
+    expect(inv.headers.Vary).toBe("Origin");
+  });
+
+  it("the default is an ALLOWLIST, not a wildcard: other origins still denied", async () => {
+    // Guards the obvious wrong fix — "no row => treat as permissive". The
+    // default grants only the origins it names.
+    behaviour = { kind: "norow" };
+    const inv = await invoke({
+      method: "OPTIONS",
+      origin: "https://evil.example.com",
+      tenantId: "strata",
+    });
+
+    expect(inv.status).toBe(403);
+    expect(acao(inv)).toBeUndefined();
+  });
+
+  it("REGRESSION: a tenant with NEITHER row NOR default is still DENIED", async () => {
+    // The fallback must not become a general fail-open. An unknown tenant has
+    // no operator decision anywhere, so there is nothing to honour.
+    behaviour = { kind: "norow" };
+    const inv = await invoke({
+      method: "OPTIONS",
+      origin: "https://app.stratareserve.co",
+      tenantId: "tenant-that-does-not-exist",
+    });
+
+    expect(inv.status).toBe(403);
+    expect(acao(inv)).toBeUndefined();
+  });
+
+  it("a PRESENT row with an EMPTY allowlist OVERRIDES the code default", async () => {
+    // The sharpest case. An operator who saved an empty allowlist for a tenant
+    // that HAS a code default decided "no cross-origin reader". A fallback keyed
+    // on `row?.allowedOrigins ?? []` cannot tell that from "no row" and would
+    // silently re-grant the default, overriding a live revocation.
+    behaviour = { kind: "origins", origins: [] };
+    const inv = await invoke({
+      method: "OPTIONS",
+      origin: "https://app.stratareserve.co",
+      tenantId: "strata",
+    });
+
+    expect(inv.status).toBe(403);
+    expect(acao(inv)).toBeUndefined();
+  });
+
+  it("a PRESENT row NARROWS the code default rather than being merged with it", async () => {
+    // Defaults are a floor, not a ceiling: DB config REPLACES, never unions.
+    // If the two were merged, the default origin would survive a redefinition.
+    behaviour = { kind: "origins", origins: ["https://other.stratareserve.co"] };
+
+    const configured = await invoke({
+      method: "OPTIONS",
+      origin: "https://other.stratareserve.co",
+      tenantId: "strata",
+    });
+    expect(configured.status).toBe(204);
+    expect(acao(configured)).toBe("https://other.stratareserve.co");
+
+    invalidateTenantCorsCache("strata");
+    const defaultOrigin = await invoke({
+      method: "OPTIONS",
+      origin: "https://app.stratareserve.co",
+      tenantId: "strata",
+    });
+    expect(defaultOrigin.status).toBe(403);
+    expect(acao(defaultOrigin)).toBeUndefined();
+  });
+
+  it("a DB ERROR still denies a tenant that HAS a code default", async () => {
+    // The fallback applies to a SUCCESSFUL read returning zero rows. A throw
+    // means we learned nothing, so #16's denial must survive untouched — the
+    // default must not become a consolation prize for a failed lookup.
+    behaviour = { kind: "throw", error: new Error("connection terminated unexpectedly") };
+    const inv = await invoke({
+      method: "OPTIONS",
+      origin: "https://app.stratareserve.co",
+      tenantId: "strata",
+    });
+
+    expect(inv.status).toBe(403);
+    expect(acao(inv)).toBeUndefined();
   });
 });
 

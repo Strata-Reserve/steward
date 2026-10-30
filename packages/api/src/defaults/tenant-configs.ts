@@ -306,9 +306,34 @@ export const ELIZA_CLOUD_CONFIG: TenantControlPlaneConfig = {
   },
 };
 
+/**
+ * Strata Reserve's own tenant.
+ *
+ * STRATA-1115 follow-up. This entry exists because its ABSENCE caused a live
+ * outage: prod had no `tenant_configs` row for `strata`, so the fail-closed CORS
+ * middleware resolved an empty allowlist and correctly denied every request from
+ * the prod dashboard. The middleware was right; the configuration was missing.
+ *
+ * `allowedOrigins` here is a FLOOR, not a ceiling. A real DB row — including one
+ * whose allowlist is empty — overrides this entirely (see `getTenantOrigins`),
+ * so an operator can still tighten or revoke it at runtime without a deploy.
+ * It names exactly one origin and grants nothing else.
+ */
+export const STRATA_CONFIG: TenantControlPlaneConfig = {
+  tenantId: "strata",
+  displayName: "Strata Reserve",
+  allowedOrigins: ["https://app.stratareserve.co"],
+  policyExposure: {},
+  policyTemplates: [],
+  secretRoutePresets: [],
+  approvalConfig: {},
+  featureFlags: {},
+};
+
 /** All default configs, keyed by tenant ID */
 export const DEFAULT_TENANT_CONFIGS: Record<string, TenantControlPlaneConfig> = {
   "milady-cloud": MILADY_CLOUD_CONFIG,
   "milady-desktop": MILADY_DESKTOP_CONFIG,
   "eliza-cloud": ELIZA_CLOUD_CONFIG,
+  strata: STRATA_CONFIG,
 };
