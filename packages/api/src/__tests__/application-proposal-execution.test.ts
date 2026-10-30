@@ -321,7 +321,16 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
     const results = await Promise.all(
       Array.from({ length: 5 }, () => execute(issued.principal.id, proposalId, bearer(adminToken))),
     );
-    for (const r of results) expect([200, 201]).toContain(r.status);
+    // Exactly one request performs the broadcast (201). The rest are replays:
+    // 200 if they read the finished row, 202 if they read it still executing.
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 201)).toHaveLength(1);
+    for (const s of statuses) expect([200, 201, 202]).toContain(s);
+    const bodies = (await Promise.all(results.map((r) => r.json()))) as Array<{
+      data: { replay: boolean; execution: { status: string } };
+    }>;
+    expect(bodies.filter((b) => !b.data.replay)).toHaveLength(1);
+    for (const b of bodies) expect(["executing", "broadcast"]).toContain(b.data.execution.status);
     expect(sent.length).toBe(sentBefore + 1);
     const rows = await getDb()
       .select()
