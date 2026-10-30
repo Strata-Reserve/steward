@@ -180,4 +180,120 @@ describe("getEmailAuthForTenant", () => {
     await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
     invalidateEmailAuthForTenant(TEST_TENANT_ID);
   });
+
+  // STRATA-1448: production Strata tenant is magic-link-only (global Resend
+  // key, own magicLinkBaseUrl). Its templateId/subjectOverride/replyTo were
+  // dropped on the global-provider path, so users got "Sign in to Steward".
+  it("honors templateId/subjectOverride/replyTo on the global-provider path (STRATA-1448)", async () => {
+    clearEmailAuthTenantCacheForTests();
+
+    const dbHandle = getDb();
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    await dbHandle.insert(tenantConfigs).values({
+      tenantId: TEST_TENANT_ID,
+      emailConfig: {
+        templateId: "strata",
+        replyTo: "support@stratareserve.example",
+        magicLinkBaseUrl: "https://app.stratareserve.example",
+        magicLinkCallbackPath: "/auth/callback",
+      },
+    });
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+
+    const auth = await getEmailAuthForTenant(TEST_TENANT_ID);
+    const provider = (auth as any).provider;
+
+    // Branding survives even though the tenant has no apiKeyEncrypted
+    expect((auth as any).templateId).toBe("strata");
+    expect((auth as any).subjectOverride).toBeUndefined();
+    expect((auth as any).replyTo).toBe("support@stratareserve.example");
+    // Global sender identity is unchanged (no per-tenant key)
+    expect(provider.constructor.name).toBe("ResendProvider");
+    expect(provider.from).toBe("Global <login@example.com>");
+    expect(provider.replyTo).toBe("support@stratareserve.example");
+    // Safe callback handling unchanged
+    expect((auth as any).baseUrl).toBe("https://app.stratareserve.example");
+    expect((auth as any).callbackPath).toBe("/auth/callback");
+
+    // End-to-end render: swap in a capturing provider so no network is touched.
+    const sent: Array<{ subject: string; text: string; html?: string }> = [];
+    (auth as any).provider = {
+      send: async (_to: string, subject: string, text: string, html?: string) => {
+        sent.push({ subject, text, html });
+      },
+    };
+    await auth.sendMagicLink("investor@example.com");
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0].subject).toBe("Sign in to Strata Reserve");
+    expect(sent[0].subject).not.toContain("Steward");
+    expect(sent[0].html).toContain("Sign in to Strata Reserve");
+    expect(sent[0].html).not.toContain("Sign in to Steward");
+    expect(sent[0].html).toContain("https://app.stratareserve.example/auth/callback?token=");
+    expect(sent[0].text).toContain("https://app.stratareserve.example/auth/callback?token=");
+
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+  });
+
+  it("applies subjectOverride on the global-provider path", async () => {
+    clearEmailAuthTenantCacheForTests();
+
+    const dbHandle = getDb();
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    await dbHandle.insert(tenantConfigs).values({
+      tenantId: TEST_TENANT_ID,
+      emailConfig: {
+        templateId: "strata",
+        subjectOverride: "Your Strata sign-in link",
+        magicLinkBaseUrl: "https://app.stratareserve.example",
+      },
+    });
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+
+    const auth = await getEmailAuthForTenant(TEST_TENANT_ID);
+    expect((auth as any).subjectOverride).toBe("Your Strata sign-in link");
+
+    const sent: Array<{ subject: string }> = [];
+    (auth as any).provider = {
+      send: async (_to: string, subject: string) => {
+        sent.push({ subject });
+      },
+    };
+    await auth.sendMagicLink("investor@example.com");
+    expect(sent[0].subject).toBe("Your Strata sign-in link");
+
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+  });
+
+  it("still renders the default Steward template when the tenant has no templateId", async () => {
+    clearEmailAuthTenantCacheForTests();
+
+    const dbHandle = getDb();
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    await dbHandle.insert(tenantConfigs).values({
+      tenantId: TEST_TENANT_ID,
+      emailConfig: { magicLinkBaseUrl: "https://waifu.fun" },
+    });
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+
+    const auth = await getEmailAuthForTenant(TEST_TENANT_ID);
+    expect((auth as any).templateId).toBeUndefined();
+    expect((auth as any).replyTo).toBeUndefined();
+    expect((auth as any).provider.replyTo).toBeUndefined();
+
+    const sent: Array<{ subject: string; html?: string }> = [];
+    (auth as any).provider = {
+      send: async (_to: string, subject: string, _text: string, html?: string) => {
+        sent.push({ subject, html });
+      },
+    };
+    await auth.sendMagicLink("user@example.com");
+    expect(sent[0].subject).toBe("Sign in to Steward");
+    expect(sent[0].html).toContain("https://waifu.fun/auth/email/verify?token=");
+
+    await dbHandle.delete(tenantConfigs).where(eq(tenantConfigs.tenantId, TEST_TENANT_ID));
+    invalidateEmailAuthForTenant(TEST_TENANT_ID);
+  });
 });
