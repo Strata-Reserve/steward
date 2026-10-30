@@ -186,6 +186,6 @@ export const AUDIT_EXCEPTIONS: readonly AuditException[] = [
       "the reachability checker changes or fails",
       "expiry (reviewBy) is reached without a fixed release",
     ],
-    expectedAbsentFromAudit: false,
+    expectedAbsentFromAudit: true,
   },
 ];
