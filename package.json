@@ -66,6 +66,10 @@
     "follow-redirects": "^1.16.1",
     "handlebars": "^4.7.10",
     "markdown-it": "^14.3.3",
-    "zod": "^4.6.6"
+    "zod": "^4.6.6",
+    "decode-uri-component": "0.5.1"
+  },
+  "patchedDependencies": {
+    "query-string@7.1.3": "patches/query-string@7.1.3.patch"
   }
 }
