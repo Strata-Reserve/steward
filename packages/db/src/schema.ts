@@ -433,6 +433,35 @@ export const applicationTransactionProposals = pgTable(
   }),
 );
 
+// STRATA-1515 exec-gap-a: immutable application proposal -> execution linkage.
+// Written only by the tenant-level executor after policy + Vault broadcast.
+export const applicationProposalExecutions = pgTable(
+  "application_proposal_executions",
+  {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    proposalId: varchar("proposal_id", { length: 64 }).notNull(),
+    transactionId: varchar("transaction_id", { length: 64 })
+      .notNull()
+      .references(() => transactions.id, { onDelete: "restrict" }),
+    chainId: integer("chain_id").notNull(),
+    txHash: varchar("tx_hash", { length: 66 }).notNull(),
+    executedBy: varchar("executed_by", { length: 255 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    proposalUnique: uniqueIndex("application_proposal_executions_proposal_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.proposalId,
+    ),
+    transactionUnique: uniqueIndex("application_proposal_executions_transaction_idx").on(
+      table.transactionId,
+    ),
+    chainCheck: check("application_proposal_executions_chain_chk", sql`${table.chainId} = 84532`),
+  }),
+);
+
 // Proposal-specific compatibility authority for proposals created before
 // transaction:proposal:read existed. Migration 0026 snapshots only existing
 // proposals whose proposer had transaction:propose and whose complete assigned

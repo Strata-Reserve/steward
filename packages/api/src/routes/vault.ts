@@ -9,6 +9,8 @@ import { issueProtectedSigningPermit } from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { enforceRateLimit, recordVaultSpend } from "../middleware/redis-enforcement";
+import { ApplicationBoundaryError } from "../services/application-boundary";
+import { executeApplicationProposal } from "../services/application-proposal-executor";
 import { trackAuditEvent } from "../services/audit";
 import {
   type ApiResponse,
@@ -1031,6 +1033,70 @@ vaultRoutes.post("/:agentId/sign", async (c) => {
       requestId,
     });
 
+    if (isRpcError(e)) {
+      return c.json<ApiResponse>({ ok: false, error: extractRpcErrorMessage(e) }, 502);
+    }
+    return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
+  }
+});
+
+// ─── Execute application proposal (STRATA-1515 exec-gap-a) ───────────────────
+// Tenant-level only (tenant API key or owner/admin session). Application
+// credentials never reach this handler (global application guard). Policy
+// engine -> Vault broadcast -> immutable execution linkage. Base Sepolia only.
+vaultRoutes.post("/application-proposals/:proposalId/execute", async (c) => {
+  if (!requireTenantLevel(c)) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Forbidden: tenant-level access required" },
+      403,
+    );
+  }
+  const tenantId = c.get("tenantId");
+  const proposalId = c.req.param("proposalId");
+  if (!/^atp_[0-9a-f]{40}$/.test(proposalId)) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid proposal id" }, 400);
+  }
+  const userId = c.get("userId");
+  const executedBy = userId ? `user:${userId}` : `tenant:${tenantId}`;
+  try {
+    const outcome = await executeApplicationProposal({ tenantId, proposalId, executedBy });
+    trackAuditEvent({
+      tenantId,
+      actorType: userId ? "user" : "system",
+      actorId: userId ?? tenantId,
+      action: `vault.application_proposal.${outcome.kind}`,
+      resourceType: "application_transaction_proposal",
+      resourceId: proposalId,
+      metadata: {
+        transactionId: outcome.transactionId,
+        ...(outcome.kind === "executed"
+          ? { txHash: outcome.txHash, chainId: outcome.chainId, replay: outcome.replay }
+          : {}),
+      },
+      ipAddress: c.req.header("x-forwarded-for") ?? null,
+      userAgent: c.req.header("user-agent") ?? null,
+      requestId: c.get("requestId") ?? null,
+    });
+    switch (outcome.kind) {
+      case "executed":
+        return c.json<ApiResponse>({ ok: true, data: outcome }, 200);
+      case "pending_approval":
+      case "processing":
+        return c.json<ApiResponse>(
+          { ok: false, error: `Execution ${outcome.kind}`, data: outcome },
+          202,
+        );
+      case "rejected":
+        return c.json<ApiResponse>({ ok: false, error: "Rejected by policy", data: outcome }, 403);
+      default:
+        return c.json<ApiResponse>({ ok: false, error: "Execution failed", data: outcome }, 500);
+    }
+  } catch (e: unknown) {
+    if (e instanceof ApplicationBoundaryError) {
+      return c.json<ApiResponse>({ ok: false, error: e.message, data: { code: e.code } }, e.status);
+    }
+    const requestId = c.get("requestId") || "unknown";
+    console.error(`[${requestId}] Application proposal execute failed: ${describeRpcError(e)}`);
     if (isRpcError(e)) {
       return c.json<ApiResponse>({ ok: false, error: extractRpcErrorMessage(e) }, 502);
     }

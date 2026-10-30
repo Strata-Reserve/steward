@@ -7,6 +7,7 @@
 import {
   applicationIdempotencyRecords,
   applicationPrincipalResources,
+  applicationProposalExecutions,
   applicationProposalReadCompatibility,
   applicationTransactionIntents,
   applicationTransactionProposals,
@@ -41,30 +42,72 @@ type ApplicationProposalReadRecord = {
   walletId: string;
   resourceKind: "wallet_owner";
   resourceId: string;
+  /** STRATA-1515: immutable execution linkage written by the tenant executor. */
+  execution?: {
+    txHash: string;
+    chainId: number;
+    transactionId: string;
+    executedAt: Date;
+    transaction: { to: string; value: string; data: string | null };
+  } | null;
 };
 
 /**
- * The proposal row proves proposal acceptance only. Steward currently has no
- * canonical relation from an application proposal to signing, broadcast, or
- * chain execution evidence, so the read model must preserve that uncertainty.
+ * The proposal row proves proposal acceptance only. Execution evidence is
+ * reported ONLY from the canonical `application_proposal_executions` linkage
+ * (STRATA-1515), written by the tenant-level executor after policy + Vault
+ * broadcast. Without that row the read model preserves the uncertainty.
  */
 export function toApplicationProposalReadModel(record: ApplicationProposalReadRecord) {
-  return {
+  const base = {
     id: record.id,
     intentId: record.intentId,
     status: record.status,
-    terminal: false as const,
     recordedAt: record.createdAt.toISOString(),
     resource: {
       kind: record.resourceKind,
       id: record.resourceId,
       walletId: record.walletId,
     },
+  };
+  if (record.execution) {
+    return {
+      ...base,
+      terminal: true as const,
+      executionEvidence: {
+        status: "executed" as const,
+        evidence: {
+          txHash: record.execution.txHash,
+          chainId: record.execution.chainId,
+          transactionId: record.execution.transactionId,
+          executedAt: record.execution.executedAt.toISOString(),
+          transaction: record.execution.transaction,
+        },
+        reason: null,
+      },
+    };
+  }
+  return {
+    ...base,
+    terminal: false as const,
     executionEvidence: {
       status: "unknown" as const,
       evidence: null,
       reason: APPLICATION_EXECUTION_EVIDENCE_UNAVAILABLE,
     },
+  };
+}
+
+function intentTransaction(intent: Record<string, unknown>): {
+  to: string;
+  value: string;
+  data: string | null;
+} {
+  const tx = (intent?.transaction ?? {}) as { to?: unknown; value?: unknown; data?: unknown };
+  return {
+    to: typeof tx.to === "string" ? tx.to : "",
+    value: typeof tx.value === "string" ? tx.value : "",
+    data: typeof tx.data === "string" ? tx.data : null,
   };
 }
 
@@ -84,6 +127,11 @@ export async function readApplicationProposalStatus(
       resourceKind: applicationWallets.resourceKind,
       resourceId: applicationWallets.resourceId,
       compatibilityProposalId: applicationProposalReadCompatibility.proposalId,
+      intent: applicationTransactionIntents.intent,
+      executionTxHash: applicationProposalExecutions.txHash,
+      executionChainId: applicationProposalExecutions.chainId,
+      executionTransactionId: applicationProposalExecutions.transactionId,
+      executionCreatedAt: applicationProposalExecutions.createdAt,
     })
     .from(applicationTransactionProposals)
     .innerJoin(
@@ -125,6 +173,14 @@ export async function readApplicationProposalStatus(
         eq(applicationProposalReadCompatibility.source, "pre_0026_transaction_proposal"),
       ),
     )
+    .leftJoin(
+      applicationProposalExecutions,
+      and(
+        eq(applicationProposalExecutions.tenantId, applicationTransactionProposals.tenantId),
+        eq(applicationProposalExecutions.principalId, applicationTransactionProposals.principalId),
+        eq(applicationProposalExecutions.proposalId, applicationTransactionProposals.id),
+      ),
+    )
     .where(
       and(
         eq(applicationTransactionProposals.tenantId, principal.tenantId),
@@ -142,7 +198,22 @@ export async function readApplicationProposalStatus(
     throw new ApplicationBoundaryError(404, "proposal_not_found", "Proposal not found");
   }
   return {
-    proposal: toApplicationProposalReadModel(record),
+    proposal: toApplicationProposalReadModel({
+      ...record,
+      execution:
+        record.executionTxHash &&
+        record.executionChainId !== null &&
+        record.executionTransactionId &&
+        record.executionCreatedAt
+          ? {
+              txHash: record.executionTxHash,
+              chainId: record.executionChainId,
+              transactionId: record.executionTransactionId,
+              executedAt: record.executionCreatedAt,
+              transaction: intentTransaction(record.intent),
+            }
+          : null,
+    }),
     authorizationBasis: hasExplicitReadCapability
       ? ("explicit_capability" as const)
       : ("pre_0026_proposal_compatibility" as const),
