@@ -44,10 +44,23 @@ export { COMMON_TOKENS, ERC20_ABI, getTokenBalances } from "./tokens";
 export type { UserWalletResult } from "./user-wallet";
 export {
   applyUserWalletDefaults,
+  buildUserWalletDefaultPolicies,
+  buildUserWalletRateLimitPolicy,
   getUserWallet,
   provisionUserWallet,
   USER_WALLET_DEFAULT_POLICIES,
+  USER_WALLET_RATE_LIMIT_POLICY_ID,
 } from "./user-wallet";
+export type { UserWalletRateLimitConfig } from "./user-wallet-config";
+export {
+  DEFAULT_USER_WALLET_MAX_TX_PER_DAY,
+  DEFAULT_USER_WALLET_MAX_TX_PER_HOUR,
+  getUserWalletRateLimitConfig,
+  USER_WALLET_MAX_TX_PER_DAY_ENV,
+  USER_WALLET_MAX_TX_PER_HOUR_ENV,
+} from "./user-wallet-config";
+export type { ReapplyRateLimitOptions, ReapplyRateLimitResult } from "./user-wallet-reapply";
+export { reapplyUserWalletRateLimit } from "./user-wallet-reapply";
 export type { VaultConfig } from "./vault";
 export {
   assertChainRpcReady,
