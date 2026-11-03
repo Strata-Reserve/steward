@@ -203,6 +203,9 @@ function productionClosure(): string[] {
         cpSync(manifest, join(scratch, group, entry.name, "package.json"));
       }
     }
+    // Mirrors the runtime stage's `COPY patches/ patches/`; bun install aborts if a patchedDependencies file is missing.
+    if (existsSync(join(repoRoot, "patches")))
+      cpSync(join(repoRoot, "patches"), join(scratch, "patches"), { recursive: true });
     // The runtime stage stubs `web` rather than shipping it.
     mkdirSync(join(scratch, "web"), { recursive: true });
     writeFileSync(
