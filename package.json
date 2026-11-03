@@ -63,7 +63,7 @@
     "browserslist": "^4.28.7",
     "toml": "^5.0.1",
     "metro": "^0.84.6",
-    "follow-redirects": "^1.16.1",
+    "follow-redirects": "^1.16.2",
     "handlebars": "^4.7.10",
     "markdown-it": "^14.3.3",
     "zod": "^4.6.6",
