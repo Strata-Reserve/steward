@@ -162,10 +162,11 @@ Once a tenant owner/admin executes the proposal (below), `executionEvidence` is 
 
 Application principals never receive sign, approve, or broadcast authority, and there is no execute route under `/application/*`. Execution is a separate privileged command on the tenant admin namespace and requires a **human owner/admin session JWT** (tenant API keys, agent tokens, application credentials, and member sessions are refused). The request itself is the approval.
 
-1. `POST /application-principals/:principalId/executor-signers` `{ chainId, signerAgentId, allowedTargets: ["0x..."] }` binds exactly one ordinary tenant agent as the signer for that principal on that chain, with a contract allowlist. The binding is immutable (a second bind returns `409`). Protected-minter agents and application-wallet agents are refused.
+1. `POST /application-principals/:principalId/executor-signers` `{ chainId, signerAgentId, allowedTargets: ["0x..."] }` binds exactly one ordinary tenant agent as the signer for that principal on that chain, with a contract allowlist. `chainId` must be `84532`; any other value returns `403 chain_not_permitted` and writes nothing. The binding is immutable (a second bind returns `409`). Protected-minter agents and application-wallet agents are refused.
 2. `POST /application-principals/:principalId/proposals/:proposalId/execute` (no body). Steward re-reads the stored intent and signs only that, after checking:
    - principal not revoked or expired, assigned resource + wallet still bound, intent not expired;
-   - the chain is listed in `STEWARD_APPLICATION_EXECUTION_CHAIN_IDS` (default empty = disabled everywhere);
+   - the stored intent's chain is exactly Base Sepolia `84532`. This is a hard pin in code (checked before the binding, policy, vault, key, or RPC is touched) and a `CHECK (chain_id = 84532)` on both `application_executor_signers` and `application_proposal_executions`. Base mainnet `8453` and every other chain return `403 chain_not_permitted` regardless of configuration;
+   - `84532` is also listed in `STEWARD_APPLICATION_EXECUTION_CHAIN_IDS` (default empty = disabled everywhere). The env can only narrow the pin: listing `8453` or any other id admits nothing;
    - an executor-signer binding exists for the chain and `to` is in its allowlist;
    - `value` is `0` and calldata is exactly `mint(address,uint256)` whose recipient is the proposal's own assigned wallet, amount > 0;
    - the signer agent's policy set passes the policy engine. A hard-policy failure returns `403 policy_rejected` with `policyResults` and reserves nothing; an `auto-approve-threshold` miss is satisfied by this human approval.

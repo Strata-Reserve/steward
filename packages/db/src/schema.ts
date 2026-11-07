@@ -1184,6 +1184,7 @@ export const applicationExecutorSigners = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    chainCheck: check("application_executor_signers_chain_chk", sql`${table.chainId} = 84532`),
     scopeUnique: uniqueIndex("application_executor_signers_scope_idx").on(
       table.tenantId,
       table.principalId,
@@ -1249,6 +1250,7 @@ export const applicationProposalExecutions = pgTable(
       foreignColumns: [agents.tenantId, agents.id],
       name: "application_executions_agent_fk",
     }).onDelete("cascade"),
+    chainCheck: check("application_executions_chain_chk", sql`${table.chainId} = 84532`),
     hashCheck: check(
       "application_executions_hash_chk",
       sql`(${table.status} = 'broadcast') = (${table.txHash} IS NOT NULL)`,

@@ -332,6 +332,8 @@ const PRINCIPAL_ID_RE = /^app_[0-9a-zA-Z]{1,60}$/;
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const executorSignerSchema = z
   .object({
+    // Shape only. The 84532 hard pin is enforced (and audited as a refusal)
+    // in createExecutorSignerBinding and by the 0031 CHECK constraint.
     chainId: z.number().int().positive().max(2_147_483_647),
     signerAgentId: z.string().min(1).max(64),
     allowedTargets: z.array(z.string().regex(ADDRESS_RE)).min(1).max(100),

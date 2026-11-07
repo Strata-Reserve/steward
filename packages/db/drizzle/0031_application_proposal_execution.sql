@@ -30,7 +30,9 @@ CREATE TABLE "application_executor_signers" (
   "allowed_targets" text[] NOT NULL,
   "created_by" varchar(255) NOT NULL,
   "created_at" timestamp with time zone NOT NULL DEFAULT now(),
-  CONSTRAINT "application_executor_signers_chain_chk" CHECK ("chain_id" > 0),
+  -- Hard pin: Base Sepolia only. 8453 and every other chain are refused by
+  -- the database even if application code or env were wrong.
+  CONSTRAINT "application_executor_signers_chain_chk" CHECK ("chain_id" = 84532),
   CONSTRAINT "application_executor_signers_targets_chk"
     CHECK (cardinality("allowed_targets") BETWEEN 1 AND 100),
   CONSTRAINT "application_executor_signers_principal_fk"
@@ -67,6 +69,7 @@ CREATE TABLE "application_proposal_executions" (
   "policy_results" jsonb NOT NULL DEFAULT '[]'::jsonb,
   "created_at" timestamp with time zone NOT NULL DEFAULT now(),
   "updated_at" timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT "application_executions_chain_chk" CHECK ("chain_id" = 84532),
   CONSTRAINT "application_executions_hash_chk"
     CHECK (("status" = 'broadcast') = ("tx_hash" IS NOT NULL)),
   CONSTRAINT "application_executions_proposal_fk"

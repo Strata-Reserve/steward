@@ -13,8 +13,13 @@
  *     assignment and wallet binding still exist, the intent has not expired;
  *   - an immutable, admin-created executor-signer binding for
  *     (tenant, principal, chain) with an explicit contract allowlist;
+ *   - a hard chain pin: Base Sepolia 84532 ONLY, checked in code before any
+ *     binding, policy, vault, key, or RPC use, and repeated as a DB CHECK on
+ *     both the binding and the execution row. No configuration can admit 8453
+ *     or any other chain;
  *   - an env kill switch (`STEWARD_APPLICATION_EXECUTION_CHAIN_IDS`, default
- *     empty = disabled) so no chain executes unless the deployment opts in;
+ *     empty = disabled). The env can only NARROW the hard pin (it can turn
+ *     84532 off); listing any other chain id admits nothing;
  *   - a strict call shape: value 0 and exactly `mint(address,uint256)` whose
  *     recipient is the proposal's own assigned wallet;
  *   - the existing policy engine over the signer agent's policy set.
@@ -53,6 +58,17 @@ import {
 import { decodeMint, isPersistedProtectedAgent, isProtectedMinter } from "./prod-minter-boundary";
 
 export const APPLICATION_EXECUTION_CHAIN_IDS_ENV = "STEWARD_APPLICATION_EXECUTION_CHAIN_IDS";
+/**
+ * Hard pin. Application proposal execution is a Base Sepolia (84532) staging
+ * capability only. This is a code constant, not configuration: Base mainnet
+ * (8453) and every other chain are refused regardless of env. Production
+ * mainnet minting stays on the protected-minter ceremony path.
+ */
+export const APPLICATION_EXECUTION_CHAIN_ID = 84532 as const;
+
+export function isApplicationExecutionChainPinned(chainId: unknown): chainId is 84532 {
+  return chainId === APPLICATION_EXECUTION_CHAIN_ID;
+}
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 export class ApplicationExecutionError extends ApplicationBoundaryError {}
@@ -61,7 +77,11 @@ function fail(status: 403 | 404 | 409 | 500, code: string, message: string): nev
   throw new ApplicationExecutionError(status, code, message);
 }
 
-/** Exact allowlist of chain ids the deployment admits. Unset/empty = feature off. */
+/**
+ * Chain ids the deployment admits: the env allowlist intersected with the hard
+ * pin. Unset/empty = feature off. A configured 8453 (or any non-84532 id) is
+ * parsed and then dropped; it can never widen the result.
+ */
 export function applicationExecutionChainIds(
   env: Record<string, string | undefined> = process.env,
 ): ReadonlySet<number> {
@@ -73,7 +93,8 @@ export function applicationExecutionChainIds(
     if (!/^[1-9][0-9]{0,9}$/.test(trimmed)) {
       throw new Error(`${APPLICATION_EXECUTION_CHAIN_IDS_ENV} must be comma-separated chain ids`);
     }
-    ids.add(Number(trimmed));
+    const id = Number(trimmed);
+    if (isApplicationExecutionChainPinned(id)) ids.add(id);
   }
   return ids;
 }
@@ -100,6 +121,10 @@ export type ExecutorSignerBindingInput = {
 
 /** Create the immutable executor-signer binding. Admin-only; never overwritten. */
 export async function createExecutorSignerBinding(input: ExecutorSignerBindingInput) {
+  // Hard pin first: nothing is read or written for a non-84532 binding.
+  if (!isApplicationExecutionChainPinned(input.chainId)) {
+    fail(403, "chain_not_permitted", "Application execution is pinned to chain 84532");
+  }
   const db = getDb();
   const [principal] = await db
     .select()
@@ -290,6 +315,10 @@ export async function executeApplicationProposal(input: {
     typeof data !== "string"
   ) {
     fail(409, "intent_shape_refused", "Prepared transaction shape is not executable");
+  }
+  // Hard pin before the binding, policy, vault, key or RPC is touched.
+  if (!isApplicationExecutionChainPinned(chainId)) {
+    fail(403, "chain_not_permitted", "Application execution is pinned to chain 84532");
   }
   const mint = decodeMint(data);
   if (!mint) fail(409, "intent_call_refused", "Only mint(address,uint256) is executable");
