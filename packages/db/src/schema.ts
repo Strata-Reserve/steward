@@ -1159,3 +1159,104 @@ export const auditEvents = pgTable(
 
 export type AuditEventRow = typeof auditEvents.$inferSelect;
 export type NewAuditEventRow = typeof auditEvents.$inferInsert;
+
+// ─── Application proposal execution (STRATA-1515 exec gap A) ────────────────
+// Migration 0031. A proposal stays proposal-only until a tenant owner/admin
+// executes it through the vault route. The executor-signer binding is
+// immutable and admin-created; the execution row is the single-execution
+// arbiter (unique per tenant + principal + proposal) and moves forward-only.
+
+export const applicationExecutionStatusEnum = pgEnum("application_execution_status", [
+  "executing",
+  "broadcast",
+  "indeterminate",
+]);
+
+export const applicationExecutorSigners = pgTable(
+  "application_executor_signers",
+  {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    chainId: integer("chain_id").notNull(),
+    signerAgentId: varchar("signer_agent_id", { length: 64 }).notNull(),
+    allowedTargets: text("allowed_targets").array().notNull(),
+    createdBy: varchar("created_by", { length: 255 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    chainCheck: check("application_executor_signers_chain_chk", sql`${table.chainId} = 84532`),
+    scopeUnique: uniqueIndex("application_executor_signers_scope_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.chainId,
+    ),
+    principalFk: foreignKey({
+      columns: [table.tenantId, table.principalId],
+      foreignColumns: [applicationPrincipals.tenantId, applicationPrincipals.id],
+      name: "application_executor_signers_principal_fk",
+    }).onDelete("cascade"),
+    agentFk: foreignKey({
+      columns: [table.tenantId, table.signerAgentId],
+      foreignColumns: [agents.tenantId, agents.id],
+      name: "application_executor_signers_agent_fk",
+    }).onDelete("cascade"),
+  }),
+);
+
+export const applicationProposalExecutions = pgTable(
+  "application_proposal_executions",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    proposalId: varchar("proposal_id", { length: 64 }).notNull(),
+    signerAgentId: varchar("signer_agent_id", { length: 64 }).notNull(),
+    chainId: integer("chain_id").notNull(),
+    transactionId: varchar("transaction_id", { length: 64 })
+      .notNull()
+      .references(() => transactions.id, { onDelete: "restrict" }),
+    executionRef: varchar("execution_ref", { length: 128 }).notNull(),
+    toAddress: varchar("to_address", { length: 42 }).notNull(),
+    recipientAddress: varchar("recipient_address", { length: 42 }).notNull(),
+    amount: text("amount").notNull(),
+    approvedBy: varchar("approved_by", { length: 255 }).notNull(),
+    status: applicationExecutionStatusEnum("status").notNull().default("executing"),
+    txHash: varchar("tx_hash", { length: 128 }),
+    failureReason: text("failure_reason"),
+    policyResults: jsonb("policy_results").$type<PolicyResult[]>().notNull().default([]),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    proposalUnique: uniqueIndex("application_executions_proposal_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.proposalId,
+    ),
+    transactionUnique: uniqueIndex("application_executions_transaction_idx").on(
+      table.transactionId,
+    ),
+    proposalFk: foreignKey({
+      columns: [table.tenantId, table.principalId, table.proposalId],
+      foreignColumns: [
+        applicationTransactionProposals.tenantId,
+        applicationTransactionProposals.principalId,
+        applicationTransactionProposals.id,
+      ],
+      name: "application_executions_proposal_fk",
+    }).onDelete("cascade"),
+    agentFk: foreignKey({
+      columns: [table.tenantId, table.signerAgentId],
+      foreignColumns: [agents.tenantId, agents.id],
+      name: "application_executions_agent_fk",
+    }).onDelete("cascade"),
+    chainCheck: check("application_executions_chain_chk", sql`${table.chainId} = 84532`),
+    hashCheck: check(
+      "application_executions_hash_chk",
+      sql`(${table.status} = 'broadcast') = (${table.txHash} IS NOT NULL)`,
+    ),
+  }),
+);
+
+export type ApplicationExecutorSigner = typeof applicationExecutorSigners.$inferSelect;
+export type ApplicationProposalExecution = typeof applicationProposalExecutions.$inferSelect;

@@ -2,6 +2,7 @@ import {
   applicationPrincipalCredentials,
   applicationPrincipalResources,
   applicationPrincipals,
+  applicationProposalExecutions,
 } from "@stwd/db";
 import { and, eq, isNull } from "drizzle-orm";
 import { type Context, Hono } from "hono";
@@ -10,14 +11,22 @@ import { clearApplicationSelectorKnownGood } from "../middleware/application-pri
 import {
   APPLICATION_CAPABILITIES,
   generateApplicationCredential,
+  isValidApplicationProposalId,
   isValidApplicationReference,
   parseFutureExpiry,
 } from "../services/application-boundary";
+import {
+  ApplicationExecutionError,
+  createExecutorSignerBinding,
+  executeApplicationProposal,
+  toApplicationExecutionView,
+} from "../services/application-executions";
 import { writeAuditEvent } from "../services/audit";
 import {
   type ApiResponse,
   type AppVariables,
   db,
+  requireHumanOwnerAdmin,
   requireTenantLevel,
   safeJsonParse,
 } from "../services/context";
@@ -310,4 +319,164 @@ applicationPrincipalAdminRoutes.post("/:principalId/revoke", async (c) => {
     ok: true,
     data: { id: principalId, revokedAt: revokedAt.toISOString() },
   });
+});
+
+// ─── Application proposal execution (STRATA-1515 exec gap A) ──────────────────
+//
+// Application principals remain proposal-only. Execution lives here, on the
+// tenant-auth admin namespace, and only a verified human owner/admin session
+// can trigger it: that request is the approval. See
+// services/application-executions.ts for the full guard list.
+
+const PRINCIPAL_ID_RE = /^app_[0-9a-zA-Z]{1,60}$/;
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const executorSignerSchema = z
+  .object({
+    // Shape only. The 84532 hard pin is enforced (and audited as a refusal)
+    // in createExecutorSignerBinding and by the 0031 CHECK constraint.
+    chainId: z.number().int().positive().max(2_147_483_647),
+    signerAgentId: z.string().min(1).max(64),
+    allowedTargets: z.array(z.string().regex(ADDRESS_RE)).min(1).max(100),
+  })
+  .strict();
+
+function executionErrorResponse(c: Context<{ Variables: AppVariables }>, error: unknown) {
+  if (error instanceof ApplicationExecutionError) {
+    const policyResults = (error as { policyResults?: unknown }).policyResults;
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: error.message,
+        data: { code: error.code, ...(policyResults ? { policyResults } : {}) },
+      },
+      error.status,
+    );
+  }
+  throw error;
+}
+
+applicationPrincipalAdminRoutes.post("/:principalId/executor-signers", async (c) => {
+  const userId = requireHumanOwnerAdmin(c);
+  if (!userId) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Executor signer binding requires a human owner/admin session" },
+      403,
+    );
+  }
+  const tenantId = c.get("tenantId");
+  const principalId = c.req.param("principalId");
+  if (!PRINCIPAL_ID_RE.test(principalId)) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid principal id" }, 400);
+  }
+  const parsed = executorSignerSchema.safeParse(await safeJsonParse<unknown>(c));
+  if (!parsed.success) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid executor signer request" }, 400);
+  }
+  try {
+    const binding = await createExecutorSignerBinding({
+      tenantId,
+      principalId,
+      chainId: parsed.data.chainId,
+      signerAgentId: parsed.data.signerAgentId,
+      allowedTargets: parsed.data.allowedTargets,
+      createdBy: `user:${userId}`,
+    });
+    await writeAuditEvent({
+      tenantId,
+      actorType: "user",
+      actorId: userId,
+      action: "application_principal.executor_signer.bind",
+      resourceType: "application_principal",
+      resourceId: principalId,
+      metadata: {
+        chainId: binding.chainId,
+        signerAgentId: binding.signerAgentId,
+        allowedTargets: binding.allowedTargets,
+      },
+      ...requestMetadata(c),
+    });
+    return c.json<ApiResponse>({ ok: true, data: { binding } }, 201);
+  } catch (error) {
+    return executionErrorResponse(c, error);
+  }
+});
+
+applicationPrincipalAdminRoutes.post("/:principalId/proposals/:proposalId/execute", async (c) => {
+  const userId = requireHumanOwnerAdmin(c);
+  if (!userId) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Proposal execution requires a human owner/admin session" },
+      403,
+    );
+  }
+  const tenantId = c.get("tenantId");
+  const principalId = c.req.param("principalId");
+  const proposalId = c.req.param("proposalId");
+  if (!PRINCIPAL_ID_RE.test(principalId) || !isValidApplicationProposalId(proposalId)) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid proposal reference" }, 400);
+  }
+  try {
+    const result = await executeApplicationProposal({
+      tenantId,
+      principalId,
+      proposalId,
+      approvedBy: `user:${userId}`,
+    });
+    await writeAuditEvent({
+      tenantId,
+      actorType: "user",
+      actorId: userId,
+      action: result.replay
+        ? "application.transaction_proposal.execute.replay"
+        : "application.transaction_proposal.execute",
+      resourceType: "application_transaction_proposal",
+      resourceId: proposalId,
+      metadata: {
+        principalId,
+        executionId: result.execution.id,
+        status: result.execution.status,
+        chainId: result.execution.chainId,
+        txHash: result.execution.txHash,
+      },
+      ...requestMetadata(c),
+    });
+    const status = result.execution.status === "broadcast" ? (result.replay ? 200 : 201) : 202;
+    return c.json<ApiResponse>({ ok: true, data: result }, status);
+  } catch (error) {
+    if (error instanceof ApplicationExecutionError) {
+      await writeAuditEvent({
+        tenantId,
+        actorType: "user",
+        actorId: userId,
+        action: "application.transaction_proposal.execute.denied",
+        resourceType: "application_transaction_proposal",
+        resourceId: proposalId,
+        metadata: { principalId, reason: error.code },
+        ...requestMetadata(c),
+      });
+    }
+    return executionErrorResponse(c, error);
+  }
+});
+
+applicationPrincipalAdminRoutes.get("/:principalId/proposals/:proposalId/execution", async (c) => {
+  if (!requireTenantLevel(c)) {
+    return c.json<ApiResponse>({ ok: false, error: "Tenant administrator access required" }, 403);
+  }
+  const proposalId = c.req.param("proposalId");
+  if (!isValidApplicationProposalId(proposalId)) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid proposal reference" }, 400);
+  }
+  const [row] = await db
+    .select()
+    .from(applicationProposalExecutions)
+    .where(
+      and(
+        eq(applicationProposalExecutions.tenantId, c.get("tenantId")),
+        eq(applicationProposalExecutions.principalId, c.req.param("principalId")),
+        eq(applicationProposalExecutions.proposalId, proposalId),
+      ),
+    );
+  if (!row) return c.json<ApiResponse>({ ok: false, error: "Execution not found" }, 404);
+  return c.json<ApiResponse>({ ok: true, data: { execution: toApplicationExecutionView(row) } });
 });

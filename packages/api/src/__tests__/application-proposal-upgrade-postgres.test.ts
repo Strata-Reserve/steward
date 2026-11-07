@@ -309,6 +309,13 @@ beforeAll(async () => {
   // Replay after later proposals exist must not expand the one-time snapshot.
   await applyMigration("0026_application_proposal_read.sql");
 
+  // A deployed server runs the full migration chain. 0027+ are additive; 0031
+  // adds the canonical execution-evidence table the proposal read joins.
+  const laterMigrations = (await Array.fromAsync(new Bun.Glob("*.sql").scan(migrationsDir)))
+    .filter((file) => /^\d{4}.*\.sql$/.test(file) && file > "0026_application_proposal_read.sql")
+    .sort();
+  for (const file of laterMigrations) await applyMigration(file);
+
   await Bun.sleep(300);
 
   server = Bun.spawn(["bun", "run", "packages/api/src/index.ts"], {
