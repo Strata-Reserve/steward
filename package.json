@@ -53,7 +53,7 @@
     "drizzle-orm": "^0.45.2",
     "hono": "^4.12.25",
     "sharp": "^0.35.4",
-    "undici": "^7.29.1",
+    "undici": "^7.30.1",
     "form-data": "^4.0.6",
     "socket.io-parser": "^4.2.7",
     "ip-address": "^10.5.0",
@@ -63,8 +63,13 @@
     "browserslist": "^4.28.7",
     "toml": "^5.0.1",
     "metro": "^0.84.6",
-    "follow-redirects": "^1.16.1",
+    "follow-redirects": "^1.16.2",
     "handlebars": "^4.7.10",
-    "markdown-it": "^14.3.3"
+    "markdown-it": "^14.3.3",
+    "zod": "^4.6.6",
+    "decode-uri-component": "0.5.1"
+  },
+  "patchedDependencies": {
+    "query-string@7.1.3": "patches/query-string@7.1.3.patch"
   }
 }

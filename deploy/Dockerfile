@@ -11,6 +11,7 @@ COPY packages/ packages/
 RUN mkdir -p web && \
     printf '{"name":"web","version":"0.0.0","private":true}\n' > web/package.json
 
+COPY patches/ patches/
 RUN bun install --frozen-lockfile
 RUN bun run build
 

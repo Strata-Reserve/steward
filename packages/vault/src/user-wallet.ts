@@ -12,6 +12,7 @@ import type { AgentIdentity, PolicyRule } from "@stwd/shared";
 import { eq } from "drizzle-orm";
 import { parseEther } from "viem";
 
+import { type EnvSource, getUserWalletRateLimitConfig, type WarnFn } from "./user-wallet-config";
 import type { Vault } from "./vault";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -31,33 +32,55 @@ type PersistedPolicyRule = Omit<PolicyRule, "type"> & {
   type: PersistedPolicyType;
 };
 
-/**
- * Sensible default policies for a user's personal wallet.
- *
- * - Spending limits: 0.5 ETH/tx, 2 ETH/day, 10 ETH/week
- * - Rate limits: 10 tx/hr, 50 tx/day
- */
-export const USER_WALLET_DEFAULT_POLICIES: PersistedPolicyRule[] = [
-  {
-    id: "user-spend-limit",
-    type: "spending-limit",
-    enabled: true,
-    config: {
-      maxPerTx: parseEther("0.5").toString(), // 0.5 ETH per transaction
-      maxPerDay: parseEther("2.0").toString(), // 2 ETH daily
-      maxPerWeek: parseEther("10.0").toString(), // 10 ETH weekly
-    },
-  },
-  {
-    id: "user-rate-limit",
+/** Stable policy-id prefix for the user-wallet rate-limit rule. */
+export const USER_WALLET_RATE_LIMIT_POLICY_ID = "user-rate-limit";
+
+/** Build the user-wallet rate-limit rule from env (see user-wallet-config.ts). */
+export function buildUserWalletRateLimitPolicy(
+  env: EnvSource = process.env,
+  warn?: WarnFn,
+): PersistedPolicyRule {
+  const { maxTxPerHour, maxTxPerDay } = getUserWalletRateLimitConfig(env, warn);
+  return {
+    id: USER_WALLET_RATE_LIMIT_POLICY_ID,
     type: "rate-limit",
     enabled: true,
-    config: {
-      maxTxPerHour: 10,
-      maxTxPerDay: 50,
+    config: { maxTxPerHour, maxTxPerDay },
+  };
+}
+
+/**
+ * Sensible default policies for a user's personal wallet, resolved from env.
+ *
+ * - Spending limits: 0.5 ETH/tx, 2 ETH/day, 10 ETH/week
+ * - Rate limits: USER_WALLET_MAX_TX_PER_HOUR (default 10) tx/hr,
+ *   USER_WALLET_MAX_TX_PER_DAY (default 50) tx/day
+ */
+export function buildUserWalletDefaultPolicies(
+  env: EnvSource = process.env,
+  warn?: WarnFn,
+): PersistedPolicyRule[] {
+  return [
+    {
+      id: "user-spend-limit",
+      type: "spending-limit",
+      enabled: true,
+      config: {
+        maxPerTx: parseEther("0.5").toString(), // 0.5 ETH per transaction
+        maxPerDay: parseEther("2.0").toString(), // 2 ETH daily
+        maxPerWeek: parseEther("10.0").toString(), // 10 ETH weekly
+      },
     },
-  },
-];
+    buildUserWalletRateLimitPolicy(env, warn),
+  ];
+}
+
+/**
+ * Default policies resolved from env at module load. Kept for existing
+ * importers (API preview / fallback). Provisioning re-resolves env per call
+ * via `buildUserWalletDefaultPolicies()`.
+ */
+export const USER_WALLET_DEFAULT_POLICIES: PersistedPolicyRule[] = buildUserWalletDefaultPolicies();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -76,7 +99,7 @@ function tenantIdFor(userId: string, overrideTenantId?: string): string {
  * Provision a Steward-managed wallet for a new user.
  *
  * - Creates a Steward agent scoped to the user's personal tenant.
- * - Applies `USER_WALLET_DEFAULT_POLICIES` automatically.
+ * - Applies the env-resolved default policies automatically.
  * - Idempotent: if the agent already exists, returns its existing identity
  *   without throwing.
  *
@@ -169,7 +192,8 @@ export async function getUserWallet(
 
 /**
  * Apply (or re-apply) the default policy set to a user's wallet.
- * Replaces any existing policies on the agent with `USER_WALLET_DEFAULT_POLICIES`.
+ * Replaces any existing policies on the agent with the env-resolved defaults
+ * from `buildUserWalletDefaultPolicies()`.
  *
  * @param userId    The application user ID.
  * @param tenantId  Optional override tenant (defaults to `personal-<userId>`).
@@ -185,10 +209,12 @@ export async function applyUserWalletDefaults(userId: string, _tenantId?: string
     throw new Error(`Cannot apply default policies: agent "${agentId}" not found in database`);
   }
 
+  const defaults = buildUserWalletDefaultPolicies();
+
   // Replace policies atomically
   await db.delete(policies).where(eq(policies.agentId, agentId));
   await db.insert(policies).values(
-    USER_WALLET_DEFAULT_POLICIES.map((policy) => ({
+    defaults.map((policy) => ({
       id: `${policy.id}-${userId}`, // unique per user to avoid PK collisions
       agentId,
       type: policy.type,
@@ -198,6 +224,6 @@ export async function applyUserWalletDefaults(userId: string, _tenantId?: string
   );
 
   console.log(
-    `[UserWallet] Default policies applied for user "${userId}" (${USER_WALLET_DEFAULT_POLICIES.length} rules)`,
+    `[UserWallet] Default policies applied for user "${userId}" (${defaults.length} rules)`,
   );
 }
