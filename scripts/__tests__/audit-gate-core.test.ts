@@ -477,50 +477,64 @@ describe("the REAL shipped registry", () => {
     expect(validity).toEqual([]);
   });
 
-  it("keeps braces as CLASS B with the non-reachability disposition", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
-    expect(e).toBeDefined();
-    expect(e?.reachabilityClass).toBe("B");
-    expect(e?.disposition).toBe("accepted_present_but_not_imported_by_runtime");
-    expect(e?.qualifiers).toContain("no_fix_available");
+  it("documents NO accepted advisory in the real threat model that the registry lacks", async () => {
+    // Reverse binding against the shipped prose: every advisory id after the
+    // accepted-CVE anchor must have a registry entry. With the 2026-11-09 removal
+    // of vite + braces this also proves the prose did not keep a stale row.
+    const doc = await Bun.file(
+      new URL("../../docs/security/threat-model.mdx", import.meta.url),
+    ).text();
+    const anchor = doc.indexOf("## Known accepted CVEs");
+    expect(anchor).toBeGreaterThan(-1);
+    const ids = new Set(AUDIT_EXCEPTIONS.flatMap((e) => e.advisories));
+    const documented = [
+      ...doc.slice(anchor).matchAll(/GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}/g),
+    ].map((m) => m[0]);
+    expect(documented.filter((id) => !ids.has(id))).toEqual([]);
   });
 
-  it("keeps vite as CLASS A absent-from-closure", () => {
-    for (const pkg of ["vite"]) {
-      const e = AUDIT_EXCEPTIONS.find((x) => x.package === pkg);
-      expect(e?.reachabilityClass).toBe("A");
-      expect(e?.disposition).toBe("accepted_absent_from_production_closure");
+  it("carries no stale cleanup markers: remediated entries are removed, not kept", () => {
+    // Precedent (threat-model changelog 2026-10-03): once an advisory stops being
+    // reported, the acceptance is deleted rather than re-dated or parked.
+    for (const e of AUDIT_EXCEPTIONS) {
+      expect(e.expectedAbsentFromAudit).toBe(false);
     }
+  });
+
+  it("carries no expired entry", () => {
+    for (const e of AUDIT_EXCEPTIONS) {
+      expect(Date.parse(e.reviewBy)).toBeGreaterThan(Date.now());
+    }
+  });
+
+  it("no longer accepts the retired vite and braces advisories", () => {
+    const pkgs = AUDIT_EXCEPTIONS.map((e) => e.package);
+    expect(pkgs).not.toContain("vite");
+    expect(pkgs).not.toContain("braces");
+  });
+
+  it("an empty registry still BLOCKS any new gated finding", async () => {
+    const doc = await Bun.file(
+      new URL("../../docs/security/threat-model.mdx", import.meta.url),
+    ).text();
+    const v = evaluate([finding({ package: "braces" })], AUDIT_EXCEPTIONS, doc, NOW);
+    expect(v.ok).toBe(false);
+    expect(v.unallowlisted.map((f) => f.package)).toContain("braces");
   });
 
   it("authorizes NO critical anywhere — no standing critical acceptance exists", () => {
     for (const e of AUDIT_EXCEPTIONS) {
       expect(e.authorizesSeverity).not.toContain("critical");
+      expect(e.criticalApproval).toBeUndefined();
     }
   });
 
-  it("gives braces the shorter 30-day-class review window", () => {
-    const img = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
-    const vite = AUDIT_EXCEPTIONS.find((x) => x.package === "vite");
-    const days = (e?: AuditException) =>
-      e ? (Date.parse(e.reviewBy) - Date.parse(e.acceptedOn)) / 86_400_000 : Number.NaN;
-    expect(days(img)).toBeLessThanOrEqual(31);
-    expect(days(img)).toBeLessThan(days(vite));
-  });
-  it("requires braces to name its four mandatory reconsideration triggers", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
-    const joined = (e?.reconsiderIf ?? []).join(" | ").toLowerCase();
-    expect(joined).toContain("braces release");
-    expect(joined).toContain("patched");
-    expect(joined).toContain("@stwd/react");
-    expect(joined).toContain("composition changes");
-    expect(joined).toContain("reachability checker");
-  });
-
-  it("does not describe braces with absence language in its rationale", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
-    expect(e?.rationale ?? "").toMatch(/IS PRESENT/);
-    expect(e?.rationale ?? "").not.toMatch(/\bis absent\b/i);
+  it("every CLASS B entry states PRESENT, never absence, in its rationale", () => {
+    for (const e of AUDIT_EXCEPTIONS) {
+      if (e.reachabilityClass !== "B") continue;
+      expect(e.rationale).toMatch(/IS PRESENT/);
+      expect(e.rationale).not.toMatch(/\bis absent\b/i);
+    }
   });
 });
 
@@ -530,15 +544,5 @@ describe("R2 F4 — CLASS B entry workspace is explicit, not parsed from prose",
       if (e.reachabilityClass !== "B") continue;
       expect(e.entryWorkspace?.trim()).toBeTruthy();
     }
-  });
-
-  it("braces names @stwd/react explicitly, independent of entryPath word order", () => {
-    const e = AUDIT_EXCEPTIONS.find((x) => x.package === "braces");
-    expect(e?.entryWorkspace).toBe("@stwd/react");
-    // The prose mentions several other scoped packages FIRST; the old regex
-    // captured whichever came first, so word order silently chose the subject.
-    const firstScoped = e?.entryPath.match(/@[a-z0-9-]+\/[a-z0-9-]+/)?.[0];
-    expect(e?.entryWorkspace).not.toBe(undefined);
-    expect(typeof firstScoped).toBe("string");
   });
 });

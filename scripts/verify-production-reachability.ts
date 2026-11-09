@@ -412,7 +412,7 @@ if (broken > 0) {
 console.log(
   "\n[OK] every accepted-CVE disposition still holds, and runtime composition is unchanged.",
 );
-console.log("NOTE: CLASS B is a weaker claim than CLASS A. `image-size` IS installed in the");
+console.log("NOTE: CLASS B is a weaker claim than CLASS A. A CLASS B package IS installed in the");
 console.log(
   "      production image closure; it is accepted only because nothing shipped imports it.",
 );
