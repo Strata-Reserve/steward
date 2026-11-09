@@ -218,6 +218,13 @@
       "when": 1786899600000,
       "tag": "0030_approval_queue_issuance_claim",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1786986000000,
+      "tag": "0031_application_proposal_execution",
+      "breakpoints": true
     }
   ]
 }

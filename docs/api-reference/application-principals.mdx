@@ -145,7 +145,50 @@ The contract deliberately separates proposal acceptance from execution evidence:
 }
 ```
 
-`proposed` is not executed, signed, broadcast, confirmed, ownership-applied, or terminal. Steward has no canonical application-proposal-to-execution linkage in this schema, so this endpoint never fabricates execution success. Consumers must keep continuation work open until a separate canonical execution-evidence contract exists. Reads are idempotent and append an application-actor audit event without mutating the immutable proposal.
+`proposed` is not executed, signed, broadcast, confirmed, ownership-applied, or terminal. Without an execution row this endpoint returns `unknown` / `no_canonical_execution_linkage` exactly as before and never fabricates execution success. Reads are idempotent and append an application-actor audit event without mutating the immutable proposal.
+
+Once a tenant owner/admin executes the proposal (below), `executionEvidence` is read from the canonical `application_proposal_executions` row (migration 0031):
+
+| Execution row | `executionEvidence.status` | `evidence` | `reason` |
+| --- | --- | --- | --- |
+| none | `unknown` | `null` | `no_canonical_execution_linkage` |
+| `executing` | `executing` | `null` | `execution_in_progress` |
+| `indeterminate` | `indeterminate` | `null` | `execution_outcome_indeterminate` |
+| `broadcast` | `broadcast` | `{ executionId, network: { namespace: "eip155", chainId }, txHash, to, call: { function: "mint(address,uint256)", recipient, amount } }` | `null` |
+| none, human rejection row | `rejected` (top-level `status` is `rejected`, `terminal: true`) | `{ rejectionId, reason, rejectedAt }` | `proposal_rejected` |
+
+`broadcast` means the signed transaction was accepted by the RPC. It is not confirmation, so `terminal` stays `false`; consumers observe the receipt themselves. A human rejection is the only terminal read Steward emits: the proposal will never be executed.
+
+### Execute Proposal (tenant owner/admin)
+
+Application principals never receive sign, approve, or broadcast authority, and there is no execute route under `/application/*`. Execution is a separate privileged command on the tenant admin namespace and requires a **human owner/admin session JWT** (tenant API keys, agent tokens, application credentials, and member sessions are refused). The request itself is the approval.
+
+1. `POST /application-principals/:principalId/executor-signers` `{ chainId, signerAgentId, allowedTargets: ["0x..."] }` binds exactly one ordinary tenant agent as the signer for that principal on that chain, with a contract allowlist. `chainId` must be `84532`; any other value returns `403 chain_not_permitted` and writes nothing. The binding is immutable (a second bind returns `409`). Protected-minter agents and application-wallet agents are refused.
+2. `POST /application-principals/:principalId/proposals/:proposalId/execute` (no body). Steward re-reads the stored intent and signs only that, after checking:
+   - principal not revoked or expired, assigned resource + wallet still bound, intent not expired;
+   - the stored intent's chain is exactly Base Sepolia `84532`. This is a hard pin in code (checked before the binding, policy, vault, key, or RPC is touched) and a `CHECK (chain_id = 84532)` on both `application_executor_signers` and `application_proposal_executions`. Base mainnet `8453` and every other chain return `403 chain_not_permitted` regardless of configuration;
+   - `84532` is also listed in `STEWARD_APPLICATION_EXECUTION_CHAIN_IDS` (default empty = disabled everywhere). The env can only narrow the pin: listing `8453` or any other id admits nothing;
+   - an executor-signer binding exists for the chain and `to` is in its allowlist;
+   - `value` is `0` and calldata is exactly `mint(address,uint256)` whose recipient is the proposal's own assigned wallet, amount > 0;
+   - the signer agent's policy set passes the policy engine. A hard-policy failure returns `403 policy_rejected` with `policyResults` and reserves nothing; an `auto-approve-threshold` miss is satisfied by this human approval.
+3. Responses: `201` broadcast, `200` replay of a broadcast execution, `202` indeterminate (RPC threw after the vault was invoked; never retried, reconcile manually).
+
+Single execution is enforced in the database: one execution row per proposal and one `transactions` reservation under `executionRef = application-proposal:<proposalId>`, both committed before the key is decrypted. Execution rows move forward-only out of `executing` and broadcast rows cannot be deleted.
+
+`GET /application-principals/:principalId/proposals/:proposalId/execution` (tenant admin) returns the execution row.
+
+### Reject Proposal (tenant owner/admin)
+
+`POST /application-principals/:principalId/proposals/:proposalId/reject` `{ "reason": "..." }` (1 to 1000 characters after trimming; no other fields). Same authority as execute: a **human owner/admin session JWT** only. Tenant API keys, agent tokens, application credentials, member sessions and other tenants are refused, and there is no reject route under `/application/*`. The rejector is recorded as `user:<id>`.
+
+- Writes one immutable `application_proposal_rejections` row (migration 0031): rejector, reason, timestamp. The row cannot be updated or deleted while its proposal exists, and the database refuses any rejector that is not `user:<id>`.
+- `201` first rejection, `200` replay. A re-reject by anyone returns the original decision unchanged (first rejector and reason stand).
+- `409 execution_started` if any execution row exists (`executing`, `broadcast` or `indeterminate`). The chain may already have the transaction, so only reconciliation can resolve it.
+- Execute after reject returns `409 proposal_rejected` before the binding, policy, vault, key or RPC is touched.
+- Reject and execute are mutually exclusive in the database: both inserts lock the proposal row and refuse if the other decision exists, so exactly one of a concurrent pair commits.
+- A revoked or expired requester can still be rejected; a refusal needs no requester authority.
+
+`GET /application-principals/:principalId/proposals/:proposalId/rejection` (tenant admin) returns the rejection row.
 
 All command schemas reject unknown fields, including `agentId`, `tenantId`, `principalId`, `actorId`, `broadcast`, `approve`, `signature`, `signedTx`, and `status`.
 

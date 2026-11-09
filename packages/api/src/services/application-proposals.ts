@@ -7,7 +7,9 @@
 import {
   applicationIdempotencyRecords,
   applicationPrincipalResources,
+  applicationProposalExecutions,
   applicationProposalReadCompatibility,
+  applicationProposalRejections,
   applicationTransactionIntents,
   applicationTransactionProposals,
   applicationWallets,
@@ -33,6 +35,22 @@ export type PrepareApplicationTransactionCommand = {
 
 export const APPLICATION_EXECUTION_EVIDENCE_UNAVAILABLE = "no_canonical_execution_linkage" as const;
 
+type ApplicationProposalExecutionRecord = {
+  status: "executing" | "broadcast" | "indeterminate";
+  chainId: number;
+  txHash: string | null;
+  toAddress: string;
+  recipientAddress: string;
+  amount: string;
+  executionId: string;
+};
+
+type ApplicationProposalRejectionRecord = {
+  rejectionId: string;
+  reason: string;
+  rejectedAt: Date;
+};
+
 type ApplicationProposalReadRecord = {
   id: string;
   intentId: string;
@@ -41,14 +59,59 @@ type ApplicationProposalReadRecord = {
   walletId: string;
   resourceKind: "wallet_owner";
   resourceId: string;
+  execution?: ApplicationProposalExecutionRecord | null;
+  rejection?: ApplicationProposalRejectionRecord | null;
 };
 
 /**
- * The proposal row proves proposal acceptance only. Steward currently has no
- * canonical relation from an application proposal to signing, broadcast, or
- * chain execution evidence, so the read model must preserve that uncertainty.
+ * The proposal row proves proposal acceptance only. Execution evidence comes
+ * exclusively from the canonical `application_proposal_executions` row written
+ * by the admin execute command (STRATA-1515 exec gap A, migration 0031):
+ *
+ *   - no row          -> `unknown` / `no_canonical_execution_linkage` (unchanged)
+ *   - `broadcast`     -> `broadcast` with the exact tx hash, chain and call
+ *   - `executing` / `indeterminate` -> no hash is claimed; the consumer must
+ *     keep the work open and reconcile.
+ *
+ * `terminal` stays false for every execution state: broadcast is not
+ * confirmation.
+ *
+ * A durable human rejection (`application_proposal_rejections`, mutually
+ * exclusive with an execution row) is the one terminal outcome Steward owns:
+ *
+ *   - rejected        -> top-level `status: "rejected"`, `terminal: true`,
+ *                        executionEvidence `rejected` / `proposal_rejected`,
+ *                        evidence `{ rejectionId, reason, rejectedAt }`. The
+ *                        proposal can never be executed afterwards.
  */
 export function toApplicationProposalReadModel(record: ApplicationProposalReadRecord) {
+  const execution = record.execution ?? null;
+  const rejection = record.rejection ?? null;
+  if (rejection !== null && execution === null) {
+    return {
+      id: record.id,
+      intentId: record.intentId,
+      // Derived: the immutable proposal row keeps `proposed`; the decision row
+      // is what makes the read terminal.
+      status: "rejected" as const,
+      terminal: true as const,
+      recordedAt: record.createdAt.toISOString(),
+      resource: {
+        kind: record.resourceKind,
+        id: record.resourceId,
+        walletId: record.walletId,
+      },
+      executionEvidence: {
+        status: "rejected" as const,
+        evidence: {
+          rejectionId: rejection.rejectionId,
+          reason: rejection.reason,
+          rejectedAt: rejection.rejectedAt.toISOString(),
+        },
+        reason: "proposal_rejected" as const,
+      },
+    };
+  }
   return {
     id: record.id,
     intentId: record.intentId,
@@ -60,11 +123,42 @@ export function toApplicationProposalReadModel(record: ApplicationProposalReadRe
       id: record.resourceId,
       walletId: record.walletId,
     },
-    executionEvidence: {
+    executionEvidence: executionEvidenceFor(execution),
+  };
+}
+
+function executionEvidenceFor(execution: ApplicationProposalExecutionRecord | null) {
+  if (execution === null) {
+    return {
       status: "unknown" as const,
       evidence: null,
       reason: APPLICATION_EXECUTION_EVIDENCE_UNAVAILABLE,
-    },
+    };
+  }
+  if (execution.status === "broadcast" && execution.txHash !== null) {
+    return {
+      status: "broadcast" as const,
+      evidence: {
+        executionId: execution.executionId,
+        network: { namespace: "eip155" as const, chainId: execution.chainId },
+        txHash: execution.txHash,
+        to: execution.toAddress,
+        call: {
+          function: "mint(address,uint256)" as const,
+          recipient: execution.recipientAddress,
+          amount: execution.amount,
+        },
+      },
+      reason: null,
+    };
+  }
+  return {
+    status: execution.status === "executing" ? ("executing" as const) : ("indeterminate" as const),
+    evidence: null,
+    reason:
+      execution.status === "executing"
+        ? ("execution_in_progress" as const)
+        : ("execution_outcome_indeterminate" as const),
   };
 }
 
@@ -84,6 +178,16 @@ export async function readApplicationProposalStatus(
       resourceKind: applicationWallets.resourceKind,
       resourceId: applicationWallets.resourceId,
       compatibilityProposalId: applicationProposalReadCompatibility.proposalId,
+      executionId: applicationProposalExecutions.id,
+      executionStatus: applicationProposalExecutions.status,
+      executionChainId: applicationProposalExecutions.chainId,
+      executionTxHash: applicationProposalExecutions.txHash,
+      executionTo: applicationProposalExecutions.toAddress,
+      executionRecipient: applicationProposalExecutions.recipientAddress,
+      executionAmount: applicationProposalExecutions.amount,
+      rejectionId: applicationProposalRejections.id,
+      rejectionReason: applicationProposalRejections.reason,
+      rejectedAt: applicationProposalRejections.createdAt,
     })
     .from(applicationTransactionProposals)
     .innerJoin(
@@ -125,6 +229,22 @@ export async function readApplicationProposalStatus(
         eq(applicationProposalReadCompatibility.source, "pre_0026_transaction_proposal"),
       ),
     )
+    .leftJoin(
+      applicationProposalExecutions,
+      and(
+        eq(applicationProposalExecutions.tenantId, applicationTransactionProposals.tenantId),
+        eq(applicationProposalExecutions.principalId, applicationTransactionProposals.principalId),
+        eq(applicationProposalExecutions.proposalId, applicationTransactionProposals.id),
+      ),
+    )
+    .leftJoin(
+      applicationProposalRejections,
+      and(
+        eq(applicationProposalRejections.tenantId, applicationTransactionProposals.tenantId),
+        eq(applicationProposalRejections.principalId, applicationTransactionProposals.principalId),
+        eq(applicationProposalRejections.proposalId, applicationTransactionProposals.id),
+      ),
+    )
     .where(
       and(
         eq(applicationTransactionProposals.tenantId, principal.tenantId),
@@ -141,8 +261,33 @@ export async function readApplicationProposalStatus(
   if (!record) {
     throw new ApplicationBoundaryError(404, "proposal_not_found", "Proposal not found");
   }
+  const execution =
+    record.executionId !== null &&
+    record.executionStatus !== null &&
+    record.executionChainId !== null &&
+    record.executionTo !== null &&
+    record.executionRecipient !== null &&
+    record.executionAmount !== null
+      ? {
+          executionId: record.executionId,
+          status: record.executionStatus,
+          chainId: record.executionChainId,
+          txHash: record.executionTxHash,
+          toAddress: record.executionTo,
+          recipientAddress: record.executionRecipient,
+          amount: record.executionAmount,
+        }
+      : null;
+  const rejection =
+    record.rejectionId !== null && record.rejectionReason !== null && record.rejectedAt !== null
+      ? {
+          rejectionId: record.rejectionId,
+          reason: record.rejectionReason,
+          rejectedAt: record.rejectedAt,
+        }
+      : null;
   return {
-    proposal: toApplicationProposalReadModel(record),
+    proposal: toApplicationProposalReadModel({ ...record, execution, rejection }),
     authorizationBasis: hasExplicitReadCapability
       ? ("explicit_capability" as const)
       : ("pre_0026_proposal_compatibility" as const),
