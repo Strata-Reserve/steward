@@ -19,6 +19,8 @@ import {
   ApplicationExecutionError,
   createExecutorSignerBinding,
   executeApplicationProposal,
+  readApplicationProposalRejection,
+  rejectApplicationProposal,
   toApplicationExecutionView,
 } from "../services/application-executions";
 import { writeAuditEvent } from "../services/audit";
@@ -479,4 +481,90 @@ applicationPrincipalAdminRoutes.get("/:principalId/proposals/:proposalId/executi
     );
   if (!row) return c.json<ApiResponse>({ ok: false, error: "Execution not found" }, 404);
   return c.json<ApiResponse>({ ok: true, data: { execution: toApplicationExecutionView(row) } });
+});
+
+// ─── Durable human rejection (lane 38) ───────────────────────────────────────
+//
+// Same authority as execute: only a verified human owner/admin session. The
+// rejector is recorded as user:<id>; the application principal (requester)
+// has no reject route. Terminal and idempotent: a re-reject returns the
+// original decision; reject after execution started is refused (409).
+
+const rejectSchema = z.object({ reason: z.string().trim().min(1).max(1000) }).strict();
+
+applicationPrincipalAdminRoutes.post("/:principalId/proposals/:proposalId/reject", async (c) => {
+  const userId = requireHumanOwnerAdmin(c);
+  if (!userId) {
+    return c.json<ApiResponse>(
+      { ok: false, error: "Proposal rejection requires a human owner/admin session" },
+      403,
+    );
+  }
+  const tenantId = c.get("tenantId");
+  const principalId = c.req.param("principalId");
+  const proposalId = c.req.param("proposalId");
+  if (!PRINCIPAL_ID_RE.test(principalId) || !isValidApplicationProposalId(proposalId)) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid proposal reference" }, 400);
+  }
+  const parsed = rejectSchema.safeParse(await safeJsonParse<unknown>(c));
+  if (!parsed.success) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid rejection request" }, 400);
+  }
+  try {
+    const result = await rejectApplicationProposal({
+      tenantId,
+      principalId,
+      proposalId,
+      rejectedBy: `user:${userId}`,
+      reason: parsed.data.reason,
+    });
+    await writeAuditEvent({
+      tenantId,
+      actorType: "user",
+      actorId: userId,
+      action: result.replay
+        ? "application.transaction_proposal.reject.replay"
+        : "application.transaction_proposal.reject",
+      resourceType: "application_transaction_proposal",
+      resourceId: proposalId,
+      metadata: {
+        principalId,
+        rejectionId: result.rejection.id,
+        rejectedBy: result.rejection.rejectedBy,
+      },
+      ...requestMetadata(c),
+    });
+    return c.json<ApiResponse>({ ok: true, data: result }, result.replay ? 200 : 201);
+  } catch (error) {
+    if (error instanceof ApplicationExecutionError) {
+      await writeAuditEvent({
+        tenantId,
+        actorType: "user",
+        actorId: userId,
+        action: "application.transaction_proposal.reject.denied",
+        resourceType: "application_transaction_proposal",
+        resourceId: proposalId,
+        metadata: { principalId, reason: error.code },
+        ...requestMetadata(c),
+      });
+    }
+    return executionErrorResponse(c, error);
+  }
+});
+
+applicationPrincipalAdminRoutes.get("/:principalId/proposals/:proposalId/rejection", async (c) => {
+  if (!requireTenantLevel(c)) {
+    return c.json<ApiResponse>({ ok: false, error: "Tenant administrator access required" }, 403);
+  }
+  const proposalId = c.req.param("proposalId");
+  if (!isValidApplicationProposalId(proposalId)) {
+    return c.json<ApiResponse>({ ok: false, error: "Invalid proposal reference" }, 400);
+  }
+  const rejection = await readApplicationProposalRejection({
+    tenantId: c.get("tenantId"),
+    principalId: c.req.param("principalId"),
+    proposalId,
+  });
+  if (!rejection) return c.json<ApiResponse>({ ok: false, error: "Rejection not found" }, 404);
+  return c.json<ApiResponse>({ ok: true, data: { rejection } });
 });

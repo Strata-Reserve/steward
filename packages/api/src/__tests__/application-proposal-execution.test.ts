@@ -13,6 +13,7 @@ import {
   agents,
   applicationExecutorSigners,
   applicationProposalExecutions,
+  applicationProposalRejections,
   applicationWallets,
   auditEvents,
   closeDb,
@@ -189,6 +190,26 @@ async function createAgent(id: string, tenant = TENANT, key = tenantKey) {
     body: JSON.stringify({ id, name: id }),
   });
   expect(r.status).toBe(200);
+}
+
+function reject(
+  principalId: string,
+  proposalId: string,
+  headers: Record<string, string>,
+  reason = "not approved by the issuer",
+) {
+  return app.request(`/application-principals/${principalId}/proposals/${proposalId}/reject`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ reason }),
+  });
+}
+
+async function rejectionRows(proposalId: string) {
+  return getDb()
+    .select()
+    .from(applicationProposalRejections)
+    .where(eq(applicationProposalRejections.proposalId, proposalId));
 }
 
 function execute(principalId: string, proposalId: string, headers: Record<string, string>) {
@@ -1096,5 +1117,370 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
       rearmed = true;
     } catch {}
     expect(rearmed).toBe(false);
+  });
+
+  // ─── durable human rejection (lane 38) ───────────────────────────────────
+
+  it("a human admin rejection is durable, terminal, attributed, and visible on every read API", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_happy");
+    const sentBefore = sent.length;
+    const r = await reject(
+      issued.principal.id,
+      proposalId,
+      bearer(adminToken),
+      "  wrong investor  ",
+    );
+    expect(r.status).toBe(201);
+    const body = (await r.json()) as any;
+    expect(body.data.replay).toBe(false);
+    expect(body.data.rejection).toMatchObject({
+      proposalId,
+      principalId: issued.principal.id,
+      status: "rejected",
+      rejectedBy: `user:${ADMIN_USER}`,
+      reason: "wrong investor",
+    });
+    expect(body.data.rejection.id).toMatch(/^apr_[0-9a-f]{40}$/);
+    expect(Number.isNaN(Date.parse(body.data.rejection.rejectedAt))).toBe(false);
+    expect(sent.length).toBe(sentBefore);
+
+    const [row] = await rejectionRows(proposalId);
+    expect(row).toMatchObject({ rejectedBy: `user:${ADMIN_USER}`, reason: "wrong investor" });
+    expect(row!.rejectedBy).not.toContain(issued.principal.id);
+    expect(await executionRows(proposalId)).toHaveLength(0);
+    expect(await reservationRows(proposalId)).toHaveLength(0);
+
+    // Requester-side read (application principal): terminal rejected.
+    const read = await readProposal(issued, proposalId);
+    expect(read.status).toBe("rejected");
+    expect(read.terminal).toBe(true);
+    expect(read.executionEvidence).toEqual({
+      status: "rejected",
+      reason: "proposal_rejected",
+      evidence: {
+        rejectionId: body.data.rejection.id,
+        reason: "wrong investor",
+        rejectedAt: body.data.rejection.rejectedAt,
+      },
+    });
+    expect(JSON.stringify(read)).not.toMatch(/broadcast|txHash|executed|confirmed/);
+
+    // Admin-side read.
+    const adminRead = await app.request(
+      `/application-principals/${issued.principal.id}/proposals/${proposalId}/rejection`,
+      { headers: tenantHeaders() },
+    );
+    expect(adminRead.status).toBe(200);
+    expect(((await adminRead.json()) as any).data.rejection).toEqual(body.data.rejection);
+    const noExec = await app.request(
+      `/application-principals/${issued.principal.id}/proposals/${proposalId}/execution`,
+      { headers: tenantHeaders() },
+    );
+    expect(noExec.status).toBe(404);
+
+    const audits = await getDb()
+      .select()
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.tenantId, TENANT),
+          eq(auditEvents.resourceId, proposalId),
+          eq(auditEvents.action, "application.transaction_proposal.reject"),
+        ),
+      );
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ actorType: "user", actorId: ADMIN_USER });
+  });
+
+  it("an owner session can reject; the rejector is that owner", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_owner");
+    const r = await reject(issued.principal.id, proposalId, bearer(ownerToken));
+    expect(r.status).toBe(201);
+    expect(((await r.json()) as any).data.rejection.rejectedBy).toBe(`user:${OWNER_USER}`);
+  });
+
+  it("agent tokens, application keys, tenant keys, members and malformed bodies cannot reject", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_authz");
+    const agentToken = await signAgentToken({ agentId: SIGNER, tenantId: TENANT });
+    for (const headers of [
+      bearer(agentToken),
+      appHeaders(issued),
+      tenantHeaders(),
+      bearer(memberToken),
+    ]) {
+      const r = await reject(issued.principal.id, proposalId, headers);
+      expect([401, 403, 404]).toContain(r.status);
+    }
+    // The requester has no reject route on its own namespace either.
+    const viaApp = await app.request(`/application/transactions/proposals/${proposalId}/reject`, {
+      method: "POST",
+      headers: appHeaders(issued),
+      body: JSON.stringify({ reason: "x" }),
+    });
+    expect([401, 403, 404]).toContain(viaApp.status);
+    for (const body of [
+      {},
+      { reason: "" },
+      { reason: "   " },
+      { reason: "x".repeat(1001) },
+      { reason: "ok", status: "rejected" },
+    ]) {
+      const r = await app.request(
+        `/application-principals/${issued.principal.id}/proposals/${proposalId}/reject`,
+        { method: "POST", headers: bearer(adminToken), body: JSON.stringify(body) },
+      );
+      expect(r.status).toBe(400);
+    }
+    expect(await rejectionRows(proposalId)).toHaveLength(0);
+    expect((await readProposal(issued, proposalId)).executionEvidence.status).toBe("unknown");
+  });
+
+  it("cross-tenant reject is refused and indistinguishable from not found", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_cross");
+    const r = await reject(issued.principal.id, proposalId, bearer(otherAdminToken));
+    expect([403, 404]).toContain(r.status);
+    const viaKey = await reject(
+      issued.principal.id,
+      proposalId,
+      tenantHeaders(OTHER_TENANT, otherTenantKey),
+    );
+    expect([403, 404]).toContain(viaKey.status);
+    expect(await rejectionRows(proposalId)).toHaveLength(0);
+    // An unknown proposal in the right tenant is a plain 404.
+    const unknown = await reject(issued.principal.id, `atp_${"9".repeat(40)}`, bearer(adminToken));
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as any).data.code).toBe("proposal_not_found");
+    const readOther = await app.request(
+      `/application-principals/${issued.principal.id}/proposals/${proposalId}/rejection`,
+      { headers: tenantHeaders(OTHER_TENANT, otherTenantKey) },
+    );
+    expect([403, 404]).toContain(readOther.status);
+  });
+
+  it("re-reject is idempotent: the first decision, rejector and reason stand", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_twice");
+    const first = await reject(issued.principal.id, proposalId, bearer(adminToken), "first reason");
+    expect(first.status).toBe(201);
+    const firstBody = (await first.json()) as any;
+    const again = await reject(
+      issued.principal.id,
+      proposalId,
+      bearer(secondAdminToken),
+      "second reason",
+    );
+    expect(again.status).toBe(200);
+    const againBody = (await again.json()) as any;
+    expect(againBody.data.replay).toBe(true);
+    expect(againBody.data.rejection).toEqual(firstBody.data.rejection);
+    // Concurrent re-rejects also converge on one row.
+    const burst = await Promise.all(
+      Array.from({ length: 4 }, () =>
+        reject(issued.principal.id, proposalId, bearer(ownerToken), "burst"),
+      ),
+    );
+    for (const r of burst) expect(r.status).toBe(200);
+    const rows = await rejectionRows(proposalId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ rejectedBy: `user:${ADMIN_USER}`, reason: "first reason" });
+  });
+
+  it("concurrent first rejects of a fresh proposal produce exactly one decision", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_burst");
+    const results = await Promise.all(
+      [adminToken, secondAdminToken, ownerToken].map((t) =>
+        reject(issued.principal.id, proposalId, bearer(t)),
+      ),
+    );
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual([200, 200, 201]);
+    expect(await rejectionRows(proposalId)).toHaveLength(1);
+  });
+
+  it("execute after reject is refused before any binding, policy, vault or RPC use", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_then_exec");
+    expect((await reject(issued.principal.id, proposalId, bearer(adminToken))).status).toBe(201);
+    const sentBefore = sent.length;
+    const evaluate = spyOn(policyEngine, "evaluate");
+    const rpc = spyOn(vault, "assertChainRpcReady");
+    try {
+      for (const token of [adminToken, secondAdminToken, ownerToken]) {
+        const r = await execute(issued.principal.id, proposalId, bearer(token));
+        expect(r.status).toBe(409);
+        expect(((await r.json()) as any).data.code).toBe("proposal_rejected");
+      }
+      expect(evaluate).not.toHaveBeenCalled();
+      expect(rpc).not.toHaveBeenCalled();
+    } finally {
+      evaluate.mockRestore();
+      rpc.mockRestore();
+    }
+    expect(sent.length).toBe(sentBefore);
+    expect(await executionRows(proposalId)).toHaveLength(0);
+    expect(await reservationRows(proposalId)).toHaveLength(0);
+    const denied = await getDb()
+      .select()
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.tenantId, TENANT),
+          eq(auditEvents.resourceId, proposalId),
+          eq(auditEvents.action, "application.transaction_proposal.execute.denied"),
+        ),
+      );
+    expect(denied).toHaveLength(3);
+    expect((await readProposal(issued, proposalId)).terminal).toBe(true);
+  });
+
+  it("reject after execution started is refused, for broadcast and for indeterminate executions", async () => {
+    const { issued, proposalId } = await scenario("party_inv_exec_then_reject");
+    expect((await execute(issued.principal.id, proposalId, bearer(adminToken))).status).toBe(201);
+    const r = await reject(issued.principal.id, proposalId, bearer(secondAdminToken));
+    expect(r.status).toBe(409);
+    expect(((await r.json()) as any).data.code).toBe("execution_started");
+    expect(await rejectionRows(proposalId)).toHaveLength(0);
+    const read = await readProposal(issued, proposalId);
+    expect(read.executionEvidence.status).toBe("broadcast");
+    expect(read.terminal).toBe(false);
+
+    const amb = await scenario("party_inv_indeterminate_then_reject");
+    broadcastImpl = async () => {
+      throw new Error("socket hang up after send");
+    };
+    try {
+      expect(
+        (await execute(amb.issued.principal.id, amb.proposalId, bearer(adminToken))).status,
+      ).toBe(202);
+    } finally {
+      broadcastImpl = async () => `0x${(sent.length + 0xabc).toString(16).padStart(64, "0")}`;
+    }
+    const r2 = await reject(amb.issued.principal.id, amb.proposalId, bearer(adminToken));
+    expect(r2.status).toBe(409);
+    expect(((await r2.json()) as any).data.code).toBe("execution_started");
+    expect((await readProposal(amb.issued, amb.proposalId)).executionEvidence.status).toBe(
+      "indeterminate",
+    );
+    const denied = await getDb()
+      .select()
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.resourceId, amb.proposalId),
+          eq(auditEvents.action, "application.transaction_proposal.reject.denied"),
+        ),
+      );
+    expect(denied).toHaveLength(1);
+  });
+
+  it("reject vs execute race: exactly one decision wins, and the loser leaves nothing behind", async () => {
+    for (let round = 0; round < 6; round++) {
+      const { issued, proposalId } = await scenario(`party_inv_race_reject_${round}`);
+      const sentBefore = sent.length;
+      const execFirst = round % 2 === 0;
+      const run = () => execute(issued.principal.id, proposalId, bearer(adminToken));
+      const refuse = () => reject(issued.principal.id, proposalId, bearer(secondAdminToken));
+      const [a, b] = await Promise.all(execFirst ? [run(), refuse()] : [refuse(), run()]);
+      const exec = execFirst ? a : b;
+      const rej = execFirst ? b : a;
+      const execRows = await executionRows(proposalId);
+      const rejRows = await rejectionRows(proposalId);
+      expect(execRows.length + rejRows.length).toBe(1);
+      if (execRows.length === 1) {
+        expect(exec.status).toBe(201);
+        expect(rej.status).toBe(409);
+        expect(((await rej.json()) as any).data.code).toBe("execution_started");
+        expect(sent.length).toBe(sentBefore + 1);
+      } else {
+        expect(rej.status).toBe(201);
+        expect(exec.status).toBe(409);
+        expect(((await exec.json()) as any).data.code).toBe("proposal_rejected");
+        expect(sent.length).toBe(sentBefore);
+        expect(await reservationRows(proposalId)).toHaveLength(0);
+      }
+    }
+  });
+
+  it("a rejection committed after execute's pre-check still wins: the DB guard rolls the reservation back", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_window");
+    const sentBefore = sent.length;
+    // Land the rejection inside the window between execute's rejection
+    // pre-check and its reservation transaction (policy runs in between).
+    const realEvaluate = policyEngine.evaluate.bind(policyEngine);
+    const evaluate = spyOn(policyEngine, "evaluate").mockImplementationOnce((async (
+      ...args: Parameters<typeof policyEngine.evaluate>
+    ) => {
+      const r = await reject(issued.principal.id, proposalId, bearer(secondAdminToken), "late");
+      expect(r.status).toBe(201);
+      return realEvaluate(...args);
+    }) as never);
+    try {
+      const r = await execute(issued.principal.id, proposalId, bearer(adminToken));
+      expect(r.status).toBe(409);
+      expect(((await r.json()) as any).data.code).toBe("proposal_rejected");
+      expect(evaluate).toHaveBeenCalledTimes(1);
+    } finally {
+      evaluate.mockRestore();
+    }
+    expect(sent.length).toBe(sentBefore);
+    expect(await executionRows(proposalId)).toHaveLength(0);
+    expect(await reservationRows(proposalId)).toHaveLength(0);
+    expect(await rejectionRows(proposalId)).toHaveLength(1);
+  });
+
+  it("a revoked requester can still be rejected (refusal needs no requester authority)", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_revoked");
+    const revoke = await app.request(`/application-principals/${issued.principal.id}/revoke`, {
+      method: "POST",
+      headers: tenantHeaders(),
+    });
+    expect(revoke.status).toBe(200);
+    const r = await reject(issued.principal.id, proposalId, bearer(adminToken));
+    expect(r.status).toBe(201);
+  });
+
+  it("the rejection row is immutable, human-only, and cannot be deleted while its proposal exists", async () => {
+    const { issued, proposalId } = await scenario("party_inv_reject_immutable");
+    expect((await reject(issued.principal.id, proposalId, bearer(adminToken))).status).toBe(201);
+    const [row] = await rejectionRows(proposalId);
+    const refused = async (op: PromiseLike<unknown>) => {
+      try {
+        await op;
+        return false;
+      } catch {
+        return true;
+      }
+    };
+    expect(
+      await refused(
+        getDb()
+          .update(applicationProposalRejections)
+          .set({ reason: "rewritten" })
+          .where(eq(applicationProposalRejections.id, row!.id)),
+      ),
+    ).toBe(true);
+    expect(
+      await refused(
+        getDb()
+          .delete(applicationProposalRejections)
+          .where(eq(applicationProposalRejections.id, row!.id)),
+      ),
+    ).toBe(true);
+    // A non-human rejector is refused by the CHECK even on a fresh proposal.
+    const other = await scenario("party_inv_reject_nonhuman");
+    expect(
+      await refused(
+        getDb()
+          .insert(applicationProposalRejections)
+          .values({
+            id: `apr_${"0".repeat(40)}`,
+            tenantId: TENANT,
+            principalId: other.issued.principal.id,
+            proposalId: other.proposalId,
+            rejectedBy: `app:${other.issued.principal.id}`,
+            reason: "self-reject",
+          }),
+      ),
+    ).toBe(true);
+    expect(await rejectionRows(other.proposalId)).toHaveLength(0);
+    expect(await rejectionRows(proposalId)).toEqual([row!]);
   });
 });

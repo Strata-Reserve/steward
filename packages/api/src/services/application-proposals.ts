@@ -9,6 +9,7 @@ import {
   applicationPrincipalResources,
   applicationProposalExecutions,
   applicationProposalReadCompatibility,
+  applicationProposalRejections,
   applicationTransactionIntents,
   applicationTransactionProposals,
   applicationWallets,
@@ -44,6 +45,12 @@ type ApplicationProposalExecutionRecord = {
   executionId: string;
 };
 
+type ApplicationProposalRejectionRecord = {
+  rejectionId: string;
+  reason: string;
+  rejectedAt: Date;
+};
+
 type ApplicationProposalReadRecord = {
   id: string;
   intentId: string;
@@ -53,6 +60,7 @@ type ApplicationProposalReadRecord = {
   resourceKind: "wallet_owner";
   resourceId: string;
   execution?: ApplicationProposalExecutionRecord | null;
+  rejection?: ApplicationProposalRejectionRecord | null;
 };
 
 /**
@@ -65,10 +73,45 @@ type ApplicationProposalReadRecord = {
  *   - `executing` / `indeterminate` -> no hash is claimed; the consumer must
  *     keep the work open and reconcile.
  *
- * `terminal` stays false: broadcast is not confirmation.
+ * `terminal` stays false for every execution state: broadcast is not
+ * confirmation.
+ *
+ * A durable human rejection (`application_proposal_rejections`, mutually
+ * exclusive with an execution row) is the one terminal outcome Steward owns:
+ *
+ *   - rejected        -> top-level `status: "rejected"`, `terminal: true`,
+ *                        executionEvidence `rejected` / `proposal_rejected`,
+ *                        evidence `{ rejectionId, reason, rejectedAt }`. The
+ *                        proposal can never be executed afterwards.
  */
 export function toApplicationProposalReadModel(record: ApplicationProposalReadRecord) {
   const execution = record.execution ?? null;
+  const rejection = record.rejection ?? null;
+  if (rejection !== null && execution === null) {
+    return {
+      id: record.id,
+      intentId: record.intentId,
+      // Derived: the immutable proposal row keeps `proposed`; the decision row
+      // is what makes the read terminal.
+      status: "rejected" as const,
+      terminal: true as const,
+      recordedAt: record.createdAt.toISOString(),
+      resource: {
+        kind: record.resourceKind,
+        id: record.resourceId,
+        walletId: record.walletId,
+      },
+      executionEvidence: {
+        status: "rejected" as const,
+        evidence: {
+          rejectionId: rejection.rejectionId,
+          reason: rejection.reason,
+          rejectedAt: rejection.rejectedAt.toISOString(),
+        },
+        reason: "proposal_rejected" as const,
+      },
+    };
+  }
   return {
     id: record.id,
     intentId: record.intentId,
@@ -142,6 +185,9 @@ export async function readApplicationProposalStatus(
       executionTo: applicationProposalExecutions.toAddress,
       executionRecipient: applicationProposalExecutions.recipientAddress,
       executionAmount: applicationProposalExecutions.amount,
+      rejectionId: applicationProposalRejections.id,
+      rejectionReason: applicationProposalRejections.reason,
+      rejectedAt: applicationProposalRejections.createdAt,
     })
     .from(applicationTransactionProposals)
     .innerJoin(
@@ -191,6 +237,14 @@ export async function readApplicationProposalStatus(
         eq(applicationProposalExecutions.proposalId, applicationTransactionProposals.id),
       ),
     )
+    .leftJoin(
+      applicationProposalRejections,
+      and(
+        eq(applicationProposalRejections.tenantId, applicationTransactionProposals.tenantId),
+        eq(applicationProposalRejections.principalId, applicationTransactionProposals.principalId),
+        eq(applicationProposalRejections.proposalId, applicationTransactionProposals.id),
+      ),
+    )
     .where(
       and(
         eq(applicationTransactionProposals.tenantId, principal.tenantId),
@@ -224,8 +278,16 @@ export async function readApplicationProposalStatus(
           amount: record.executionAmount,
         }
       : null;
+  const rejection =
+    record.rejectionId !== null && record.rejectionReason !== null && record.rejectedAt !== null
+      ? {
+          rejectionId: record.rejectionId,
+          reason: record.rejectionReason,
+          rejectedAt: record.rejectedAt,
+        }
+      : null;
   return {
-    proposal: toApplicationProposalReadModel({ ...record, execution }),
+    proposal: toApplicationProposalReadModel({ ...record, execution, rejection }),
     authorizationBasis: hasExplicitReadCapability
       ? ("explicit_capability" as const)
       : ("pre_0026_proposal_compatibility" as const),

@@ -1258,5 +1258,42 @@ export const applicationProposalExecutions = pgTable(
   }),
 );
 
+// Durable human rejection (migration 0031). Mutually exclusive with an
+// execution row (DB guard), immutable, and only removable with its proposal.
+export const applicationProposalRejections = pgTable(
+  "application_proposal_rejections",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    principalId: varchar("principal_id", { length: 64 }).notNull(),
+    proposalId: varchar("proposal_id", { length: 64 }).notNull(),
+    rejectedBy: varchar("rejected_by", { length: 255 }).notNull(),
+    reason: text("reason").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    proposalUnique: uniqueIndex("application_rejections_proposal_idx").on(
+      table.tenantId,
+      table.principalId,
+      table.proposalId,
+    ),
+    proposalFk: foreignKey({
+      columns: [table.tenantId, table.principalId, table.proposalId],
+      foreignColumns: [
+        applicationTransactionProposals.tenantId,
+        applicationTransactionProposals.principalId,
+        applicationTransactionProposals.id,
+      ],
+      name: "application_rejections_proposal_fk",
+    }).onDelete("cascade"),
+    humanCheck: check("application_rejections_human_chk", sql`${table.rejectedBy} ~ '^user:.+$'`),
+    reasonCheck: check(
+      "application_rejections_reason_chk",
+      sql`char_length(btrim(${table.reason})) BETWEEN 1 AND 1000`,
+    ),
+  }),
+);
+
 export type ApplicationExecutorSigner = typeof applicationExecutorSigners.$inferSelect;
 export type ApplicationProposalExecution = typeof applicationProposalExecutions.$inferSelect;
+export type ApplicationProposalRejection = typeof applicationProposalRejections.$inferSelect;

@@ -37,6 +37,7 @@ import {
   applicationPrincipalResources,
   applicationPrincipals,
   applicationProposalExecutions,
+  applicationProposalRejections,
   applicationTransactionIntents,
   applicationTransactionProposals,
   applicationWallets,
@@ -236,6 +237,12 @@ export async function executeApplicationProposal(input: {
     );
   if (existing) return { execution: toApplicationExecutionView(existing), replay: true };
 
+  // A durable human rejection is terminal: execute after reject is refused
+  // before any binding, policy, vault, key or RPC use.
+  if (await findRejection(input.tenantId, input.principalId, input.proposalId)) {
+    fail(409, "proposal_rejected", "Proposal was rejected and can never be executed");
+  }
+
   // Application boundary: the exact proposal -> intent -> wallet -> assigned
   // resource chain, all in the principal's tenant scope.
   const [record] = await db
@@ -398,62 +405,71 @@ export async function executeApplicationProposal(input: {
   );
   const txId = crypto.randomUUID();
 
-  const reservation = await db.transaction(async (tx) => {
-    // Re-lock the principal row so a concurrent revoke serializes against us.
-    const [locked] = await tx
-      .select({ revokedAt: applicationPrincipals.revokedAt })
-      .from(applicationPrincipals)
-      .where(
-        and(
-          eq(applicationPrincipals.tenantId, input.tenantId),
-          eq(applicationPrincipals.id, input.principalId),
-        ),
-      )
-      .for("update");
-    if (!locked || locked.revokedAt) return { revoked: true as const };
-    // Single-execution arbiter first: the execution_ref unique index on
-    // transactions (STRATA-1486) admits exactly one reservation per proposal.
-    const reserved = await tx
-      .insert(transactions)
-      .values({
-        id: txId,
-        agentId: binding.signerAgentId,
-        tenantId: input.tenantId,
-        executionRef,
-        status: "approved",
-        toAddress: signRequest.to,
-        value: "0",
-        data: signRequest.data,
-        chainId,
-        policyResults,
-      })
-      .onConflictDoNothing({
-        target: [transactions.tenantId, transactions.agentId, transactions.executionRef],
-      })
-      .returning({ id: transactions.id });
-    if (reserved.length === 0) return { winner: true as const };
-    const inserted = await tx
-      .insert(applicationProposalExecutions)
-      .values({
-        id: executionId,
-        tenantId: input.tenantId,
-        principalId: input.principalId,
-        proposalId: proposal.id,
-        signerAgentId: binding.signerAgentId,
-        chainId,
-        transactionId: txId,
-        executionRef,
-        toAddress: signRequest.to,
-        recipientAddress: mint.recipient.toLowerCase(),
-        amount: mint.amount.toString(),
-        approvedBy: input.approvedBy,
-        policyResults,
-      })
-      .onConflictDoNothing()
-      .returning();
-    if (inserted.length === 0) throw new Error("application execution reservation collided");
-    return { row: inserted[0]! };
-  });
+  // The 0031 decision guard: a rejection committed between the check above
+  // and the execution insert wins, and the whole reservation rolls back.
+  const reservation = await db
+    .transaction(async (tx) => {
+      // Re-lock the principal row so a concurrent revoke serializes against us.
+      const [locked] = await tx
+        .select({ revokedAt: applicationPrincipals.revokedAt })
+        .from(applicationPrincipals)
+        .where(
+          and(
+            eq(applicationPrincipals.tenantId, input.tenantId),
+            eq(applicationPrincipals.id, input.principalId),
+          ),
+        )
+        .for("update");
+      if (!locked || locked.revokedAt) return { revoked: true as const };
+      // Single-execution arbiter first: the execution_ref unique index on
+      // transactions (STRATA-1486) admits exactly one reservation per proposal.
+      const reserved = await tx
+        .insert(transactions)
+        .values({
+          id: txId,
+          agentId: binding.signerAgentId,
+          tenantId: input.tenantId,
+          executionRef,
+          status: "approved",
+          toAddress: signRequest.to,
+          value: "0",
+          data: signRequest.data,
+          chainId,
+          policyResults,
+        })
+        .onConflictDoNothing({
+          target: [transactions.tenantId, transactions.agentId, transactions.executionRef],
+        })
+        .returning({ id: transactions.id });
+      if (reserved.length === 0) return { winner: true as const };
+      const inserted = await tx
+        .insert(applicationProposalExecutions)
+        .values({
+          id: executionId,
+          tenantId: input.tenantId,
+          principalId: input.principalId,
+          proposalId: proposal.id,
+          signerAgentId: binding.signerAgentId,
+          chainId,
+          transactionId: txId,
+          executionRef,
+          toAddress: signRequest.to,
+          recipientAddress: mint.recipient.toLowerCase(),
+          amount: mint.amount.toString(),
+          approvedBy: input.approvedBy,
+          policyResults,
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (inserted.length === 0) throw new Error("application execution reservation collided");
+      return { row: inserted[0]! };
+    })
+    .catch((error: unknown) => {
+      if (isDecisionGuardError(error, "application proposal is rejected")) {
+        fail(409, "proposal_rejected", "Proposal was rejected and can never be executed");
+      }
+      throw error;
+    });
   if ("revoked" in reservation) fail(409, "principal_revoked", "Application principal is revoked");
   if ("winner" in reservation) {
     const [winner] = await db
@@ -514,4 +530,141 @@ export async function executeApplicationProposal(input: {
   recordVaultSpend(binding.signerAgentId, input.tenantId, "0", chainId).catch(() => undefined);
   if (!row) fail(500, "execution_record_failed", "Broadcast succeeded but recording failed");
   return { execution: toApplicationExecutionView(row), replay: false };
+}
+
+// ─── Durable human rejection (lane 38) ───────────────────────────────────────
+
+type RejectionRow = typeof applicationProposalRejections.$inferSelect;
+
+export function toApplicationRejectionView(row: RejectionRow) {
+  return {
+    id: row.id,
+    proposalId: row.proposalId,
+    principalId: row.principalId,
+    status: "rejected" as const,
+    rejectedBy: row.rejectedBy,
+    reason: row.reason,
+    rejectedAt: row.createdAt.toISOString(),
+  };
+}
+
+async function findRejection(tenantId: string, principalId: string, proposalId: string) {
+  const [row] = await getDb()
+    .select()
+    .from(applicationProposalRejections)
+    .where(
+      and(
+        eq(applicationProposalRejections.tenantId, tenantId),
+        eq(applicationProposalRejections.principalId, principalId),
+        eq(applicationProposalRejections.proposalId, proposalId),
+      ),
+    );
+  return row ?? null;
+}
+
+export async function readApplicationProposalRejection(input: {
+  tenantId: string;
+  principalId: string;
+  proposalId: string;
+}) {
+  const row = await findRejection(input.tenantId, input.principalId, input.proposalId);
+  return row ? toApplicationRejectionView(row) : null;
+}
+
+function isDecisionGuardError(error: unknown, message: string): boolean {
+  for (let e: unknown = error, depth = 0; e && depth < 5; depth++) {
+    if (e instanceof Error && e.message.includes(message)) return true;
+    e = (e as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+export type RejectApplicationProposalResult = {
+  rejection: ReturnType<typeof toApplicationRejectionView>;
+  replay: boolean;
+};
+
+/**
+ * A human owner/admin refuses one application proposal. Durable and terminal:
+ * one immutable rejection row per proposal, mutually exclusive with the
+ * execution row (0031 decision guard), so exactly one of a concurrent
+ * reject/execute pair wins. Re-reject returns the original decision unchanged
+ * (first rejector and reason stand). Reject after execution started (any
+ * execution row, including indeterminate) is refused: the chain may already
+ * have the transaction, so only reconciliation can resolve it.
+ *
+ * Principal revocation/expiry and intent expiry do NOT block a rejection: a
+ * refusal never needs authority the requester may have lost.
+ */
+export async function rejectApplicationProposal(input: {
+  tenantId: string;
+  principalId: string;
+  proposalId: string;
+  rejectedBy: string;
+  reason: string;
+}): Promise<RejectApplicationProposalResult> {
+  const db = getDb();
+  const prior = await findRejection(input.tenantId, input.principalId, input.proposalId);
+  if (prior) return { rejection: toApplicationRejectionView(prior), replay: true };
+
+  const [proposal] = await db
+    .select({ id: applicationTransactionProposals.id })
+    .from(applicationTransactionProposals)
+    .where(
+      and(
+        eq(applicationTransactionProposals.tenantId, input.tenantId),
+        eq(applicationTransactionProposals.principalId, input.principalId),
+        eq(applicationTransactionProposals.id, input.proposalId),
+      ),
+    );
+  if (!proposal) fail(404, "proposal_not_found", "Proposal not found");
+
+  const [execution] = await db
+    .select({ id: applicationProposalExecutions.id })
+    .from(applicationProposalExecutions)
+    .where(
+      and(
+        eq(applicationProposalExecutions.tenantId, input.tenantId),
+        eq(applicationProposalExecutions.principalId, input.principalId),
+        eq(applicationProposalExecutions.proposalId, input.proposalId),
+      ),
+    );
+  if (execution) {
+    fail(409, "execution_started", "Proposal execution already started; it cannot be rejected");
+  }
+
+  const id = deterministicId(
+    "apr",
+    "application-proposal-rejection",
+    input.tenantId,
+    input.principalId,
+    input.proposalId,
+  );
+  let inserted: RejectionRow[];
+  try {
+    inserted = await db
+      .insert(applicationProposalRejections)
+      .values({
+        id,
+        tenantId: input.tenantId,
+        principalId: input.principalId,
+        proposalId: input.proposalId,
+        rejectedBy: input.rejectedBy,
+        reason: input.reason,
+      })
+      .onConflictDoNothing()
+      .returning();
+  } catch (error) {
+    if (isDecisionGuardError(error, "application proposal execution already started")) {
+      fail(409, "execution_started", "Proposal execution already started; it cannot be rejected");
+    }
+    throw error;
+  }
+  if (inserted.length === 0) {
+    // A concurrent reject won; report its decision.
+    const winner = await findRejection(input.tenantId, input.principalId, input.proposalId);
+    if (!winner) fail(500, "rejection_record_failed", "Rejection could not be recorded");
+    return { rejection: toApplicationRejectionView(winner), replay: true };
+  }
+  return { rejection: toApplicationRejectionView(inserted[0]!), replay: false };
 }

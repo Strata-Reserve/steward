@@ -93,6 +93,59 @@ describe("application proposal read service contract", () => {
     ).toBeNull();
   });
 
+  it("maps a durable human rejection to the only terminal read, with no execution claim", () => {
+    const base = {
+      id: `atp_${"a".repeat(40)}`,
+      intentId: `ati_${"b".repeat(40)}`,
+      status: "proposed" as const,
+      createdAt: new Date("2026-11-09T16:00:00.000Z"),
+      walletId: `aw_${"c".repeat(40)}`,
+      resourceKind: "wallet_owner" as const,
+      resourceId: "party_inv_123",
+    };
+    const rejection = {
+      rejectionId: `apr_${"d".repeat(40)}`,
+      reason: "not approved",
+      rejectedAt: new Date("2026-11-09T17:00:00.000Z"),
+    };
+    const model = toApplicationProposalReadModel({ ...base, rejection });
+    expect(model).toEqual({
+      id: base.id,
+      intentId: base.intentId,
+      status: "rejected",
+      terminal: true,
+      recordedAt: "2026-11-09T16:00:00.000Z",
+      resource: { kind: "wallet_owner", id: "party_inv_123", walletId: base.walletId },
+      executionEvidence: {
+        status: "rejected",
+        reason: "proposal_rejected",
+        evidence: {
+          rejectionId: rejection.rejectionId,
+          reason: "not approved",
+          rejectedAt: "2026-11-09T17:00:00.000Z",
+        },
+      },
+    });
+    expect(JSON.stringify(model)).not.toMatch(/broadcast|txHash|executed|confirmed|signed/);
+    // The DB makes rejection and execution mutually exclusive; if both were
+    // ever present the read never claims rejection over an execution row.
+    const both = toApplicationProposalReadModel({
+      ...base,
+      rejection,
+      execution: {
+        executionId: `ape_${"e".repeat(40)}`,
+        status: "indeterminate",
+        chainId: 84532,
+        txHash: null,
+        toAddress: `0x${"e".repeat(40)}`,
+        recipientAddress: `0x${"f".repeat(40)}`,
+        amount: "1",
+      },
+    });
+    expect(both.terminal).toBe(false);
+    expect(both.executionEvidence.status).toBe("indeterminate");
+  });
+
   it("accepts only the canonical proposal identifier shape", () => {
     expect(isValidApplicationProposalId(`atp_${"0".repeat(40)}`)).toBe(true);
     for (const candidate of [

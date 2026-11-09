@@ -33,6 +33,10 @@ const INTENT = `ati_${"a".repeat(40)}`;
 const PROPOSAL = `atp_${"a".repeat(40)}`;
 const PROPOSAL_2 = `atp_${"b".repeat(40)}`;
 const INTENT_2 = `ati_${"b".repeat(40)}`;
+const PROPOSAL_3 = `atp_${"c".repeat(40)}`;
+const INTENT_3 = `ati_${"c".repeat(40)}`;
+const PROPOSAL_4 = `atp_${"f".repeat(40)}`;
+const INTENT_4 = `ati_${"f".repeat(40)}`;
 const SIGNER = "exec31-signer";
 const TOKEN = "0x7045ee8bcd2f2bd5f04622829334faeb6129971b";
 
@@ -142,6 +146,8 @@ beforeAll(async () => {
   for (const [intent, proposal, suffix] of [
     [INTENT, PROPOSAL, "d"],
     [INTENT_2, PROPOSAL_2, "e"],
+    [INTENT_3, PROPOSAL_3, "1"],
+    [INTENT_4, PROPOSAL_4, "2"],
   ] as const) {
     await sql.unsafe(
       `INSERT INTO application_transaction_intents
@@ -177,6 +183,24 @@ describe.skipIf(SKIP)("0031 application proposal execution on real Postgres", ()
     expect(proposals.map((p) => [p.id, p.status])).toEqual([
       [PROPOSAL, "proposed"],
       [PROPOSAL_2, "proposed"],
+      [PROPOSAL_3, "proposed"],
+      [PROPOSAL_4, "proposed"],
+    ]);
+    const rejections = await sql!.unsafe(
+      `SELECT count(*)::int AS n FROM application_proposal_rejections`,
+    );
+    expect(rejections[0]!.n).toBe(0);
+    const guards = await sql!.unsafe(
+      `SELECT tgname FROM pg_trigger WHERE tgname IN
+         ('application_executions_decision_guard', 'application_rejections_decision_guard',
+          'application_rejections_immutable', 'application_rejections_no_delete')
+       ORDER BY tgname`,
+    );
+    expect(guards.map((g) => g.tgname)).toEqual([
+      "application_executions_decision_guard",
+      "application_rejections_decision_guard",
+      "application_rejections_immutable",
+      "application_rejections_no_delete",
     ]);
     const executions = await sql!.unsafe(
       `SELECT count(*)::int AS n FROM application_proposal_executions`,
@@ -313,5 +337,137 @@ describe.skipIf(SKIP)("0031 application proposal execution on real Postgres", ()
         /immutable|application/,
       ),
     ).toBe(true);
+  });
+
+  it("rejection rows: human-only, one per proposal, immutable, undeletable while the proposal exists", async () => {
+    const insertRejection = (id: string, proposalId: string, by = "user:exec31", reason = "no") =>
+      sql!.unsafe(
+        `INSERT INTO application_proposal_rejections
+           (id, tenant_id, principal_id, proposal_id, rejected_by, reason)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [id, TENANT, PRINCIPAL, proposalId, by, reason],
+      );
+    expect(
+      await refused(
+        () => insertRejection(`apr_${"0".repeat(40)}`, PROPOSAL_3, `app:${PRINCIPAL}`),
+        /application_rejections_human_chk/,
+      ),
+    ).toBe(true);
+    expect(
+      await refused(
+        () => insertRejection(`apr_${"0".repeat(40)}`, PROPOSAL_3, "user:exec31", "   "),
+        /application_rejections_reason_chk/,
+      ),
+    ).toBe(true);
+    await insertRejection(`apr_${"3".repeat(40)}`, PROPOSAL_3);
+    expect(
+      await refused(
+        () => insertRejection(`apr_${"4".repeat(40)}`, PROPOSAL_3),
+        /application_rejections_proposal_idx|duplicate key/,
+      ),
+    ).toBe(true);
+    expect(
+      await refused(
+        () =>
+          sql!.unsafe(`UPDATE application_proposal_rejections SET reason = 'x' WHERE id = $1`, [
+            `apr_${"3".repeat(40)}`,
+          ]),
+        /immutable/,
+      ),
+    ).toBe(true);
+    expect(
+      await refused(
+        () =>
+          sql!.unsafe(`DELETE FROM application_proposal_rejections WHERE id = $1`, [
+            `apr_${"3".repeat(40)}`,
+          ]),
+        /permanent/,
+      ),
+    ).toBe(true);
+  });
+
+  it("decision guard: a rejected proposal cannot get an execution row, and an executed one cannot be rejected", async () => {
+    // PROPOSAL_3 was rejected above: no execution can be inserted for it.
+    await insertTransaction("exec31-tx-3", 84532, "direct:84532-3");
+    expect(
+      await refused(
+        () => insertExecution(`ape_${"5".repeat(40)}`, PROPOSAL_3, "exec31-tx-3", 84532),
+        /application proposal is rejected/,
+      ),
+    ).toBe(true);
+    // PROPOSAL (indeterminate) and PROPOSAL_2 (broadcast) already have execution
+    // rows: neither can be rejected.
+    for (const proposalId of [PROPOSAL, PROPOSAL_2]) {
+      expect(
+        await refused(
+          () =>
+            sql!.unsafe(
+              `INSERT INTO application_proposal_rejections
+                 (id, tenant_id, principal_id, proposal_id, rejected_by, reason)
+               VALUES ($1, $2, $3, $4, 'user:exec31', 'late')`,
+              [`apr_${proposalId.slice(4, 44)}`, TENANT, PRINCIPAL, proposalId],
+            ),
+          /execution already started/,
+        ),
+        proposalId,
+      ).toBe(true);
+    }
+  });
+
+  it("decision guard serializes a concurrent reject and execute on real Postgres: exactly one commits", async () => {
+    await insertTransaction("exec31-tx-4", 84532, "direct:84532-4");
+    const a = createPostgresClient(databaseUrl);
+    const b = createPostgresClient(databaseUrl);
+    try {
+      const results = await Promise.allSettled([
+        a.begin(async (tx) => {
+          await tx.unsafe(
+            `INSERT INTO application_proposal_executions
+               (id, tenant_id, principal_id, proposal_id, signer_agent_id, chain_id, transaction_id,
+                execution_ref, to_address, recipient_address, amount, approved_by)
+             VALUES ($1, $2, $3, $4, $5, 84532, 'exec31-tx-4', $6, $7, $8, '1', 'user:a')`,
+            [
+              `ape_${"6".repeat(40)}`,
+              TENANT,
+              PRINCIPAL,
+              PROPOSAL_4,
+              SIGNER,
+              `application-proposal:${PROPOSAL_4}`,
+              TOKEN,
+              `0x${"33".repeat(20)}`,
+            ],
+          );
+          await tx.unsafe(`SELECT pg_sleep(0.3)`);
+        }),
+        (async () => {
+          await Bun.sleep(50);
+          return b.begin(async (tx) => {
+            await tx.unsafe(
+              `INSERT INTO application_proposal_rejections
+                 (id, tenant_id, principal_id, proposal_id, rejected_by, reason)
+               VALUES ($1, $2, $3, $4, 'user:b', 'race')`,
+              [`apr_${"6".repeat(40)}`, TENANT, PRINCIPAL, PROPOSAL_4],
+            );
+          });
+        })(),
+      ]);
+      expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+      const [execs, rejs] = await Promise.all([
+        sql!.unsafe(
+          `SELECT count(*)::int AS n FROM application_proposal_executions WHERE proposal_id = $1`,
+          [PROPOSAL_4],
+        ),
+        sql!.unsafe(
+          `SELECT count(*)::int AS n FROM application_proposal_rejections WHERE proposal_id = $1`,
+          [PROPOSAL_4],
+        ),
+      ]);
+      expect(execs[0]!.n + rejs[0]!.n).toBe(1);
+      // The execute transaction locked the proposal first, so it wins here.
+      expect(execs[0]!.n).toBe(1);
+    } finally {
+      await a.end();
+      await b.end();
+    }
   });
 });

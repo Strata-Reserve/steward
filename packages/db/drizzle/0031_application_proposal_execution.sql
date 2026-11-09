@@ -10,11 +10,23 @@
 --                                  single-execution arbiter: a proposal can be
 --                                  signed at most once, ever.
 --
+--   application_proposal_rejections one row per rejected proposal. A human
+--                                  owner/admin refusal is a durable terminal
+--                                  decision (rejector, reason, timestamp).
+--
+-- Execution and rejection are mutually exclusive per proposal. Both inserts run
+-- a BEFORE INSERT guard that locks the proposal row and refuses if the other
+-- decision already exists, so exactly one of a concurrent reject/execute pair
+-- can commit, whatever the application code does.
+--
 -- Rollback (only BEFORE any execution has been broadcast; afterwards it drops
 -- the only Steward linkage from proposal to chain transaction):
+--   DROP TABLE application_proposal_rejections;
 --   DROP TABLE application_proposal_executions;
 --   DROP TABLE application_executor_signers;
 --   DROP FUNCTION steward_guard_application_execution_update();
+--   DROP FUNCTION steward_guard_application_proposal_decision();
+--   DROP FUNCTION steward_guard_application_rejection_delete();
 --   DROP TYPE application_execution_status;
 CREATE TYPE "application_execution_status" AS ENUM (
   'executing',
@@ -118,3 +130,80 @@ CREATE TRIGGER application_executions_no_delete
   BEFORE DELETE ON application_proposal_executions
   FOR EACH ROW WHEN (OLD.status = 'broadcast')
   EXECUTE FUNCTION steward_reject_application_immutable_update();
+--> statement-breakpoint
+-- Durable human rejection. Immutable once written; it can only disappear
+-- together with its proposal (cascade), never on its own, so a rejected
+-- proposal can never be reopened for execution.
+CREATE TABLE "application_proposal_rejections" (
+  "id" varchar(64) PRIMARY KEY NOT NULL,
+  "tenant_id" varchar(64) NOT NULL,
+  "principal_id" varchar(64) NOT NULL,
+  "proposal_id" varchar(64) NOT NULL,
+  "rejected_by" varchar(255) NOT NULL,
+  "reason" text NOT NULL,
+  "created_at" timestamp with time zone NOT NULL DEFAULT now(),
+  -- Only a human user can reject (the route records user:<id>).
+  CONSTRAINT "application_rejections_human_chk" CHECK ("rejected_by" ~ '^user:.+$'),
+  CONSTRAINT "application_rejections_reason_chk"
+    CHECK (char_length(btrim("reason")) BETWEEN 1 AND 1000),
+  CONSTRAINT "application_rejections_proposal_fk"
+    FOREIGN KEY ("tenant_id", "principal_id", "proposal_id")
+    REFERENCES "application_transaction_proposals" ("tenant_id", "principal_id", "id")
+    ON DELETE cascade
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX "application_rejections_proposal_idx"
+  ON "application_proposal_rejections" ("tenant_id", "principal_id", "proposal_id");
+--> statement-breakpoint
+CREATE TRIGGER application_rejections_immutable
+  BEFORE UPDATE ON application_proposal_rejections
+  FOR EACH ROW EXECUTE FUNCTION steward_reject_application_immutable_update();
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION steward_guard_application_rejection_delete() RETURNS trigger AS $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM application_transaction_proposals
+     WHERE tenant_id = OLD.tenant_id AND principal_id = OLD.principal_id AND id = OLD.proposal_id
+  ) THEN
+    RAISE EXCEPTION 'application proposal rejection is permanent';
+  END IF;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+--> statement-breakpoint
+CREATE TRIGGER application_rejections_no_delete
+  BEFORE DELETE ON application_proposal_rejections
+  FOR EACH ROW EXECUTE FUNCTION steward_guard_application_rejection_delete();
+--> statement-breakpoint
+-- One decision per proposal: lock the proposal row, then refuse the insert if
+-- the opposite decision exists. Under READ COMMITTED the check runs after the
+-- lock is granted, so it sees the competing transaction's commit.
+CREATE OR REPLACE FUNCTION steward_guard_application_proposal_decision() RETURNS trigger AS $$
+BEGIN
+  PERFORM 1 FROM application_transaction_proposals
+   WHERE tenant_id = NEW.tenant_id AND principal_id = NEW.principal_id AND id = NEW.proposal_id
+   FOR UPDATE;
+  IF TG_TABLE_NAME = 'application_proposal_executions' THEN
+    IF EXISTS (
+      SELECT 1 FROM application_proposal_rejections
+       WHERE tenant_id = NEW.tenant_id AND principal_id = NEW.principal_id AND proposal_id = NEW.proposal_id
+    ) THEN
+      RAISE EXCEPTION 'application proposal is rejected';
+    END IF;
+  ELSIF EXISTS (
+    SELECT 1 FROM application_proposal_executions
+     WHERE tenant_id = NEW.tenant_id AND principal_id = NEW.principal_id AND proposal_id = NEW.proposal_id
+  ) THEN
+    RAISE EXCEPTION 'application proposal execution already started';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+--> statement-breakpoint
+CREATE TRIGGER application_executions_decision_guard
+  BEFORE INSERT ON application_proposal_executions
+  FOR EACH ROW EXECUTE FUNCTION steward_guard_application_proposal_decision();
+--> statement-breakpoint
+CREATE TRIGGER application_rejections_decision_guard
+  BEFORE INSERT ON application_proposal_rejections
+  FOR EACH ROW EXECUTE FUNCTION steward_guard_application_proposal_decision();
