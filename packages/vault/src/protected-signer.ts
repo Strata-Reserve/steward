@@ -358,16 +358,22 @@ export async function issueProtectedSigningPermit(
   // for an approved row with this digest AND the same allowlisted approver
   // (the row cannot be re-pointed at a different identity between the check
   // above and the claim).
+  // STRATA-1673 (c): a read-back row handed off to the human queue keeps its
+  // original claim; the human claim is then the one-use
+  // `readbackHandoff.humanClaimedAt` (NULL -> now) on the same row.
   const claimed = await db
     .update(approvalQueue)
-    .set({ issuanceClaimedAt: new Date() })
+    .set({
+      issuanceClaimedAt: sql`coalesce(${approvalQueue.issuanceClaimedAt}, now())`,
+      reviewProjection: sql`CASE WHEN ${approvalQueue.issuanceClaimedAt} IS NULL THEN ${approvalQueue.reviewProjection} ELSE jsonb_set(${approvalQueue.reviewProjection}, '{readbackHandoff,humanClaimedAt}', to_jsonb(${new Date().toISOString()}::text)) END`,
+    })
     .where(
       and(
         eq(approvalQueue.txId, input.txId),
         eq(approvalQueue.agentId, input.agentId),
         eq(approvalQueue.status, "approved"),
         eq(approvalQueue.approvedByUserId, approver),
-        isNull(approvalQueue.issuanceClaimedAt),
+        humanClaimable(),
         sql`${approvalQueue.approvalSource} IS DISTINCT FROM 'issuance_readback'`,
         sql`lower(${approvalQueue.reviewDigest}) = ${digest}`,
       ),
@@ -451,6 +457,7 @@ export async function issueProtectedResumePermit(input: {
       approvalSource: approvalQueue.approvalSource,
       approvedByUserId: approvalQueue.approvedByUserId,
       instructionDigest: approvalQueue.instructionDigest,
+      reviewProjection: approvalQueue.reviewProjection,
     })
     .from(approvalQueue)
     .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)));
@@ -458,7 +465,9 @@ export async function issueProtectedResumePermit(input: {
   if (!q.reviewDigest || q.reviewDigest.toLowerCase() !== input.reviewDigest.toLowerCase()) {
     return null;
   }
-  if (Date.now() - q.issuanceClaimedAt.getTime() <= PERMIT_TTL_MS) return null;
+  // STRATA-1673 (c): after a handoff the live claim is the human re-claim.
+  const claimAt = effectiveClaimAt(q.issuanceClaimedAt, q.reviewProjection);
+  if (!claimAt || Date.now() - claimAt.getTime() <= PERMIT_TTL_MS) return null;
   if (q.approvalSource === "issuance_readback") {
     if (!q.instructionDigest || q.approvedByUserId) return null;
   } else if (!q.approvedByUserId || !guard.isApprover(q.approvedByUserId)) {
@@ -467,6 +476,27 @@ export async function issueProtectedResumePermit(input: {
   const handle = crypto.randomUUID();
   permits.set(handle, { ...input, expiresAt: Date.now() + PERMIT_TTL_MS });
   return handle;
+}
+
+/**
+ * STRATA-1673 (c): the claim a human may take on an approved row: the
+ * original one (claim NULL) or, for a read-back row handed off to the human
+ * queue, the one-use handoff re-claim.
+ */
+function humanClaimable() {
+  return sql`(${approvalQueue.issuanceClaimedAt} IS NULL OR (${approvalQueue.reviewProjection} -> 'readbackHandoff' IS NOT NULL AND ${approvalQueue.reviewProjection} -> 'readbackHandoff' ->> 'humanClaimedAt' IS NULL))`;
+}
+
+/** The timestamp of the live claim: the handoff re-claim if any, else the original. */
+export function effectiveClaimAt(
+  claimedAt: Date | null,
+  projection: Record<string, unknown> | null | undefined,
+): Date | null {
+  const h = projection?.readbackHandoff as { humanClaimedAt?: unknown } | undefined;
+  if (h && typeof h === "object") {
+    return typeof h.humanClaimedAt === "string" ? new Date(h.humanClaimedAt) : null;
+  }
+  return claimedAt;
 }
 
 /** Permit lifetime; a claim older than this cannot have a usable permit. */
@@ -577,6 +607,9 @@ export async function authorizeProtectedKeyUse(input: {
         status: approvalQueue.status,
         approvalSource: approvalQueue.approvalSource,
         issuanceClaimedAt: approvalQueue.issuanceClaimedAt,
+        resolvedAt: approvalQueue.resolvedAt,
+        resolvedBy: approvalQueue.resolvedBy,
+        instructionDigest: approvalQueue.instructionDigest,
       })
       .from(approvalQueue)
       .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)))
@@ -610,13 +643,26 @@ export async function authorizeProtectedKeyUse(input: {
     if (readback && control?.at) {
       await tx
         .update(approvalQueue)
+        // STRATA-1673 (c): hand off to the human queue WITHOUT resetting the
+        // claim. `issuance_claimed_at`, `instruction_digest`, `resolved_*`
+        // keep the original read-back claim/audit identity; the handoff is
+        // recorded on the same row. A later human approval re-claims through
+        // `readbackHandoff.humanClaimedAt` (single use), never by clearing.
         .set({
           status: "pending",
           approvalSource: null,
-          instructionDigest: null,
-          resolvedAt: null,
-          resolvedBy: null,
-          issuanceClaimedAt: null,
+          reviewProjection: sql`jsonb_set(coalesce(${approvalQueue.reviewProjection}, '{}'::jsonb), '{readbackHandoff}', ${JSON.stringify(
+            {
+              at: new Date().toISOString(),
+              reason: "agent_suspended",
+              from: "issuance_readback",
+              claimedAt: q.issuanceClaimedAt.toISOString(),
+              resolvedAt: q.resolvedAt?.toISOString() ?? null,
+              resolvedBy: q.resolvedBy,
+              instructionDigest: q.instructionDigest,
+              humanClaimedAt: null,
+            },
+          )}::jsonb)`,
         })
         .where(eq(approvalQueue.id, q.id));
       return {

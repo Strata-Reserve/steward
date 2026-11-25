@@ -884,6 +884,8 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
 
   it("[H4] suspend completes while a permit is outstanding -> no key use; row back on the human queue, not failed", async () => {
     const { r, keyUse } = await outstandingReadbackPermit();
+    const { q: claimBefore } = await queueRowByRef(r);
+    expect(claimBefore!.issuanceClaimedAt).not.toBeNull();
     expect((await post("/protected-minter/suspend", { reason: "incident" })).status).toBe(200);
     const before = signed.length;
     try {
@@ -894,7 +896,19 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       expect(tx!.txHash).toBeNull();
       expect(q!.status).toBe("pending");
       expect(q!.approvalSource).toBeNull();
-      expect(q!.issuanceClaimedAt).toBeNull();
+      // (c): the original claim and read-back audit identity survive the handoff.
+      expect(q!.issuanceClaimedAt?.getTime()).toBe(claimBefore!.issuanceClaimedAt?.getTime());
+      expect(q!.instructionDigest).toBe(claimBefore!.instructionDigest);
+      expect(q!.resolvedBy).toBe(claimBefore!.resolvedBy);
+      const h = (q!.reviewProjection as any).readbackHandoff;
+      expect(h.reason).toBe("agent_suspended");
+      expect(h.from).toBe("issuance_readback");
+      expect(new Date(h.claimedAt).getTime()).toBe(
+        new Date(claimBefore!.issuanceClaimedAt as never).getTime(),
+      );
+      expect(h.resolvedBy).toBe(claimBefore!.resolvedBy);
+      expect(h.instructionDigest).toBe(claimBefore!.instructionDigest);
+      expect(h.humanClaimedAt).toBeNull();
     } finally {
       expect((await post("/protected-minter/resume")).status).toBe(200);
     }
@@ -906,6 +920,17 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       body: JSON.stringify({ reviewDigest: q!.reviewDigest }),
     });
     expect(approve.status).toBe(200);
+    expect(signed.length).toBe(before + 1);
+    const after = (await queueRowByRef(r)).q!;
+    expect(after.issuanceClaimedAt?.getTime()).toBe(claimBefore!.issuanceClaimedAt?.getTime());
+    expect((after.reviewProjection as any).readbackHandoff.humanClaimedAt).not.toBeNull();
+    // Human re-claim is single use: a replayed approval cannot issue a second permit.
+    const again = await app.request(`/vault/${AGENT}/approve/${tx!.id}`, {
+      method: "POST",
+      headers: bearer(ownerToken),
+      body: JSON.stringify({ reviewDigest: q!.reviewDigest }),
+    });
+    expect(again.status).not.toBe(200);
     expect(signed.length).toBe(before + 1);
   });
 
