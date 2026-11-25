@@ -265,4 +265,51 @@ describe.skipIf(SKIP)("STRATA-1673 r7 approve atomicity + concurrent resume (pos
     expect(done.tx.tx_hash).toBe(body.data.txHash);
     expect(keyUses.length - usesBefore).toBe(1);
   });
+
+  it("[H2] two overlapping identical resumes -> one 200 signer, one 409 replay, one key use, same hash", async () => {
+    const { txId, digest } = await proposeMint();
+    // Crash between the approval+claim commit and signing: key use never runs.
+    let reached!: () => void;
+    const atSign = new Promise<void>((res) => {
+      reached = res;
+    });
+    const hang = spyOn(vault, "signTransaction").mockImplementationOnce((() => {
+      reached();
+      return new Promise<string>(() => {});
+    }) as never);
+    void approve(txId, digest);
+    await atSign;
+    hang.mockRestore();
+    const crashed = await state(txId);
+    expect(crashed.q.status).toBe("approved");
+    expect(crashed.q.issuance_claimed_at).not.toBeNull();
+    expect(crashed.tx.signed_raw).toBeNull();
+    // The lost permit is past its TTL.
+    await db!.unsafe(
+      `UPDATE approval_queue SET issuance_claimed_at = now() - interval '5 minutes' WHERE tx_id = $1`,
+      [txId],
+    );
+
+    const usesBefore = keyUses.length;
+    prepareDelayMs = 300; // hold the signer inside the section so both overlap
+    let results: Response[];
+    try {
+      results = await Promise.all([approve(txId, digest), approve(txId, digest)]);
+    } finally {
+      prepareDelayMs = 0;
+    }
+    const bodies = (await Promise.all(results.map((r) => r.json()))) as any[];
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual([200, 409]);
+    expect(keyUses.length - usesBefore).toBe(1);
+    const final = await state(txId);
+    expect(final.tx.tx_hash).toBeTruthy();
+    for (const b of bodies) expect(b.data.txHash).toBe(final.tx.tx_hash);
+    const loser = bodies[results.findIndex((r) => r.status === 409)];
+    expect(loser.ok).toBe(false);
+    expect(loser.data.replay).toBe(true);
+    // A later, non-overlapping replay is also 409; still one key use.
+    expect((await approve(txId, digest)).status).toBe(409);
+    expect(keyUses.length - usesBefore).toBe(1);
+  });
 });

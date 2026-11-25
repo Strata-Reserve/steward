@@ -707,7 +707,10 @@ async function protectedInFlightResponse(
  * Never resets the claim, never issues a new ref. Best effort; errors leave
  * the row as it was.
  */
-async function recoverProtectedAction(row: TransactionRow): Promise<TransactionRow> {
+async function recoverProtectedAction(
+  row: TransactionRow,
+  out?: { signed: boolean },
+): Promise<TransactionRow> {
   if (!row.tenantId || !isProtectedMinter(row.tenantId, row.agentId)) return row;
   const scope = { tenantId: row.tenantId, agentId: row.agentId, txId: row.id };
   try {
@@ -738,12 +741,17 @@ async function recoverProtectedAction(row: TransactionRow): Promise<TransactionR
                 protectedReviewDigest: q.reviewDigest,
               },
             );
+            if (out) out.signed = true;
             const post = await recordProtectedPostSend(row.id, txHash, new Date());
             if (post.won) {
               dispatchWebhook(row.tenantId, row.agentId, "tx_signed", { txId: row.id, txHash });
             }
           } catch (e) {
             discardProtectedSigningPermit(permit);
+            // A signer refusal (another request's signed row, brakes) means
+            // this request did not sign; any other error came from our own
+            // attempt (e.g. send after persist), so we remain the signer.
+            if (out && !(e instanceof ProtectedSignerError)) out.signed = true;
             if (!(e instanceof ProtectedKeyUseReleasedError)) {
               console.error(`Protected resume failed, tx ${row.id}: ${describeRpcError(e)}`);
               const [r2] = await db.select().from(transactions).where(eq(transactions.id, row.id));
@@ -776,7 +784,11 @@ async function resumeProtectedApproval(
   userId: string,
   reviewDigest: string,
 ) {
-  const row = await recoverProtectedAction(transaction);
+  // r7 H2: exactly one request is the signer. A request that did NOT sign
+  // but finds another request's signature (concurrent identical resume) is a
+  // replay: 409 as a later replay, carrying the existing tx hash.
+  const out = { signed: false };
+  const row = await recoverProtectedAction(transaction, out);
   const status = await resolveActionStatus(row);
   trackAuditEvent({
     tenantId: row.tenantId ?? "",
@@ -790,6 +802,22 @@ async function resumeProtectedApproval(
     userAgent: c.req.header("user-agent") ?? null,
     requestId: c.get("requestId") ?? null,
   });
+  if (!out.signed && row.signedRaw && row.txHash) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: "Transaction already processed or not found",
+        data: {
+          txId: row.id,
+          txHash: row.txHash,
+          executionRef: row.executionRef ?? undefined,
+          status,
+          replay: true,
+        },
+      },
+      409,
+    );
+  }
   if (status === "processing" || status === "pending_approval" || !row.txHash) {
     return c.json<ApiResponse>(
       {
