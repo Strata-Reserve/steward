@@ -346,4 +346,72 @@ describe.skipIf(SKIP)("STRATA-1673 protected signing section (postgres:16 + Anvi
     expect((await row("t1")).tx_hash).toBe(hash);
     expect((await pub().waitForTransactionReceipt({ hash })).status).toBe("success");
   }, 60_000);
+
+  it("[F2] signer A commits signed bytes; signer B waiting sees suspension -> reconcile branch, never the human queue", async () => {
+    await seedTx("h1", 6);
+    let keyUses = 0;
+    const count = () => {
+      keyUses += 1;
+    };
+    // Signer A: signs and commits the signed row.
+    const hash = await protectedMint("h1", 6, { keyUse: count });
+    expect((await row("h1")).signed_raw).not.toBeNull();
+    // A separate backend holds the per-signer section lock so B must wait.
+    const holder = await brake!.reserve();
+    try {
+      await holder.unsafe("BEGIN");
+      await holder.unsafe(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [
+        `steward_protected_signer:8453:${SIGNER}`,
+      ]);
+      // Signer B (TTL resume on the same claim): waits on the section lock.
+      const b = protectedMint("h1", 6, { keyUse: count });
+      const bErr = b.then(
+        () => null,
+        (e: unknown) => e,
+      );
+      await waitFor(async () => {
+        const [r] = await observer!.unsafe(
+          `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
+        );
+        return (r?.n as number) >= 1;
+      });
+      // Suspension commits (third backend) while B is still waiting.
+      await db!.unsafe(
+        `INSERT INTO protected_minter_controls (tenant_id, agent_id, protected_minting_suspended_at, suspended_by, suspend_reason)
+         VALUES ($1, $2, now(), 'user:incident', 'incident')
+         ON CONFLICT (tenant_id, agent_id) DO UPDATE SET protected_minting_suspended_at = now()`,
+        [TENANT, AGENT],
+      );
+      await holder.unsafe("COMMIT");
+      const e = await bErr;
+      expect(e).toBeInstanceOf(vaultLib.ProtectedSignerError);
+      expect(e).not.toBeInstanceOf(vaultLib.ProtectedKeyUseReleasedError);
+      expect(String((e as Error).message)).toMatch(/signed transaction already exists/);
+      expect(keyUses).toBe(1);
+      // No handoff: approval stays the read-back approval, no readbackHandoff.
+      const [q] = await db!.unsafe(
+        `SELECT status, approval_source, issuance_claimed_at, review_projection FROM approval_queue WHERE tx_id = 'h1'`,
+      );
+      expect(q?.status).toBe("approved");
+      expect(q?.approval_source).toBe("issuance_readback");
+      expect(q?.issuance_claimed_at).not.toBeNull();
+      expect((q?.review_projection as any)?.readbackHandoff ?? null).toBeNull();
+      // The signed row is untouched (reconcile branch: callers reconcile a
+      // non-released refusal with signed bytes on record) and the original
+      // bytes are the one inclusion. (Vault reconcile needs an https
+      // RPC_URL_8453, not available against local Anvil.)
+      expect((await pub().waitForTransactionReceipt({ hash })).status).toBe("success");
+      const r = await row("h1");
+      expect(r.status).toBe("signed");
+      expect(r.signed_raw).not.toBeNull();
+      expect(r.tx_hash).toBe(hash);
+    } finally {
+      await holder.unsafe("ROLLBACK").catch(() => undefined);
+      holder.release();
+      await db!.unsafe(
+        `UPDATE protected_minter_controls SET protected_minting_suspended_at = NULL WHERE tenant_id = $1 AND agent_id = $2`,
+        [TENANT, AGENT],
+      );
+    }
+  }, 60_000);
 });

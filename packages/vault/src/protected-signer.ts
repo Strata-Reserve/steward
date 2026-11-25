@@ -599,7 +599,10 @@ export async function authorizeProtectedKeyUse(input: {
   to: string;
   data?: string | null;
 }): Promise<void> {
-  const outcome = await getDb().transaction((tx) => checkProtectedKeyUse(tx, input));
+  const outcome = await getDb().transaction(async (tx) => {
+    const signed = await refuseIfSigned(tx, input);
+    return signed ?? checkProtectedKeyUse(tx, input);
+  });
   if (outcome?.released) throw new ProtectedKeyUseReleasedError(outcome.refuse);
   if (outcome) throw new ProtectedSignerError(outcome.refuse);
 }
@@ -640,29 +643,13 @@ export async function runProtectedSigningSection<T>(
     await tx.execute(
       sql`SELECT pg_advisory_xact_lock(hashtextextended(${`steward_protected_signer:${input.chainId}:${signer}`}, 0))`,
     );
+    // STRATA-1673 F2: signed row FIRST. A signed transaction always takes
+    // the reconcile branch (non-released refusal), never the human queue;
+    // only an unsigned row may be handed off, in this same transaction.
+    const signedRefusal = await refuseIfSigned(tx, input);
+    if (signedRefusal) return { refusal: signedRefusal, value: undefined };
     const refusal = await checkProtectedKeyUse(tx, input);
     if (refusal) return { refusal, value: undefined };
-    const [row] = await tx
-      .select({ status: transactions.status, signedRaw: transactions.signedRaw })
-      .from(transactions)
-      .where(
-        and(
-          eq(transactions.id, input.txId),
-          eq(transactions.tenantId, input.tenantId),
-          eq(transactions.agentId, input.agentId),
-        ),
-      )
-      .for("update");
-    if (row && (row.signedRaw || row.status !== "pending")) {
-      return {
-        refusal: {
-          refuse:
-            "a signed transaction already exists for this claim; resolve via executionRef lookup",
-          released: false,
-        },
-        value: undefined,
-      };
-    }
     const [floor] = await tx
       .select({
         max: sql<string | number | null>`max(${transactions.signedNonce})`,
@@ -684,6 +671,31 @@ export async function runProtectedSigningSection<T>(
     throw new ProtectedSignerError(result.refusal.refuse);
   }
   return result.value as T;
+}
+
+/**
+ * STRATA-1673 F2: lock the transactions row FOR UPDATE; a row that already
+ * carries signed bytes (or left `pending`) is refused WITHOUT any handoff.
+ */
+async function refuseIfSigned(tx: DbExecutor, input: KeyUseInput): Promise<KeyUseRefusal> {
+  const [row] = await tx
+    .select({ status: transactions.status, signedRaw: transactions.signedRaw })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.id, input.txId),
+        eq(transactions.tenantId, input.tenantId),
+        eq(transactions.agentId, input.agentId),
+      ),
+    )
+    .for("update");
+  if (row && (row.signedRaw || row.status !== "pending")) {
+    return {
+      refuse: "a signed transaction already exists for this claim; resolve via executionRef lookup",
+      released: false,
+    };
+  }
+  return null;
 }
 
 async function checkProtectedKeyUse(tx: DbExecutor, input: KeyUseInput): Promise<KeyUseRefusal> {

@@ -51,7 +51,6 @@ import { type EncryptedKey, KeyStore } from "./keystore";
 import {
   assertNotProtected,
   assertProtectedPostureIntact,
-  authorizeProtectedKeyUse,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
   type DbExecutor,
@@ -894,17 +893,10 @@ export class Vault {
       if (agentRow.walletAddress.toLowerCase() !== protectedExpectedAddress.toLowerCase()) {
         throw new ProtectedSignerError("stored wallet address does not match the manifest pin");
       }
-      // STRATA-1673 H4: brakes re-checked at key use, serialized with
-      // suspend/revoke by row locks.
+      // STRATA-1673 H4/F2: brakes (and any suspension handoff) are checked
+      // ONLY inside the exclusive signing section, after the signed-row
+      // check, so a signed row can never be returned to the human queue.
       if (!options.txId) throw new ProtectedSignerError("txId is required");
-      await authorizeProtectedKeyUse({
-        tenantId: request.tenantId,
-        agentId: request.agentId,
-        txId: options.txId,
-        chainId,
-        to: request.to,
-        data: request.data,
-      });
     }
 
     // ── Resolve the correct signing key ─────────────────────────────────
@@ -1079,6 +1071,10 @@ export class Vault {
       } catch (err) {
         // STRATA-1499 (F2): viem embeds the transport URL in its errors.
         // Redact at the boundary so no caller can log/return the endpoint.
+        // STRATA-1673 F2: signing-section refusals (fixed messages, no
+        // endpoint) keep their type so callers can tell a released handoff
+        // from a signed-row refusal.
+        if (err instanceof ProtectedSignerError) throw err;
         throw redactRpcError(err, this.configuredRpcUrls());
       }
     }

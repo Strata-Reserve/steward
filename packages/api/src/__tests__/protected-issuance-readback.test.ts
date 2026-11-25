@@ -890,7 +890,12 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     expect((await post("/protected-minter/suspend", { reason: "incident" })).status).toBe(200);
     const before = signed.length;
     try {
-      await expect(keyUse()).rejects.toBeInstanceOf(ProtectedKeyUseReleasedError);
+      // F2: the brake/handoff runs only inside the real signing section, so
+      // drive the real broadcast (prepare/send faked, section + key use real).
+      await withFakeChain(async (chain) => {
+        await expect(keyUse()).rejects.toBeInstanceOf(ProtectedKeyUseReleasedError);
+        expect(chain.sends.length).toBe(0);
+      });
       expect(signed.length).toBe(before);
       const { tx, q } = await queueRowByRef(r);
       expect(tx!.status).toBe("pending");
