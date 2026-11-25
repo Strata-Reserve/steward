@@ -15,7 +15,7 @@
  * refuses every operation on such an agent unless a guard recognises it.
  */
 
-import { agents, approvalQueue, getDb, transactions } from "@stwd/db";
+import { agents, approvalQueue, getDb, protectedMinterControls, transactions } from "@stwd/db";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { keccak256, stringToHex } from "viem";
 
@@ -44,11 +44,7 @@ export interface ProtectedSignerGuard {
     tx: ProtectedTransactionShape,
     scope?: { tenantId: string; agentId: string },
   ): ProtectedValidation | Promise<ProtectedValidation>;
-  /**
-   * STRATA-1673 S1: true when automatic (read-back) signing is suspended for
-   * the agent. Absent => treated as suspended (fail closed).
-   */
-  isAutoIssuanceSuspended?(tenantId: string, agentId: string): Promise<boolean>;
+
   /**
    * REVIEW-STEWARD-28-R5 N1: true only when `userId` is a pinned approver in
    * the installed manifest allowlist. Empty allowlist / unknown user => false.
@@ -305,10 +301,18 @@ export async function issueProtectedSigningPermit(
     if (pre.approvedByUserId) {
       throw new ProtectedSignerError("permit refused: read-back approval carries a human approver");
     }
-    if (!guard.isAutoIssuanceSuspended) {
-      throw new ProtectedSignerError("permit refused: guard cannot check suspension");
-    }
-    if (await guard.isAutoIssuanceSuspended(input.tenantId, input.agentId)) {
+    // Read through the same executor so the check sees (and is serialized
+    // with) the caller's transaction.
+    const [control] = await db
+      .select({ at: protectedMinterControls.protectedMintingSuspendedAt })
+      .from(protectedMinterControls)
+      .where(
+        and(
+          eq(protectedMinterControls.tenantId, input.tenantId),
+          eq(protectedMinterControls.agentId, input.agentId),
+        ),
+      );
+    if (control?.at) {
       throw new ProtectedSignerError(
         "permit refused: protected minting is suspended for this agent",
       );

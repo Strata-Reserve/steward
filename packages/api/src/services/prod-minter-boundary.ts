@@ -608,7 +608,6 @@ function buildGuard(manifest: ProtectedMinterManifest, digest: string): Protecte
       const r = validateProtectedShape(manifest, tx, admitted);
       return r.ok ? { ok: true } : { ok: false, reason: r.reason };
     },
-    isAutoIssuanceSuspended: (tenantId, agentId) => isProtectedMintingSuspended(tenantId, agentId),
     // REVIEW-STEWARD-28-R5 N1: the vault verifies the recorded approver at
     // permit issuance against this same pinned allowlist.
     isApprover: (userId) =>

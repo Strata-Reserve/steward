@@ -215,11 +215,12 @@ describe.skipIf(SKIP)("0031 application proposal execution on real Postgres", ()
       "application_executions_chain_chk",
       "application_executor_signers_chain_chk",
     ]);
-    for (const c of checks) expect(c.def).toContain("84532");
+    // STRATA-1673 D5 (0032): the 0031 84532 pin is relaxed to chain_id > 0.
+    for (const c of checks) expect(c.def).toContain("> 0");
   });
 
-  it("binding rows: only chain 84532 is admitted, and a binding is immutable", async () => {
-    for (const chainId of [8453, 1, 0, -1, 11155111]) {
+  it("binding rows: only positive chain ids are admitted, and a binding is immutable", async () => {
+    for (const chainId of [0, -1]) {
       expect(
         await refused(
           () =>
@@ -252,11 +253,11 @@ describe.skipIf(SKIP)("0031 application proposal execution on real Postgres", ()
     ).toBe(true);
   });
 
-  it("execution rows: only chain 84532 is admitted; one per proposal; forward-only", async () => {
-    await insertTransaction("exec31-tx-8453", 8453, "direct:8453");
+  it("execution rows: only positive chain ids are admitted; one per proposal; forward-only", async () => {
+    await insertTransaction("exec31-tx-0", 0, "direct:0");
     expect(
       await refused(
-        () => insertExecution(`ape_${"8".repeat(40)}`, PROPOSAL, "exec31-tx-8453", 8453),
+        () => insertExecution(`ape_${"8".repeat(40)}`, PROPOSAL, "exec31-tx-0", 0),
         /application_executions_chain_chk/,
       ),
     ).toBe(true);
