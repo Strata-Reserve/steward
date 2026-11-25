@@ -7,6 +7,7 @@
 
 import {
   discardProtectedSigningPermit,
+  issueProtectedResumePermit,
   issueProtectedSigningPermit,
   ProtectedKeyUseReleasedError,
 } from "@stwd/vault";
@@ -584,15 +585,13 @@ async function tryReadbackAutoSign(
       };
     }
     // Claim consumed; never released, never re-signed under a new claim.
-    // Recovery is the executionRef status lookup.
     const requestId = c.get("requestId") || "unknown";
     const rawMessage = e instanceof Error ? e.message : "Unknown error";
     console.error(`[${requestId}] Protected read-back sign failed, tx ${input.txId}:`, e);
-    await db
-      .update(transactions)
-      .set({ status: "failed" })
-      .where(and(eq(transactions.id, input.txId), eq(transactions.status, "pending")))
-      .catch(() => undefined);
+    // STRATA-1673 H1: signed bytes on record -> reconcile (never "failed" on
+    // an ambiguous send); nothing signed -> nothing sent -> failed.
+    const inFlight = await protectedInFlightResponse(c, input.tenantId, input.agentId, input.txId, e);
+    if (inFlight) return { kind: "response", response: inFlight };
     dispatchWebhook(input.tenantId, input.agentId, "tx_failed", {
       txId: input.txId,
       executionRef: input.executionRef,
@@ -610,6 +609,119 @@ async function tryReadbackAutoSign(
       response: c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500),
     };
   }
+}
+
+/**
+ * STRATA-1673 H1: after a protected signing error. Returns a response when
+ * signed bytes were recorded (outcome uncertain -> reconciled against the
+ * chain, never marked failed blindly). Returns null after marking the row
+ * failed when nothing was signed/sent (the caller reports the error as before).
+ */
+async function protectedInFlightResponse(
+  c: Context<{ Variables: AppVariables }>,
+  tenantId: string,
+  agentId: string,
+  txId: string,
+  error: unknown,
+): Promise<Response | null> {
+  const [row] = await db
+    .select()
+    .from(transactions)
+    .where(and(eq(transactions.id, txId), eq(transactions.agentId, agentId)));
+  if (!row) return null;
+  // Bytes are persisted BEFORE any send, so no recorded bytes means nothing
+  // was sent: a definite (not ambiguous) failure, terminal as before.
+  void error;
+  if (!row.signedRaw) {
+    await db
+      .update(transactions)
+      .set({ status: "failed" })
+      .where(and(eq(transactions.id, txId), eq(transactions.status, "pending")))
+      .catch(() => undefined);
+    return null;
+  }
+  if (row.signedRaw) {
+    await vault
+      .reconcileProtectedTransaction({ tenantId, agentId, txId })
+      .catch(() => "unknown" as const);
+  }
+  const [after] = await db.select().from(transactions).where(eq(transactions.id, txId));
+  const current = after ?? row;
+  const status = await resolveActionStatus(current);
+  // No new webhook type: the executionRef lookup is the recovery channel.
+  const ok = status !== "failed";
+  return c.json<ApiResponse>(
+    {
+      ok,
+      error: ok ? "Outcome uncertain; resolve via executionRef lookup" : "Transaction failed",
+      data: { ...actionView(current, status), reconciling: true },
+    },
+    ok ? 202 : 500,
+  );
+}
+
+/**
+ * STRATA-1673 H1: recover a protected action found by executionRef.
+ *  - signed bytes on record, not terminal -> reconcile against the chain
+ *    (receipt / tx by hash / nonce) and retransmit the SAME bytes if unknown;
+ *  - claimed but nothing signed (process lost between claim and signature),
+ *    claim older than the permit TTL -> resume: sign once under the SAME
+ *    claim and ref (the signer's persist CAS allows one recorded signature).
+ * Never resets the claim, never issues a new ref. Best effort; errors leave
+ * the row as it was.
+ */
+async function recoverProtectedAction(row: TransactionRow): Promise<TransactionRow> {
+  if (!row.tenantId || !isProtectedMinter(row.tenantId, row.agentId)) return row;
+  const scope = { tenantId: row.tenantId, agentId: row.agentId, txId: row.id };
+  try {
+    if (row.signedRaw && (row.status === "signed" || row.status === "broadcast")) {
+      await vault.reconcileProtectedTransaction(scope);
+    } else if (row.status === "pending" && !row.signedRaw && row.executionRef) {
+      const [q] = await db.select().from(approvalQueue).where(eq(approvalQueue.txId, row.id));
+      if (q?.status === "approved" && q.issuanceClaimedAt && q.reviewDigest) {
+        const permit = await issueProtectedResumePermit({ ...scope, reviewDigest: q.reviewDigest });
+        if (permit) {
+          try {
+            const txHash = await vault.signTransaction(
+              {
+                agentId: row.agentId,
+                tenantId: row.tenantId,
+                to: row.toAddress,
+                value: row.value,
+                data: row.data ?? undefined,
+                chainId: row.chainId,
+                executionRef: row.executionRef,
+                broadcast: true,
+              },
+              {
+                txId: row.id,
+                policyResults: row.policyResults ?? [],
+                status: "signed",
+                protectedPermit: permit,
+                protectedReviewDigest: q.reviewDigest,
+              },
+            );
+            await db
+              .update(transactions)
+              .set({ status: "signed", txHash, signedAt: new Date() })
+              .where(eq(transactions.id, row.id));
+            dispatchWebhook(row.tenantId, row.agentId, "tx_signed", { txId: row.id, txHash });
+          } catch (e) {
+            discardProtectedSigningPermit(permit);
+            if (!(e instanceof ProtectedKeyUseReleasedError)) {
+              console.error(`Protected resume failed, tx ${row.id}: ${describeRpcError(e)}`);
+              const [r2] = await db.select().from(transactions).where(eq(transactions.id, row.id));
+              if (r2?.signedRaw) await vault.reconcileProtectedTransaction(scope).catch(() => undefined);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`Protected recovery failed, tx ${row.id}: ${describeRpcError(e)}`);
+  }
+  const [after] = await db.select().from(transactions).where(eq(transactions.id, row.id));
+  return after ?? row;
 }
 
 type QueueRow = typeof approvalQueue.$inferSelect;
@@ -798,13 +910,8 @@ async function handleProtectedApprove(
     const requestId = c.get("requestId") || "unknown";
     const rawMessage = e instanceof Error ? e.message : "Unknown error";
     console.error(`[${requestId}] Protected approve failed for agent ${agentId}, tx ${txId}:`, e);
-    await db
-      .update(transactions)
-      .set({ status: "failed" })
-      .where(and(eq(transactions.id, txId), eq(transactions.status, "pending")))
-      .catch((updateErr) =>
-        console.error(`[${requestId}] Failed to mark approved tx ${txId} failed:`, updateErr),
-      );
+    const inFlight = await protectedInFlightResponse(c, tenantId, agentId, txId, e);
+    if (inFlight) return inFlight;
     dispatchWebhook(tenantId, agentId, "tx_failed", {
       txId,
       executionRef: transaction.executionRef,
@@ -923,9 +1030,12 @@ async function resolveActionStatus(
 ): Promise<"processing" | "pending_approval" | TransactionRow["status"]> {
   if (row.status !== "pending") return row.status;
   const [queueEntry] = await db
-    .select({ id: approvalQueue.id })
+    .select({ status: approvalQueue.status, claimed: approvalQueue.issuanceClaimedAt })
     .from(approvalQueue)
     .where(eq(approvalQueue.txId, row.id));
+  // STRATA-1673 H1: an approved, claimed row is in signing/recovery, not on
+  // the human queue.
+  if (queueEntry && queueEntry.status === "approved" && queueEntry.claimed) return "processing";
   return queueEntry ? "pending_approval" : "processing";
 }
 
@@ -973,6 +1083,7 @@ async function replayExistingAction(
     );
   }
 
+  row = await recoverProtectedAction(row);
   const status = await resolveActionStatus(row);
   c.header("Idempotency-Replayed", "true");
   const view = { ...actionView(row, status), replayed: true };
@@ -1651,10 +1762,11 @@ vaultRoutes.get("/:agentId/actions/by-ref/:executionRef", async (c) => {
     return c.json<ApiResponse>({ ok: false, error: "Agent not found" }, 404);
   }
 
-  const row = await findByExecutionRef(tenantId, agentId, executionRef);
-  if (!row) {
+  const found = await findByExecutionRef(tenantId, agentId, executionRef);
+  if (!found) {
     return c.json<ApiResponse>({ ok: false, error: "Action not found" }, 404);
   }
+  const row = await recoverProtectedAction(found);
   const status = await resolveActionStatus(row);
   return c.json<ApiResponse>({ ok: true, data: actionView(row, status) });
 });

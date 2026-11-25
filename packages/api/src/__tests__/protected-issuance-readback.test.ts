@@ -22,8 +22,13 @@ import {
   userTenants,
 } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
-import { issueProtectedSigningPermit, ProtectedKeyUseReleasedError } from "@stwd/vault";
+import {
+  issueProtectedSigningPermit,
+  ProtectedKeyUseReleasedError,
+  Vault as VaultClass,
+} from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
+import { keccak256 } from "viem";
 import type { Hono } from "hono";
 import {
   encodeAbiParameters,
@@ -992,6 +997,224 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     ]);
     expect(rv.status).toBe(200);
     expect(await status(C)).toEqual(["revoked"]);
+  });
+
+  /**
+   * H1 harness: the REAL protected broadcast (prepare -> sign -> persist ->
+   * send raw) against an in-memory chain. `mode` scripts the failure.
+   */
+  async function withFakeChain(
+    run: (chain: {
+      mined: Map<string, string>; // hash -> raw
+      sends: string[]; // every raw handed to sendRawEvm
+      mode: { send: "ok" | "crash_before" | "lost_ack"; observe: "ok" | "down" };
+      bumpNonce: () => void;
+    }) => Promise<void>,
+  ) {
+    const original = VaultClass.prototype.broadcastEvm as unknown as (...a: unknown[]) => Promise<string>;
+    const mined = new Map<string, string>();
+    const sends: string[] = [];
+    let nonce = 0;
+    const mode = { send: "ok" as "ok" | "crash_before" | "lost_ack", observe: "ok" as "ok" | "down" };
+    const spies = [
+      spyOn(vault as never, "prepareProtectedEvm" as never).mockImplementation((async (
+        _c: unknown,
+        tx: { to: `0x${string}`; value: bigint; data?: `0x${string}`; chainId: number },
+      ) => ({
+        type: "eip1559",
+        to: tx.to,
+        value: tx.value,
+        data: tx.data,
+        gas: 100000n,
+        nonce,
+        maxFeePerGas: 2_000_000_000n,
+        maxPriorityFeePerGas: 1_000_000n,
+        chainId: tx.chainId,
+      })) as never),
+      spyOn(vault as never, "sendRawEvm" as never).mockImplementation((async (
+        _c: unknown,
+        raw: `0x${string}`,
+      ) => {
+        sends.push(raw);
+        if (mode.send === "crash_before") throw new Error("socket hang up");
+        const h = keccak256(raw);
+        if (!mined.has(h)) {
+          mined.set(h, raw);
+          nonce += 1;
+          signed.push({ to: "mined", chainId: 8453 });
+        }
+        if (mode.send === "lost_ack") throw new Error("socket hang up");
+        return h;
+      }) as never),
+      spyOn(vault as never, "observeProtectedTx" as never).mockImplementation((async (
+        _chainId: number,
+        hash: string,
+      ) => {
+        if (mode.observe === "down") throw new Error("rpc down");
+        const h = hash.toLowerCase();
+        return { latestNonce: nonce, receipt: mined.has(h) ? "success" : null, known: mined.has(h) };
+      }) as never),
+    ];
+    sendSpy.mockImplementation((async function (this: unknown, ...a: unknown[]) {
+      return original.apply(vault, a);
+    }) as never);
+    try {
+      await run({ mined, sends, mode, bumpNonce: () => (nonce += 1) });
+    } finally {
+      for (const sp of spies) sp.mockRestore();
+      sendSpy.mockImplementation((async (_c: unknown, tx: { to: string; data?: string; chainId: number }) => {
+        signed.push(tx);
+        return `0x${signed.length.toString(16).padStart(64, "0")}`;
+      }) as never);
+    }
+  }
+
+  it("[H1] signed bytes, nonce and hash are durable BEFORE send; happy path records sent_at", async () => {
+    await withFakeChain(async (chain) => {
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      const res = await signMint(r);
+      expect(res.status).toBe(200);
+      const { tx } = await queueRowByRef(r);
+      expect(tx!.signedRaw).toBe(chain.sends[0]);
+      expect(tx!.txHash).toBe(keccak256(tx!.signedRaw as `0x${string}`));
+      expect(tx!.signedNonce).toBe(0);
+      expect(tx!.signerAddress).toBe(signerAddress.toLowerCase());
+      expect(tx!.sentAt).not.toBeNull();
+      expect(chain.mined.size).toBe(1);
+    });
+  });
+
+  it("[H1] crash after sign, before send: row kept signed (not failed); replay retransmits the SAME bytes -> exactly one mint", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "crash_before";
+      chain.mode.observe = "down"; // the in-request reconcile cannot see the chain either
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      const res = await signMint(r);
+      expect(res.status).toBe(202);
+      expect(((await res.json()) as any).data.reconciling).toBe(true);
+      const { tx, q } = await queueRowByRef(r);
+      expect(tx!.status).toBe("signed");
+      expect(tx!.signedRaw).not.toBeNull();
+      expect(tx!.sentAt).toBeNull();
+      expect(q!.issuanceClaimedAt).not.toBeNull(); // claim never reset
+      expect(chain.mined.size).toBe(0);
+      // Network back. Replays reconcile: unknown to chain -> same bytes resent.
+      chain.mode.send = "ok";
+      chain.mode.observe = "ok";
+      const again = await Promise.all([signMint(r), signMint(r), signMint(r)]);
+      for (const a of again) expect([200, 202]).toContain(a.status);
+      expect(new Set(chain.sends)).toEqual(new Set([tx!.signedRaw!]));
+      expect(chain.mined.size).toBe(1);
+      const last = await signMint(r);
+      expect(last.status).toBe(200);
+      const body = (await last.json()) as any;
+      expect(body.data.status).toBe("confirmed");
+      expect(body.data.txHash).toBe(tx!.txHash);
+      expect(chain.mined.size).toBe(1);
+    });
+  });
+
+  it("[H1] lost acknowledgement (send landed, response lost): reconciled to confirmed, never failed, never resent", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "lost_ack";
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      const res = await signMint(r);
+      expect(res.status).toBe(202);
+      const body = (await res.json()) as any;
+      expect(body.data.status).toBe("confirmed");
+      expect(chain.mined.size).toBe(1);
+      expect(chain.sends).toHaveLength(1);
+      const { tx } = await queueRowByRef(r);
+      expect(tx!.status).toBe("confirmed");
+      const lookup = await app.request(`/vault/${AGENT}/actions/by-ref/${encodeURIComponent(r)}`, {
+        headers: bearer(agentJwt),
+      });
+      expect(((await lookup.json()) as any).data.status).toBe("confirmed");
+      expect(chain.sends).toHaveLength(1);
+      expect(chain.mined.size).toBe(1);
+    });
+  });
+
+  it("[H1] crash after claim, before any signature: replay resumes under the SAME claim and ref -> exactly one mint, no stranded row", async () => {
+    await withFakeChain(async (chain) => {
+      // Readback down -> queued; then simulate a read-back approval whose
+      // process died right after the claim (no permit survives, nothing signed).
+      reply = { kind: "status", status: 503 };
+      const r = ref();
+      expect((await signMint(r)).status).toBe(202);
+      const { tx, q } = await queueRowByRef(r);
+      const claimedAt = new Date(Date.now() - 5 * 60_000);
+      await getDb()
+        .update(approvalQueue)
+        .set({
+          status: "approved",
+          approvalSource: "issuance_readback",
+          instructionDigest: DIGEST,
+          issuanceClaimedAt: claimedAt,
+        })
+        .where(eq(approvalQueue.id, q!.id));
+      // Status is "processing" (not misreported as pending_approval).
+      const look = await app.request(`/vault/${AGENT}/actions/by-ref/${encodeURIComponent(r)}`, {
+        headers: bearer(agentJwt),
+      });
+      expect(look.status).toBe(200);
+      // The lookup itself resumed: one signature, one mint.
+      expect(chain.mined.size).toBe(1);
+      const results = await Promise.all([signMint(r), signMint(r)]);
+      for (const x of results) expect(x.status).toBe(200);
+      expect(chain.mined.size).toBe(1);
+      expect(new Set(chain.sends).size).toBe(1);
+      const { tx: after, q: qa } = await queueRowByRef(r);
+      expect(after!.id).toBe(tx!.id);
+      expect(["signed", "confirmed"]).toContain(after!.status);
+      expect(qa!.issuanceClaimedAt!.getTime()).toBe(claimedAt.getTime());
+    });
+  });
+
+  it("[H1] a fresh claim (< permit TTL) is not resumed: the original request may still hold its permit", async () => {
+    await withFakeChain(async (chain) => {
+      reply = { kind: "status", status: 503 };
+      const r = ref();
+      expect((await signMint(r)).status).toBe(202);
+      const { q } = await queueRowByRef(r);
+      await getDb()
+        .update(approvalQueue)
+        .set({
+          status: "approved",
+          approvalSource: "issuance_readback",
+          instructionDigest: DIGEST,
+          issuanceClaimedAt: new Date(),
+        })
+        .where(eq(approvalQueue.id, q!.id));
+      const res = await signMint(r);
+      expect(res.status).toBe(202);
+      expect(((await res.json()) as any).data.status).toBe("processing");
+      expect(chain.sends).toHaveLength(0);
+    });
+  });
+
+  it("[H1] nonce consumed by a different transaction: marked failed for human reconciliation, never re-signed or resent", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "crash_before";
+      chain.mode.observe = "down";
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      expect((await signMint(r)).status).toBe(202);
+      chain.bumpNonce(); // someone else's tx used our nonce
+      chain.mode.send = "ok";
+      chain.mode.observe = "ok";
+      const sendsBefore = chain.sends.length;
+      const res = await signMint(r);
+      expect(res.status).toBe(500);
+      expect(((await res.json()) as any).data.status).toBe("failed");
+      expect(chain.sends.length).toBe(sendsBefore);
+      expect(chain.mined.size).toBe(0);
+      const { q } = await queueRowByRef(r);
+      expect(q!.issuanceClaimedAt).not.toBeNull();
+    });
   });
 
   it("[M8] the readback path never touches the human approve route; the agent token still cannot approve", async () => {
