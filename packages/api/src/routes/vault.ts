@@ -11,6 +11,7 @@ import {
   issueProtectedResumePermit,
   issueProtectedSigningPermit,
   ProtectedKeyUseReleasedError,
+  ProtectedSignerError,
 } from "@stwd/vault";
 import { and, eq, notInArray } from "drizzle-orm";
 import { type Context, Hono } from "hono";
@@ -943,11 +944,12 @@ async function handleProtectedApprove(
       claim = { approved: true, permit: null, error: e };
     }
   } else {
-    // STRATA-1673 r6 G1: approval and its durable claim commit TOGETHER.
-    // The claim (issuance_claimed_at, or readbackHandoff.humanClaimedAt for a
-    // handed-off row) is taken in a savepoint of the same transaction, so a
-    // crash can never leave an approved row with no claim; a refused claim
-    // keeps today's outcome (approval recorded, error reported below).
+    // STRATA-1673 r6 G1 / r7 H1: approval and its durable claim commit
+    // TOGETHER. The claim (issuance_claimed_at, or readbackHandoff.humanClaimedAt
+    // for a handed-off row) is taken in a savepoint of the same transaction. A
+    // refused claim THROWS out of the outer transaction, so the approval rolls
+    // back with it: the row stays pending, unclaimed, and no key is used. The
+    // error is mapped to the HTTP response only after the rollback.
     let issued: string | null = null;
     try {
       claim = await db.transaction(async (dbtx) => {
@@ -969,17 +971,17 @@ async function handleProtectedApprove(
           )
           .returning({ id: approvalQueue.id });
         if (won.length === 0) return { approved: false, permit: null, error: null };
-        try {
-          issued = await dbtx.transaction((sp) => issueProtectedSigningPermit(permitInput, sp));
-          return { approved: true, permit: issued, error: null };
-        } catch (e) {
-          return { approved: true, permit: null, error: e };
-        }
+        // Throws on refusal -> the whole transaction (approval included) rolls back.
+        issued = await dbtx.transaction((sp) => issueProtectedSigningPermit(permitInput, sp));
+        return { approved: true, permit: issued, error: null };
       });
     } catch (e) {
-      // Commit failed: nothing was approved or claimed; drop the permit.
+      // Rolled back: nothing was approved or claimed; drop any permit.
       if (issued) discardProtectedSigningPermit(issued);
-      console.error(`Protected approve commit failed, tx ${txId}: ${describeRpcError(e)}`);
+      console.error(`Protected approve claim/commit failed, tx ${txId}: ${describeRpcError(e)}`);
+      if (e instanceof ProtectedSignerError) {
+        return protectedRefused(c, e.message.replace(/^Protected signer: /, ""));
+      }
       return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
     }
   }
