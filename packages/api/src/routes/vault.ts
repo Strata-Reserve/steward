@@ -61,8 +61,8 @@ import {
   SELECTOR_MINT,
   validateProtectedShape,
 } from "../services/prod-minter-boundary";
-import { protectedMinterRoutes } from "./protected-minter";
 import { dispatchWebhook } from "../services/webhook-dispatch";
+import { protectedMinterRoutes } from "./protected-minter";
 
 export const vaultRoutes = new Hono<{ Variables: AppVariables }>();
 
