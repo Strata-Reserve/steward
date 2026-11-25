@@ -11,6 +11,7 @@ export type {
 export {
   assertNotProtected,
   assertProtectedPostureIntact,
+  authorizeProtectedKeyUse,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
   discardProtectedSigningPermit,
@@ -21,6 +22,7 @@ export {
   issueProtectedSigningPermit,
   isUndefinedColumn,
   outstandingProtectedPermits,
+  ProtectedKeyUseReleasedError,
   ProtectedSignerError,
   registerProtectedSignerGuard,
 } from "./protected-signer";

@@ -22,7 +22,7 @@ import {
   userTenants,
 } from "@stwd/db";
 import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
-import { issueProtectedSigningPermit } from "@stwd/vault";
+import { issueProtectedSigningPermit, ProtectedKeyUseReleasedError } from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
 import type { Hono } from "hono";
 import {
@@ -655,6 +655,159 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     reply = { kind: "status", status: 503 };
     expect((await signMint(ref(), MANIFEST_ONLY_TOKEN)).status).toBe(403);
     expect(signed.length).toBe(before);
+  });
+
+  /** H4 helper: a read-back-approved, claimed row with an outstanding permit. */
+  async function outstandingReadbackPermit(token = TOKEN) {
+    const r = ref();
+    reply = { kind: "status", status: 503 };
+    expect((await signMint(r, token)).status).toBe(202);
+    const { tx, q } = await queueRowByRef(r);
+    await getDb()
+      .update(approvalQueue)
+      .set({ status: "approved", approvalSource: "issuance_readback", instructionDigest: DIGEST })
+      .where(eq(approvalQueue.id, q!.id));
+    const permit = await issueProtectedSigningPermit({
+      tenantId: TENANT,
+      agentId: AGENT,
+      txId: tx!.id,
+      reviewDigest: q!.reviewDigest!,
+    });
+    const keyUse = () =>
+      vault.signTransaction(
+        {
+          agentId: AGENT,
+          tenantId: TENANT,
+          to: token,
+          value: "0",
+          data: mint(),
+          chainId: 8453,
+          executionRef: r,
+          broadcast: true,
+        },
+        {
+          txId: tx!.id,
+          policyResults: [],
+          status: "signed",
+          protectedPermit: permit,
+          protectedReviewDigest: q!.reviewDigest!,
+        },
+      );
+    return { r, txId: tx!.id, keyUse };
+  }
+
+  it("[H4] suspend completes while a permit is outstanding -> no key use; row back on the human queue, not failed", async () => {
+    const { r, keyUse } = await outstandingReadbackPermit();
+    expect((await post("/protected-minter/suspend", { reason: "incident" })).status).toBe(200);
+    const before = signed.length;
+    try {
+      await expect(keyUse()).rejects.toBeInstanceOf(ProtectedKeyUseReleasedError);
+      expect(signed.length).toBe(before);
+      const { tx, q } = await queueRowByRef(r);
+      expect(tx!.status).toBe("pending");
+      expect(tx!.txHash).toBeNull();
+      expect(q!.status).toBe("pending");
+      expect(q!.approvalSource).toBeNull();
+      expect(q!.issuanceClaimedAt).toBeNull();
+    } finally {
+      expect((await post("/protected-minter/resume")).status).toBe(200);
+    }
+    // The existing human path can still complete it exactly once.
+    const { tx, q } = await queueRowByRef(r);
+    const approve = await app.request(`/vault/${AGENT}/approve/${tx!.id}`, {
+      method: "POST",
+      headers: bearer(ownerToken),
+      body: JSON.stringify({ reviewDigest: q!.reviewDigest }),
+    });
+    expect(approve.status).toBe(200);
+    expect(signed.length).toBe(before + 1);
+  });
+
+  it("[H4] suspend lands after key-use authorization -> already-sent work is kept (signed once), never re-signed or orphaned", async () => {
+    sendSpy.mockImplementationOnce((async (_c: unknown, tx: { to: string; data?: string; chainId: number }) => {
+      // The brake commits while the transaction is on the wire.
+      expect((await post("/protected-minter/suspend", { reason: "late incident" })).status).toBe(200);
+      signed.push(tx);
+      return `0x${signed.length.toString(16).padStart(64, "0")}`;
+    }) as never);
+    const before = signed.length;
+    const r = ref();
+    reply = { kind: "ok", instruction: {} };
+    try {
+      const res = await signMint(r);
+      expect(res.status).toBe(200);
+      const first = (await res.json()) as any;
+      expect(signed.length).toBe(before + 1);
+      const { tx } = await queueRowByRef(r);
+      expect(tx!.status).toBe("signed");
+      expect(tx!.txHash).toBe(first.data.txHash);
+      // Replay while suspended observes the same hash; no second signature.
+      const again = await signMint(r);
+      expect(((await again.json()) as any).data.txHash).toBe(first.data.txHash);
+      expect(signed.length).toBe(before + 1);
+    } finally {
+      expect((await post("/protected-minter/resume")).status).toBe(200);
+    }
+  });
+
+  it("[H4] revoke completes while a permit is outstanding -> refused at key use", async () => {
+    const LATE = "0x0000000000000000000000000000000000700004";
+    await getDb().insert(protectedMinterTokens).values({
+      id: crypto.randomUUID(),
+      tenantId: TENANT,
+      agentId: AGENT,
+      chainId: 8453,
+      tokenAddress: LATE,
+      deployTxHash: `0x${"a4".repeat(32)}`,
+      deployExecutionRef: "tokenization:deploy:a4",
+    });
+    const { keyUse } = await outstandingReadbackPermit(LATE);
+    expect((await post(`/protected-minter/tokens/${LATE}/revoke`, { reason: "late" })).status).toBe(200);
+    const before = signed.length;
+    await expect(keyUse()).rejects.toThrow(/revoked/);
+    expect(signed.length).toBe(before);
+  });
+
+  it("[H4] revoke vs first admission, both orders -> never an active row after a completed revoke", async () => {
+    const admit = (address: string) =>
+      getDb()
+        .insert(protectedMinterTokens)
+        .values({
+          id: crypto.randomUUID(),
+          tenantId: TENANT,
+          agentId: AGENT,
+          chainId: 8453,
+          tokenAddress: address,
+          deployTxHash: `0x${"a5".repeat(32)}`,
+          deployExecutionRef: "tokenization:deploy:a5",
+        })
+        .onConflictDoNothing(); // exactly what admitOwnDeployedToken does
+    const status = async (address: string) =>
+      (
+        await getDb()
+          .select({ s: protectedMinterTokens.status })
+          .from(protectedMinterTokens)
+          .where(eq(protectedMinterTokens.tokenAddress, address))
+      ).map((x) => x.s);
+    // Order 1: revoke first (tombstone), admission second -> stays revoked.
+    const A = "0x0000000000000000000000000000000000700005";
+    expect((await post(`/protected-minter/tokens/${A}/revoke`, { reason: "pre" })).status).toBe(200);
+    await admit(A);
+    expect(await status(A)).toEqual(["revoked"]);
+    // Order 2: admission wins the race, revoke second -> flipped, reported revoked.
+    const B = "0x0000000000000000000000000000000000700006";
+    await admit(B);
+    const res = await post(`/protected-minter/tokens/${B}/revoke`, { reason: "post" });
+    expect(res.status).toBe(200);
+    expect(await status(B)).toEqual(["revoked"]);
+    // Concurrent: admission and revoke together -> revoked either way.
+    const C = "0x0000000000000000000000000000000000700007";
+    const [rv] = await Promise.all([
+      post(`/protected-minter/tokens/${C}/revoke`, { reason: "race" }),
+      admit(C),
+    ]);
+    expect(rv.status).toBe(200);
+    expect(await status(C)).toEqual(["revoked"]);
   });
 
   it("[M8] the readback path never touches the human approve route; the agent token still cannot approve", async () => {

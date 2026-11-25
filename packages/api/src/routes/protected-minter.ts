@@ -119,7 +119,24 @@ protectedMinterRoutes.post("/:agentId/protected-minter/tokens/:token/revoke", as
   // side), so a completed revoke never leaves an active row behind.
   const revokedAt = new Date();
   const revokedBy = `user:${auth.userId}`;
-  const changed = await db
+  // H4: take the agent's controls row lock first, so a revoke is ordered
+  // against in-flight key-use checks even for a token with no row yet.
+  const changed = await db.transaction(async (tx) => {
+    await tx
+      .insert(protectedMinterControls)
+      .values({ tenantId, agentId })
+      .onConflictDoNothing();
+    await tx
+      .select({ t: protectedMinterControls.tenantId })
+      .from(protectedMinterControls)
+      .where(
+        and(
+          eq(protectedMinterControls.tenantId, tenantId),
+          eq(protectedMinterControls.agentId, agentId),
+        ),
+      )
+      .for("update");
+    return tx
     .insert(protectedMinterTokens)
     .values({
       id: crypto.randomUUID(),
@@ -145,6 +162,7 @@ protectedMinterRoutes.post("/:agentId/protected-minter/tokens/:token/revoke", as
       setWhere: eq(protectedMinterTokens.status, "active"),
     })
     .returning({ id: protectedMinterTokens.id });
+  });
   if (changed.length === 0) return refuse(c, "token is already revoked", 409);
   trackAuditEvent({
     tenantId,

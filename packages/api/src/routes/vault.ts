@@ -5,7 +5,11 @@
  * Mount: app.route("/vault", vaultRoutes)
  */
 
-import { discardProtectedSigningPermit, issueProtectedSigningPermit } from "@stwd/vault";
+import {
+  discardProtectedSigningPermit,
+  issueProtectedSigningPermit,
+  ProtectedKeyUseReleasedError,
+} from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { enforceRateLimit, recordVaultSpend } from "../middleware/redis-enforcement";
@@ -555,6 +559,30 @@ async function tryReadbackAutoSign(
       }),
     };
   } catch (e: unknown) {
+    // STRATA-1673 H4: a brake (suspension) refused key use BEFORE any
+    // signature existed; the vault returned the row to the human queue in
+    // the same locked transaction. Not failed, not stranded.
+    if (e instanceof ProtectedKeyUseReleasedError) {
+      dispatchWebhook(input.tenantId, input.agentId, "approval_required", {
+        txId: input.txId,
+        executionRef: input.executionRef,
+      });
+      return {
+        kind: "response",
+        response: c.json<ApiResponse>(
+          {
+            ok: true,
+            data: {
+              txId: input.txId,
+              executionRef: input.executionRef,
+              status: "pending_approval",
+              readbackRefusal: "agent_suspended",
+            },
+          },
+          202,
+        ),
+      };
+    }
     // Claim consumed; never released, never re-signed under a new claim.
     // Recovery is the executionRef status lookup.
     const requestId = c.get("requestId") || "unknown";

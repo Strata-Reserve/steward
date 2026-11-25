@@ -46,6 +46,7 @@ import { type EncryptedKey, KeyStore } from "./keystore";
 import {
   assertNotProtected,
   assertProtectedPostureIntact,
+  authorizeProtectedKeyUse,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
   getProtectedSignerGuard,
@@ -844,6 +845,17 @@ export class Vault {
       if (agentRow.walletAddress.toLowerCase() !== protectedExpectedAddress.toLowerCase()) {
         throw new ProtectedSignerError("stored wallet address does not match the manifest pin");
       }
+      // STRATA-1673 H4: brakes re-checked at key use, serialized with
+      // suspend/revoke by row locks.
+      if (!options.txId) throw new ProtectedSignerError("txId is required");
+      await authorizeProtectedKeyUse({
+        tenantId: request.tenantId,
+        agentId: request.agentId,
+        txId: options.txId,
+        chainId,
+        to: request.to,
+        data: request.data,
+      });
     }
 
     // ── Resolve the correct signing key ─────────────────────────────────

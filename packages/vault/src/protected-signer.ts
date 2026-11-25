@@ -15,7 +15,14 @@
  * refuses every operation on such an agent unless a guard recognises it.
  */
 
-import { agents, approvalQueue, getDb, protectedMinterControls, transactions } from "@stwd/db";
+import {
+  agents,
+  approvalQueue,
+  getDb,
+  protectedMinterControls,
+  protectedMinterTokens,
+  transactions,
+} from "@stwd/db";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { keccak256, stringToHex } from "viem";
 
@@ -301,17 +308,11 @@ export async function issueProtectedSigningPermit(
     if (pre.approvedByUserId) {
       throw new ProtectedSignerError("permit refused: read-back approval carries a human approver");
     }
-    // Read through the same executor so the check sees (and is serialized
-    // with) the caller's transaction.
-    const [control] = await db
-      .select({ at: protectedMinterControls.protectedMintingSuspendedAt })
-      .from(protectedMinterControls)
-      .where(
-        and(
-          eq(protectedMinterControls.tenantId, input.tenantId),
-          eq(protectedMinterControls.agentId, input.agentId),
-        ),
-      );
+    // STRATA-1673 H4: read through the same executor AND share-lock the
+    // controls row (created if absent), so a concurrent suspend upsert is
+    // serialized against this claim: it either commits first (seen here) or
+    // waits for this transaction and then finds the claim.
+    const control = await lockProtectedControls(db, input.tenantId, input.agentId);
     if (control?.at) {
       throw new ProtectedSignerError(
         "permit refused: protected minting is suspended for this agent",
@@ -444,4 +445,124 @@ export function discardProtectedSigningPermit(handle: string): void {
 /** Test/diagnostic helper: number of unconsumed permits. */
 export function outstandingProtectedPermits(): number {
   return permits.size;
+}
+
+/**
+ * STRATA-1673 H4: ensure the controls row exists and share-lock it. The
+ * suspend/resume upsert takes the row lock, so every brake change is ordered
+ * against claim and key-use transactions.
+ */
+async function lockProtectedControls(
+  db: DbExecutor,
+  tenantId: string,
+  agentId: string,
+): Promise<{ at: Date | null } | undefined> {
+  await db.insert(protectedMinterControls).values({ tenantId, agentId }).onConflictDoNothing();
+  const [control] = await db
+    .select({ at: protectedMinterControls.protectedMintingSuspendedAt })
+    .from(protectedMinterControls)
+    .where(
+      and(
+        eq(protectedMinterControls.tenantId, tenantId),
+        eq(protectedMinterControls.agentId, agentId),
+      ),
+    )
+    .for("share");
+  return control;
+}
+
+/**
+ * STRATA-1673 H4: thrown when key use was refused by a brake BEFORE any
+ * signature existed and the read-back approval was handed back to the human
+ * queue (claim released in the same transaction that proved nothing was
+ * signed). Callers must not mark the transaction failed.
+ */
+export class ProtectedKeyUseReleasedError extends ProtectedSignerError {
+  readonly released = true;
+}
+
+const MINT_SELECTOR = "0x40c10f19";
+
+/**
+ * STRATA-1673 H4: the brakes, re-checked at key use under row locks.
+ *
+ * One transaction: share-lock the controls row, lock the approval row, and
+ * share-lock the target token's admission row. Suspend (controls upsert)
+ * and revoke (token upsert) conflict with these locks, so each brake either
+ * committed before this check (and refuses here) or is ordered after it
+ * (and the work is already-authorized, to be reconciled, never re-signed).
+ *
+ *  - revoked token -> refused for every approval source;
+ *  - read-back row whose token has no active admission -> refused;
+ *  - read-back row while suspended -> refused, and because nothing has been
+ *    signed yet the row is returned to the existing human queue (claim
+ *    cleared, readback approval removed) rather than stranded.
+ */
+export async function authorizeProtectedKeyUse(input: {
+  tenantId: string;
+  agentId: string;
+  txId: string;
+  chainId: number;
+  to: string;
+  data?: string | null;
+}): Promise<void> {
+  const outcome = await getDb().transaction(async (tx) => {
+    const control = await lockProtectedControls(tx, input.tenantId, input.agentId);
+    const [q] = await tx
+      .select({
+        id: approvalQueue.id,
+        status: approvalQueue.status,
+        approvalSource: approvalQueue.approvalSource,
+        issuanceClaimedAt: approvalQueue.issuanceClaimedAt,
+      })
+      .from(approvalQueue)
+      .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)))
+      .for("update");
+    if (!q || q.status !== "approved" || !q.issuanceClaimedAt) {
+      return { refuse: "no claimed approval for this transaction", released: false };
+    }
+    const readback = q.approvalSource === "issuance_readback";
+    const isMint =
+      typeof input.data === "string" && input.data.toLowerCase().startsWith(MINT_SELECTOR);
+    if (isMint) {
+      const [tok] = await tx
+        .select({ status: protectedMinterTokens.status })
+        .from(protectedMinterTokens)
+        .where(
+          and(
+            eq(protectedMinterTokens.tenantId, input.tenantId),
+            eq(protectedMinterTokens.agentId, input.agentId),
+            eq(protectedMinterTokens.chainId, input.chainId),
+            eq(protectedMinterTokens.tokenAddress, input.to.toLowerCase()),
+          ),
+        )
+        .for("share");
+      if (tok?.status === "revoked") {
+        return { refuse: "token admission is revoked", released: false };
+      }
+      if (readback && tok?.status !== "active") {
+        return { refuse: "read-back signing requires an active token admission", released: false };
+      }
+    }
+    if (readback && control?.at) {
+      await tx
+        .update(approvalQueue)
+        .set({
+          status: "pending",
+          approvalSource: null,
+          instructionDigest: null,
+          resolvedAt: null,
+          resolvedBy: null,
+          issuanceClaimedAt: null,
+        })
+        .where(eq(approvalQueue.id, q.id));
+      return {
+        refuse: "protected minting is suspended; returned to the human queue before key use",
+        released: true,
+      };
+    }
+    return null;
+  });
+  if (outcome?.released) throw new ProtectedKeyUseReleasedError(outcome.refuse);
+  if (outcome) throw new ProtectedSignerError(outcome.refuse);
 }
