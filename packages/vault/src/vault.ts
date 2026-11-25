@@ -347,15 +347,17 @@ export type ProtectedSection = (
 ) => Promise<ProtectedSignedTx>;
 export interface ProtectedChainObservation {
   latestNonce: number;
-  /**
-   * STRATA-1673 H1: signer nonce at the admission confirmation depth
-   * (head - PROTECTED_TERMINAL_DEPTH + 1). Only a nonce consumed this deep
-   * by a different hash is proof of replacement; anything shallower may be
-   * propagation lag or a reorg.
-   */
-  nonceAtDepth: number;
   receipt: "success" | "reverted" | null;
   known: boolean;
+  /**
+   * STRATA-1673 F1: the transaction POSITIVELY identified as canonically
+   * included for this signer + nonce (found in the block where the nonce was
+   * consumed, with its own receipt in that canonical block), and its
+   * confirmation count (inclusion block = 1). Null when not established.
+   * Only a hash different from ours at >= PROTECTED_TERMINAL_DEPTH proves
+   * replacement; negative lookups never do.
+   */
+  included: { hash: `0x${string}`; confirmations: number } | null;
 }
 export type ProtectedReconcileOutcome =
   | "unsigned"
@@ -1196,30 +1198,28 @@ export class Vault {
   }
 
   /**
-   * H1 seam: what the chain knows about `hash`. Nonce is read FIRST so a
-   * consumed nonce without our receipt really means another transaction.
+   * H1 seam: what the chain knows about `hash`.
    * STRATA-1673 H1: only a definitive not-found counts as absence; any other
    * RPC error propagates (the caller treats it as UNKNOWN, never absence).
+   * STRATA-1673 F1: when our hash is unseen but the signer's nonce is
+   * consumed, locate the block that consumed `nonce`, find the signer's
+   * transaction at that nonce in it, and read ITS receipt from that same
+   * canonical block. Anything short of that leaves `included` null.
    */
   protected async observeProtectedTx(
     chainId: number,
     hash: `0x${string}`,
     signer: `0x${string}`,
+    nonce: number,
   ): Promise<ProtectedChainObservation> {
     const rpcUrl = requireEvmRpcUrl(chainId, this.config);
     const pc = createPublicClient({ chain: CHAINS[chainId], transport: http(rpcUrl) });
-    const head = await pc.getBlockNumber();
-    const depthBlock = head - BigInt(PROTECTED_TERMINAL_DEPTH - 1);
-    const nonceAtDepth =
-      depthBlock < 0n
-        ? 0
-        : await pc.getTransactionCount({ address: signer, blockNumber: depthBlock });
     const latestNonce = await pc.getTransactionCount({ address: signer, blockTag: "latest" });
     const receipt = await pc.getTransactionReceipt({ hash }).catch((e: unknown) => {
       if (e instanceof TransactionReceiptNotFoundError) return null;
       throw e;
     });
-    if (receipt) return { latestNonce, nonceAtDepth, receipt: receipt.status, known: true };
+    if (receipt) return { latestNonce, receipt: receipt.status, known: true, included: null };
     const known = await pc
       .getTransaction({ hash })
       .then(() => true)
@@ -1227,7 +1227,46 @@ export class Vault {
         if (e instanceof TransactionNotFoundError) return false;
         throw e;
       });
-    return { latestNonce, nonceAtDepth, receipt: null, known };
+    if (known || latestNonce <= nonce) {
+      return { latestNonce, receipt: null, known, included: null };
+    }
+    const head = await pc.getBlockNumber();
+    // Lowest block whose post-state nonce is > `nonce`: the consuming block.
+    let lo = 0n;
+    let hi = head;
+    if ((await pc.getTransactionCount({ address: signer, blockNumber: hi })) <= nonce) {
+      return { latestNonce, receipt: null, known, included: null };
+    }
+    while (lo < hi) {
+      const mid = (lo + hi) / 2n;
+      const n = await pc.getTransactionCount({ address: signer, blockNumber: mid });
+      if (n > nonce) hi = mid;
+      else lo = mid + 1n;
+    }
+    const block = await pc.getBlock({ blockNumber: lo, includeTransactions: true });
+    const tx = block.transactions.find(
+      (t) => t.from.toLowerCase() === signer.toLowerCase() && t.nonce === nonce,
+    );
+    if (!tx) return { latestNonce, receipt: null, known, included: null };
+    const other = await pc.getTransactionReceipt({ hash: tx.hash }).catch((e: unknown) => {
+      if (e instanceof TransactionReceiptNotFoundError) return null;
+      throw e;
+    });
+    if (
+      !other ||
+      other.blockNumber !== lo ||
+      !block.hash ||
+      other.blockHash.toLowerCase() !== block.hash.toLowerCase() ||
+      other.from.toLowerCase() !== signer.toLowerCase()
+    ) {
+      return { latestNonce, receipt: null, known, included: null };
+    }
+    return {
+      latestNonce,
+      receipt: null,
+      known,
+      included: { hash: tx.hash, confirmations: Number(head - lo + 1n) },
+    };
   }
 
   /**
@@ -1297,7 +1336,12 @@ export class Vault {
     const hash = row.txHash as `0x${string}`;
     let obs: ProtectedChainObservation;
     try {
-      obs = await this.observeProtectedTx(row.chainId, hash, row.signerAddress as `0x${string}`);
+      obs = await this.observeProtectedTx(
+        row.chainId,
+        hash,
+        row.signerAddress as `0x${string}`,
+        row.signedNonce,
+      );
     } catch {
       return "unknown";
     }
@@ -1320,11 +1364,16 @@ export class Vault {
       if (!row.sentAt) await db.update(transactions).set({ sentAt: now }).where(where);
       return "sent";
     }
-    // STRATA-1673 H1: terminal `failed` only when, at the admission
-    // confirmation depth, this signer's nonce is consumed and our hash is
-    // neither mined nor known. A shallower consumption may still be our tx
-    // propagating (or a reorg): stay signed, do not retransmit, retry later.
-    if (obs.nonceAtDepth > row.signedNonce) {
+    // STRATA-1673 F1: terminal `failed` only when a DIFFERENT hash is
+    // positively identified as canonically included for this signer + nonce
+    // at the admission confirmation depth. Negative lookups + an advanced
+    // nonce (hash index gap, lagging backend, shallow reorg window) stay
+    // signed: no retransmit, retry later.
+    if (
+      obs.included &&
+      obs.included.hash.toLowerCase() !== hash.toLowerCase() &&
+      obs.included.confirmations >= PROTECTED_TERMINAL_DEPTH
+    ) {
       const rows = await db
         .update(transactions)
         .set({ status: "failed" })

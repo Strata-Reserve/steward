@@ -1044,7 +1044,7 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       mode: {
         send: "ok" | "crash_before" | "lost_ack";
         observe: "ok" | "down";
-        depth: "deep" | "shallow";
+        depth: "deep" | "shallow" | "unidentified";
       };
       /** Another tx consumes nonces up to and including `through` (default: next). */
       bumpNonce: (through?: number) => void;
@@ -1054,14 +1054,16 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       ...a: unknown[]
     ) => Promise<string>;
     const mined = new Map<string, string>();
+    const others = new Map<number, `0x${string}`>(); // nonce -> other included hash
     const sends: string[] = [];
     let nonce = 0;
     const mode = {
       send: "ok" as "ok" | "crash_before" | "lost_ack",
       observe: "ok" as "ok" | "down",
-      // "shallow": the latest nonce moved but nothing is yet at the
-      // confirmation depth (propagation lag / reorg window).
-      depth: "deep" as "deep" | "shallow",
+      // "shallow": the other tx is included at depth 1 (propagation lag /
+      // reorg window). "unidentified": the nonce advanced but no canonical
+      // tx at that nonce could be positively identified (hash index gap).
+      depth: "deep" as "deep" | "shallow" | "unidentified",
     };
     const spies = [
       spyOn(vault as never, "prepareProtectedEvm" as never).mockImplementation((async (
@@ -1096,14 +1098,20 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       spyOn(vault as never, "observeProtectedTx" as never).mockImplementation((async (
         _chainId: number,
         hash: string,
+        _signer: string,
+        txNonce: number,
       ) => {
         if (mode.observe === "down") throw new Error("rpc down");
         const h = hash.toLowerCase();
+        const other = others.get(txNonce);
         return {
           latestNonce: nonce,
-          nonceAtDepth: mode.depth === "shallow" ? 0 : nonce,
           receipt: mined.has(h) ? "success" : null,
           known: mined.has(h),
+          included:
+            mined.has(h) || !other || mode.depth === "unidentified"
+              ? null
+              : { hash: other, confirmations: mode.depth === "shallow" ? 1 : 10 },
         };
       }) as never),
     ];
@@ -1116,7 +1124,11 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
         sends,
         mode,
         bumpNonce: (through?: number) => {
-          nonce = Math.max(nonce + 1, (through ?? -1) + 1);
+          const next = Math.max(nonce + 1, (through ?? -1) + 1);
+          for (let n = nonce; n < next; n++) {
+            others.set(n, `0x${"0e".repeat(31)}${n.toString(16).padStart(2, "0")}`);
+          }
+          nonce = next;
         },
       });
     } finally {
@@ -1327,6 +1339,35 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       expect((await queueRowByRef(r)).tx!.status).toBe("failed");
       expect(chain.sends.length).toBe(sendsBefore);
       expect(chain.mined.size).toBe(0);
+    });
+  });
+
+  it("[F1] nonce advanced but hash index misses our tx and no other hash is positively identified -> stays signed, never failed", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "crash_before";
+      chain.mode.observe = "down";
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      expect((await signMint(r)).status).toBe(202);
+      const { tx } = await queueRowByRef(r);
+      const scope = { tenantId: tx!.tenantId, agentId: tx!.agentId, txId: tx!.id };
+      chain.bumpNonce(tx!.signedNonce!); // nonce advanced (deep), our hash unseen
+      chain.mode.send = "ok";
+      chain.mode.observe = "ok";
+      chain.mode.depth = "unidentified";
+      const sendsBefore = chain.sends.length;
+      for (let i = 0; i < 3; i++) {
+        expect(await vault.reconcileProtectedTransaction(scope)).toBe("unknown");
+      }
+      expect((await queueRowByRef(r)).tx!.status).toBe("signed");
+      expect(chain.sends.length).toBe(sendsBefore);
+      chain.mode.depth = "shallow"; // other hash identified at depth 1
+      expect(await vault.reconcileProtectedTransaction(scope)).toBe("unknown");
+      expect((await queueRowByRef(r)).tx!.status).toBe("signed");
+      chain.mode.depth = "deep"; // other hash identified at depth 10
+      expect(await vault.reconcileProtectedTransaction(scope)).toBe("nonce_consumed");
+      expect((await queueRowByRef(r)).tx!.status).toBe("failed");
+      expect(chain.sends.length).toBe(sendsBefore);
     });
   });
 
