@@ -57,10 +57,10 @@ import {
   admitOwnDeployedToken,
   getProtectedMinterManifest,
   getProtectedMinterManifestDigest,
+  hasActiveAdmission,
   isProtectedMinter,
   isProtectedMinterApprover,
   isProtectedMintingSuspended,
-  hasActiveAdmission,
   loadTokenScope,
   type ProtectedShapeResult,
   protectedReviewDigest,
@@ -590,7 +590,13 @@ async function tryReadbackAutoSign(
     console.error(`[${requestId}] Protected read-back sign failed, tx ${input.txId}:`, e);
     // STRATA-1673 H1: signed bytes on record -> reconcile (never "failed" on
     // an ambiguous send); nothing signed -> nothing sent -> failed.
-    const inFlight = await protectedInFlightResponse(c, input.tenantId, input.agentId, input.txId, e);
+    const inFlight = await protectedInFlightResponse(
+      c,
+      input.tenantId,
+      input.agentId,
+      input.txId,
+      e,
+    );
     if (inFlight) return { kind: "response", response: inFlight };
     dispatchWebhook(input.tenantId, input.agentId, "tx_failed", {
       txId: input.txId,
@@ -711,7 +717,8 @@ async function recoverProtectedAction(row: TransactionRow): Promise<TransactionR
             if (!(e instanceof ProtectedKeyUseReleasedError)) {
               console.error(`Protected resume failed, tx ${row.id}: ${describeRpcError(e)}`);
               const [r2] = await db.select().from(transactions).where(eq(transactions.id, row.id));
-              if (r2?.signedRaw) await vault.reconcileProtectedTransaction(scope).catch(() => undefined);
+              if (r2?.signedRaw)
+                await vault.reconcileProtectedTransaction(scope).catch(() => undefined);
             }
           }
         }

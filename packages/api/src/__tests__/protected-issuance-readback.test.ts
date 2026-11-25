@@ -28,12 +28,12 @@ import {
   Vault as VaultClass,
 } from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
-import { keccak256 } from "viem";
 import type { Hono } from "hono";
 import {
   encodeAbiParameters,
   encodeEventTopics,
   encodeFunctionData,
+  keccak256,
   parseAbi,
   parseAbiParameters,
 } from "viem";
@@ -594,7 +594,8 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       head: 200n,
       roles: new Set<string>(), // `${role}:${account}`
     };
-    const grant = (role: string, account: string) => st.roles.add(`${role}:${account.toLowerCase()}`);
+    const grant = (role: string, account: string) =>
+      st.roles.add(`${role}:${account.toLowerCase()}`);
     const readerCalls: string[] = [];
     boundary.setProtectedChainReader({
       async getReceipt(_chainId, hash) {
@@ -641,28 +642,24 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       // Restricted deploy row WITHOUT a protected approval (not Steward's protected deploy).
       await refusedNow("no protected approval binding");
       expect(readerCalls).not.toContain(`receipt:${LEGACY_HASH}`);
-      await getDb()
-        .insert(approvalQueue)
-        .values({
-          id: crypto.randomUUID(),
-          txId: deployTxId,
-          agentId: AGENT,
-          status: "approved",
-          reviewDigest: DIGEST,
-          approvedByUserId: OWNER_USER,
-          issuanceClaimedAt: new Date(),
-        });
-      await getDb()
-        .insert(approvalQueue)
-        .values({
-          id: crypto.randomUUID(),
-          txId: legacyTxId,
-          agentId: AGENT,
-          status: "approved",
-          reviewDigest: DIGEST,
-          approvedByUserId: OWNER_USER,
-          issuanceClaimedAt: new Date(),
-        });
+      await getDb().insert(approvalQueue).values({
+        id: crypto.randomUUID(),
+        txId: deployTxId,
+        agentId: AGENT,
+        status: "approved",
+        reviewDigest: DIGEST,
+        approvedByUserId: OWNER_USER,
+        issuanceClaimedAt: new Date(),
+      });
+      await getDb().insert(approvalQueue).values({
+        id: crypto.randomUUID(),
+        txId: legacyTxId,
+        agentId: AGENT,
+        status: "approved",
+        reviewDigest: DIGEST,
+        approvedByUserId: OWNER_USER,
+        issuanceClaimedAt: new Date(),
+      });
       st.roles.clear();
       // Unrelated deployer: receipt sender is someone else.
       st.from = FOREIGN_TOKEN;
@@ -913,9 +910,14 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
   });
 
   it("[H4] suspend lands after key-use authorization -> already-sent work is kept (signed once), never re-signed or orphaned", async () => {
-    sendSpy.mockImplementationOnce((async (_c: unknown, tx: { to: string; data?: string; chainId: number }) => {
+    sendSpy.mockImplementationOnce((async (
+      _c: unknown,
+      tx: { to: string; data?: string; chainId: number },
+    ) => {
       // The brake commits while the transaction is on the wire.
-      expect((await post("/protected-minter/suspend", { reason: "late incident" })).status).toBe(200);
+      expect((await post("/protected-minter/suspend", { reason: "late incident" })).status).toBe(
+        200,
+      );
       signed.push(tx);
       return `0x${signed.length.toString(16).padStart(64, "0")}`;
     }) as never);
@@ -941,17 +943,21 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
 
   it("[H4] revoke completes while a permit is outstanding -> refused at key use", async () => {
     const LATE = "0x0000000000000000000000000000000000700004";
-    await getDb().insert(protectedMinterTokens).values({
-      id: crypto.randomUUID(),
-      tenantId: TENANT,
-      agentId: AGENT,
-      chainId: 8453,
-      tokenAddress: LATE,
-      deployTxHash: `0x${"a4".repeat(32)}`,
-      deployExecutionRef: "tokenization:deploy:a4",
-    });
+    await getDb()
+      .insert(protectedMinterTokens)
+      .values({
+        id: crypto.randomUUID(),
+        tenantId: TENANT,
+        agentId: AGENT,
+        chainId: 8453,
+        tokenAddress: LATE,
+        deployTxHash: `0x${"a4".repeat(32)}`,
+        deployExecutionRef: "tokenization:deploy:a4",
+      });
     const { keyUse } = await outstandingReadbackPermit(LATE);
-    expect((await post(`/protected-minter/tokens/${LATE}/revoke`, { reason: "late" })).status).toBe(200);
+    expect((await post(`/protected-minter/tokens/${LATE}/revoke`, { reason: "late" })).status).toBe(
+      200,
+    );
     const before = signed.length;
     await expect(keyUse()).rejects.toThrow(/revoked/);
     expect(signed.length).toBe(before);
@@ -980,7 +986,9 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       ).map((x) => x.s);
     // Order 1: revoke first (tombstone), admission second -> stays revoked.
     const A = "0x0000000000000000000000000000000000700005";
-    expect((await post(`/protected-minter/tokens/${A}/revoke`, { reason: "pre" })).status).toBe(200);
+    expect((await post(`/protected-minter/tokens/${A}/revoke`, { reason: "pre" })).status).toBe(
+      200,
+    );
     await admit(A);
     expect(await status(A)).toEqual(["revoked"]);
     // Order 2: admission wins the race, revoke second -> flipped, reported revoked.
@@ -1011,11 +1019,16 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       bumpNonce: () => void;
     }) => Promise<void>,
   ) {
-    const original = VaultClass.prototype.broadcastEvm as unknown as (...a: unknown[]) => Promise<string>;
+    const original = VaultClass.prototype.broadcastEvm as unknown as (
+      ...a: unknown[]
+    ) => Promise<string>;
     const mined = new Map<string, string>();
     const sends: string[] = [];
     let nonce = 0;
-    const mode = { send: "ok" as "ok" | "crash_before" | "lost_ack", observe: "ok" as "ok" | "down" };
+    const mode = {
+      send: "ok" as "ok" | "crash_before" | "lost_ack",
+      observe: "ok" as "ok" | "down",
+    };
     const spies = [
       spyOn(vault as never, "prepareProtectedEvm" as never).mockImplementation((async (
         _c: unknown,
@@ -1052,17 +1065,24 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       ) => {
         if (mode.observe === "down") throw new Error("rpc down");
         const h = hash.toLowerCase();
-        return { latestNonce: nonce, receipt: mined.has(h) ? "success" : null, known: mined.has(h) };
+        return {
+          latestNonce: nonce,
+          receipt: mined.has(h) ? "success" : null,
+          known: mined.has(h),
+        };
       }) as never),
     ];
-    sendSpy.mockImplementation((async function (this: unknown, ...a: unknown[]) {
+    sendSpy.mockImplementation(async function (this: unknown, ...a: unknown[]) {
       return original.apply(vault, a);
-    }) as never);
+    } as never);
     try {
       await run({ mined, sends, mode, bumpNonce: () => (nonce += 1) });
     } finally {
       for (const sp of spies) sp.mockRestore();
-      sendSpy.mockImplementation((async (_c: unknown, tx: { to: string; data?: string; chainId: number }) => {
+      sendSpy.mockImplementation((async (
+        _c: unknown,
+        tx: { to: string; data?: string; chainId: number },
+      ) => {
         signed.push(tx);
         return `0x${signed.length.toString(16).padStart(64, "0")}`;
       }) as never);

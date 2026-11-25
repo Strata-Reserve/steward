@@ -1127,7 +1127,10 @@ export class Vault {
       gas: tx.gas,
     } as never)) as unknown as Record<string, unknown>;
     const { account: _a, chain: _c, from: _f, parameters: _p, ...rest } = prepared;
-    return { ...(rest as TransactionSerializable), chainId: tx.chainId } as TransactionSerializable & {
+    return {
+      ...(rest as TransactionSerializable),
+      chainId: tx.chainId,
+    } as TransactionSerializable & {
       nonce: number;
     };
   }
@@ -1227,11 +1230,7 @@ export class Vault {
     const hash = row.txHash as `0x${string}`;
     let obs: ProtectedChainObservation;
     try {
-      obs = await this.observeProtectedTx(
-        row.chainId,
-        hash,
-        row.signerAddress as `0x${string}`,
-      );
+      obs = await this.observeProtectedTx(row.chainId, hash, row.signerAddress as `0x${string}`);
     } catch {
       return "unknown";
     }

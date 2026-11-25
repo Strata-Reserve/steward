@@ -622,7 +622,10 @@ export function validateProtectedShape(
       ["pauser", d.pauser],
     ] as const) {
       if (v === ZERO_ADDRESS || v === signer || v === lower(factory)) {
-        return { ok: false, reason: `createRestrictedDealToken ${k} must be nonzero and not the signer` };
+        return {
+          ok: false,
+          reason: `createRestrictedDealToken ${k} must be nonzero and not the signer`,
+        };
       }
     }
     if (d.name.length === 0 || d.symbol.length === 0) {

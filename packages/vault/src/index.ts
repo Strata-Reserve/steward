@@ -23,8 +23,8 @@ export {
   issueProtectedSigningPermit,
   isUndefinedColumn,
   outstandingProtectedPermits,
-  ProtectedKeyUseReleasedError,
   PROTECTED_PERMIT_TTL_MS,
+  ProtectedKeyUseReleasedError,
   ProtectedSignerError,
   registerProtectedSignerGuard,
 } from "./protected-signer";

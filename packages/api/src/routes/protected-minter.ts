@@ -122,10 +122,7 @@ protectedMinterRoutes.post("/:agentId/protected-minter/tokens/:token/revoke", as
   // H4: take the agent's controls row lock first, so a revoke is ordered
   // against in-flight key-use checks even for a token with no row yet.
   const changed = await db.transaction(async (tx) => {
-    await tx
-      .insert(protectedMinterControls)
-      .values({ tenantId, agentId })
-      .onConflictDoNothing();
+    await tx.insert(protectedMinterControls).values({ tenantId, agentId }).onConflictDoNothing();
     await tx
       .select({ t: protectedMinterControls.tenantId })
       .from(protectedMinterControls)
@@ -137,31 +134,31 @@ protectedMinterRoutes.post("/:agentId/protected-minter/tokens/:token/revoke", as
       )
       .for("update");
     return tx
-    .insert(protectedMinterTokens)
-    .values({
-      id: crypto.randomUUID(),
-      tenantId,
-      agentId,
-      chainId: manifest.chainId,
-      tokenAddress: token.toLowerCase(),
-      deployTxHash: `0x${"0".repeat(64)}`,
-      deployExecutionRef: "revoked-before-admission",
-      status: "revoked",
-      revokedAt,
-      revokedBy,
-      revokeReason: reason,
-    })
-    .onConflictDoUpdate({
-      target: [
-        protectedMinterTokens.tenantId,
-        protectedMinterTokens.agentId,
-        protectedMinterTokens.chainId,
-        protectedMinterTokens.tokenAddress,
-      ],
-      set: { status: "revoked", revokedAt, revokedBy, revokeReason: reason },
-      setWhere: eq(protectedMinterTokens.status, "active"),
-    })
-    .returning({ id: protectedMinterTokens.id });
+      .insert(protectedMinterTokens)
+      .values({
+        id: crypto.randomUUID(),
+        tenantId,
+        agentId,
+        chainId: manifest.chainId,
+        tokenAddress: token.toLowerCase(),
+        deployTxHash: `0x${"0".repeat(64)}`,
+        deployExecutionRef: "revoked-before-admission",
+        status: "revoked",
+        revokedAt,
+        revokedBy,
+        revokeReason: reason,
+      })
+      .onConflictDoUpdate({
+        target: [
+          protectedMinterTokens.tenantId,
+          protectedMinterTokens.agentId,
+          protectedMinterTokens.chainId,
+          protectedMinterTokens.tokenAddress,
+        ],
+        set: { status: "revoked", revokedAt, revokedBy, revokeReason: reason },
+        setWhere: eq(protectedMinterTokens.status, "active"),
+      })
+      .returning({ id: protectedMinterTokens.id });
   });
   if (changed.length === 0) return refuse(c, "token is already revoked", 409);
   trackAuditEvent({
