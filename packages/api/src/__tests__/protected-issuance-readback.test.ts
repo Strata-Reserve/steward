@@ -1,0 +1,656 @@
+/**
+ * STRATA-1673 E7 S1: protected minter auto-signs read-back-validated issuance.
+ *
+ * In-memory PGLite; the vault's final EVM send is replaced by a recorder so
+ * "one signature" is observable and no RPC is hit. Strata's read-back
+ * endpoint (S2, not built yet) is a typed fake implementing the contract in
+ * services/issuance-readback-client.ts.
+ *
+ * Must-hold map: [M1]..[M9] (see PR body).
+ */
+
+import { afterAll, beforeAll, beforeEach, describe, expect, it, type Mock, spyOn } from "bun:test";
+import { generateApiKey, signAccessToken, signAgentToken } from "@stwd/auth";
+import {
+  approvalQueue,
+  closeDb,
+  getDb,
+  protectedMinterTokens,
+  tenants,
+  transactions,
+  users,
+  userTenants,
+} from "@stwd/db";
+import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
+import { issueProtectedSigningPermit } from "@stwd/vault";
+import { and, eq } from "drizzle-orm";
+import type { Hono } from "hono";
+import {
+  encodeAbiParameters,
+  encodeEventTopics,
+  encodeFunctionData,
+  parseAbi,
+  parseAbiParameters,
+} from "viem";
+import type { IssuanceInstruction } from "../services/issuance-readback-client";
+
+const TENANT = "strata";
+const AGENT = "prod-minter-1673";
+const FACTORY = "0x00000000000000000000000000000000000f0001";
+const TOKEN = "0x0000000000000000000000000000000000700001";
+const DEPLOYED_TOKEN = "0x0000000000000000000000000000000000700abc";
+const FOREIGN_TOKEN = "0x0000000000000000000000000000000000700def";
+const SAFE = "0x3Ea77cDf3eC33603bF4135bb1a36712B5e21d721";
+const RECIPIENT = "0x00000000000000000000000000000000000000aa";
+const OTHER_RECIPIENT = "0x00000000000000000000000000000000000000bb";
+const OWNER_USER = crypto.randomUUID();
+const AMOUNT = 1000n * 10n ** 18n;
+const DIGEST = `0x${"ab".repeat(32)}`;
+const DEPLOY_HASH = `0x${"de".repeat(32)}`;
+const READBACK_URL = "https://strata.readback.invalid";
+const READBACK_TOKEN = "read-only-principal-token";
+
+const TOKEN_ABI = parseAbi(["function mint(address to, uint256 amount)"]);
+const FACTORY_ABI = parseAbi([
+  "function createDealToken(string name, string symbol, address admin, address minter, bytes32 salt) returns (address)",
+]);
+const EVENT_ABI = parseAbi([
+  "event DealTokenDeployed(address indexed token, address indexed admin, address indexed minter, address deployer, string name, string symbol, bytes32 salt)",
+]);
+
+let app: Hono;
+let signerAddress: string;
+let ownerToken: string;
+let agentJwt: string;
+let vault: Awaited<typeof import("../services/context")>["vault"];
+let boundary: typeof import("../services/prod-minter-boundary");
+let readback: typeof import("../services/issuance-readback-client");
+let sendSpy: Mock<(...args: unknown[]) => Promise<unknown>>;
+let signed: Array<{ to: string; data?: string; chainId: number }> = [];
+let refN = 0;
+
+/** Typed fake of Strata's S2 endpoint. */
+type FakeReply =
+  | { kind: "ok"; instruction: Partial<IssuanceInstruction> }
+  | { kind: "status"; status: number; body?: unknown }
+  | { kind: "hang" }
+  | { kind: "throw" }
+  | { kind: "raw"; body: unknown };
+let reply: FakeReply = { kind: "status", status: 409, body: { reason: "unset" } };
+let calls: Array<{ url: string; method: string; auth: string | null }> = [];
+
+function fakeFetch(input: string, init: RequestInit): Promise<Response> {
+  const h = new Headers(init.headers);
+  calls.push({ url: input, method: String(init.method), auth: h.get("authorization") });
+  const ref = decodeURIComponent(input.split("/").pop() ?? "");
+  const r = reply;
+  if (r.kind === "throw") return Promise.reject(new TypeError("fetch failed"));
+  if (r.kind === "hang") {
+    return new Promise((_, reject) => {
+      init.signal?.addEventListener("abort", () => {
+        const e = new Error("aborted");
+        e.name = "AbortError";
+        reject(e);
+      });
+    });
+  }
+  if (r.kind === "status") {
+    return Promise.resolve(new Response(JSON.stringify(r.body ?? {}), { status: r.status }));
+  }
+  if (r.kind === "raw")
+    return Promise.resolve(new Response(JSON.stringify(r.body), { status: 200 }));
+  const body: IssuanceInstruction = {
+    tenantRef: "strata-tenant",
+    chainId: 8453,
+    token: TOKEN,
+    recipient: RECIPIENT,
+    amount: AMOUNT.toString(),
+    participationId: "par_1",
+    mintId: "mint_1",
+    executionRef: ref,
+    status: "authorized",
+    instructionDigest: DIGEST,
+    ...r.instruction,
+  };
+  return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+}
+
+function installReadback(enabled = true) {
+  readback.setIssuanceReadbackClient(
+    new readback.IssuanceReadbackClient(
+      enabled ? { baseUrl: READBACK_URL, token: READBACK_TOKEN, timeoutMs: 200 } : null,
+      fakeFetch,
+    ),
+  );
+}
+
+const bearer = (t: string) => ({
+  "Content-Type": "application/json",
+  Authorization: `Bearer ${t}`,
+});
+const ref = () => `tokenization:mint:${++refN}`;
+const mint = (to = RECIPIENT, amount = AMOUNT) =>
+  encodeFunctionData({ abi: TOKEN_ABI, functionName: "mint", args: [to as `0x${string}`, amount] });
+
+async function sign(body: Record<string, unknown>) {
+  return app.request(`/vault/${AGENT}/sign`, {
+    method: "POST",
+    headers: bearer(agentJwt),
+    body: JSON.stringify(body),
+  });
+}
+async function signMint(executionRef = ref(), token = TOKEN, data = mint()) {
+  return sign({ to: token, value: "0", data, chainId: 8453, executionRef });
+}
+async function queueRowByRef(executionRef: string) {
+  const [t] = await getDb()
+    .select()
+    .from(transactions)
+    .where(and(eq(transactions.agentId, AGENT), eq(transactions.executionRef, executionRef)));
+  if (!t) return { tx: undefined, q: undefined };
+  const [q] = await getDb().select().from(approvalQueue).where(eq(approvalQueue.txId, t.id));
+  return { tx: t, q };
+}
+async function post(path: string, body: Record<string, unknown> = {}, token = ownerToken) {
+  return app.request(`/vault/${AGENT}${path}`, {
+    method: "POST",
+    headers: bearer(token),
+    body: JSON.stringify(body),
+  });
+}
+
+beforeAll(async () => {
+  process.env.STEWARD_PGLITE_MEMORY = "true";
+  process.env.DATABASE_URL = "postgres://test:test@localhost:5432/steward";
+  process.env.STEWARD_MASTER_PASSWORD = "readback-master-password";
+  process.env.STEWARD_AUDIT_HMAC_KEY = "readback-audit-key-32-bytes-minimum-aaaaaaa";
+  process.env.STEWARD_JWT_SECRET = "readback-jwt-secret-with-enough-bytes-aaaaaaaa";
+  process.env.RPC_URL_8453 = "https://readback-tests.invalid/v2/UNUSED";
+
+  const { db, client } = await createPGLiteDb("memory://");
+  setPGLiteOverride(db, async () => client.close());
+  const k = generateApiKey();
+  await db.insert(tenants).values({ id: TENANT, name: "Strata", apiKeyHash: k.hash });
+  await db.insert(users).values({ id: OWNER_USER, email: `owner-${OWNER_USER}@example.test` });
+  await db.insert(userTenants).values({ userId: OWNER_USER, tenantId: TENANT, role: "owner" });
+
+  ({ app } = await import("../app"));
+  ({ vault } = await import("../services/context"));
+  boundary = await import("../services/prod-minter-boundary");
+  readback = await import("../services/issuance-readback-client");
+
+  const r = await app.request("/agents", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Steward-Tenant": TENANT,
+      "X-Steward-Key": k.key,
+    },
+    body: JSON.stringify({ id: AGENT, name: AGENT }),
+  });
+  if (r.status !== 200) throw new Error(`create agent ${r.status}`);
+  signerAddress = ((await r.json()) as any).data.walletAddress;
+
+  boundary.installProtectedMinterManifest({
+    tenantId: TENANT,
+    agentId: AGENT,
+    signerAddress,
+    chainId: 8453,
+    safeAdmin: SAFE,
+    factories: [FACTORY],
+    verifiedTokens: [{ address: TOKEN, provenance: "0xdeploy:verified" }],
+    approvers: [OWNER_USER],
+  });
+  ownerToken = await signAccessToken(
+    { address: `0x${"1".repeat(40)}`, tenantId: TENANT, userId: OWNER_USER } as never,
+    "1h",
+  );
+  agentJwt = await signAgentToken({ agentId: AGENT, tenantId: TENANT }, "1h");
+
+  sendSpy = spyOn(vault as never, "broadcastEvm" as never).mockImplementation((async (
+    _c: unknown,
+    tx: { to: string; data?: string; chainId: number },
+  ) => {
+    signed.push(tx);
+    return `0x${signed.length.toString(16).padStart(64, "0")}`;
+  }) as never) as never;
+}, 120000);
+
+afterAll(async () => {
+  sendSpy?.mockRestore();
+  readback?.setIssuanceReadbackClient(null);
+  boundary?.setProtectedChainReader(null);
+  boundary?.installProtectedMinterManifest(null);
+  await closeDb();
+  for (const k of [
+    "STEWARD_PGLITE_MEMORY",
+    "DATABASE_URL",
+    "STEWARD_MASTER_PASSWORD",
+    "STEWARD_AUDIT_HMAC_KEY",
+    "STEWARD_JWT_SECRET",
+    "RPC_URL_8453",
+  ])
+    delete process.env[k];
+});
+
+beforeEach(() => {
+  installReadback(true);
+  reply = { kind: "ok", instruction: {} };
+  calls = [];
+});
+
+describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
+  it("[M1] exact match on (chainId, token, recipient, amount) -> approved by readback, claimed once, signed once", async () => {
+    const before = signed.length;
+    const r = ref();
+    const res = await signMint(r);
+    expect(res.status).toBe(200);
+    const b = (await res.json()) as any;
+    expect(b.data.status).toBe("signed");
+    expect(b.data.approvalSource).toBe("issuance_readback");
+    expect(signed.length).toBe(before + 1);
+    expect(signed.at(-1)!.to.toLowerCase()).toBe(TOKEN);
+    expect(signed.at(-1)!.data).toBe(mint());
+    const { tx, q } = await queueRowByRef(r);
+    expect(tx!.status).toBe("signed");
+    expect(q!.status).toBe("approved");
+    expect(q!.approvalSource).toBe("issuance_readback");
+    expect(q!.instructionDigest).toBe(DIGEST);
+    expect(q!.approvedByUserId).toBeNull();
+    expect(q!.issuanceClaimedAt).not.toBeNull();
+    // The Strata read principal is used only for the read-back GET.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("GET");
+    expect(calls[0]!.url).toBe(
+      `${READBACK_URL}/internal/steward/issuance-instructions/${encodeURIComponent(r)}`,
+    );
+    expect(calls[0]!.auth).toBe(`Bearer ${READBACK_TOKEN}`);
+  });
+
+  it("[M2] any field mismatch -> NOT signed, queued for a human with the reason", async () => {
+    const cases: Array<[Partial<IssuanceInstruction>, string]> = [
+      [{ amount: (AMOUNT + 1n).toString() }, "readback_mismatch:amount"],
+      [{ recipient: OTHER_RECIPIENT }, "readback_mismatch:recipient"],
+      [{ token: FOREIGN_TOKEN }, "readback_mismatch:token"],
+      [{ chainId: 84532 }, "readback_mismatch:chainId"],
+    ];
+    for (const [instruction, reason] of cases) {
+      reply = { kind: "ok", instruction };
+      const before = signed.length;
+      const r = ref();
+      const res = await signMint(r);
+      expect(res.status, reason).toBe(202);
+      const b = (await res.json()) as any;
+      expect(b.data.status).toBe("pending_approval");
+      expect(b.data.readbackRefusal).toBe(reason);
+      expect(signed.length).toBe(before);
+      const { q } = await queueRowByRef(r);
+      expect(q!.status).toBe("pending");
+      expect(q!.approvalSource).toBeNull();
+      expect(q!.issuanceClaimedAt).toBeNull();
+    }
+  });
+
+  it("[M2] 409 / timeout / unreachable / 5xx / malformed / wrong executionRef -> NOT signed, human queue", async () => {
+    const cases: Array<[FakeReply, string]> = [
+      [
+        { kind: "status", status: 409, body: { reason: "settlement_not_final" } },
+        "settlement_not_final",
+      ],
+      [{ kind: "hang" }, "readback_timeout"],
+      [{ kind: "throw" }, "readback_unreachable"],
+      [{ kind: "status", status: 503 }, "readback_http_503"],
+      [{ kind: "status", status: 401 }, "readback_http_401"],
+      [{ kind: "raw", body: { status: "authorized" } }, "readback_malformed"],
+      [{ kind: "ok", instruction: { status: "pending" as never } }, "readback_malformed"],
+      [
+        { kind: "ok", instruction: { executionRef: "tokenization:mint:other" } },
+        "readback_execution_ref_mismatch",
+      ],
+    ];
+    for (const [r0, reason] of cases) {
+      reply = r0;
+      const before = signed.length;
+      const r = ref();
+      const res = await signMint(r);
+      expect(res.status, reason).toBe(202);
+      expect(((await res.json()) as any).data.readbackRefusal).toBe(reason);
+      expect(signed.length).toBe(before);
+      const { q } = await queueRowByRef(r);
+      expect(q!.status).toBe("pending");
+    }
+  });
+
+  it("[M3] executionRef replay returns the same action and never a second signature", async () => {
+    const r = ref();
+    const first = await signMint(r);
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as any;
+    const before = signed.length;
+    for (let i = 0; i < 3; i++) {
+      const again = await signMint(r);
+      expect(again.status).toBe(200);
+      expect(again.headers.get("Idempotency-Replayed")).toBe("true");
+      const b = (await again.json()) as any;
+      expect(b.data.txId).toBe(firstBody.data.txId);
+      expect(b.data.txHash).toBe(firstBody.data.txHash);
+    }
+    // Different payload under the same ref -> 409, nothing signed.
+    const conflict = await signMint(r, TOKEN, mint(OTHER_RECIPIENT));
+    expect(conflict.status).toBe(409);
+    expect(signed.length).toBe(before);
+  });
+
+  it("[M3] concurrent identical requests -> exactly one signature", async () => {
+    const r = ref();
+    const before = signed.length;
+    const results = await Promise.all(Array.from({ length: 8 }, () => signMint(r)));
+    for (const res of results) expect([200, 202]).toContain(res.status);
+    expect(signed.length).toBe(before + 1);
+  });
+
+  it("[M3] the readback claim is single-use: a second permit for the same row is refused", async () => {
+    const r = ref();
+    expect((await signMint(r)).status).toBe(200);
+    const { tx, q } = await queueRowByRef(r);
+    await getDb()
+      .update(transactions)
+      .set({ status: "pending" })
+      .where(eq(transactions.id, tx!.id));
+    await expect(
+      issueProtectedSigningPermit({
+        tenantId: TENANT,
+        agentId: AGENT,
+        txId: tx!.id,
+        reviewDigest: q!.reviewDigest!,
+      }),
+    ).rejects.toThrow(/already issued|resolve via executionRef/);
+    await getDb().update(transactions).set({ status: "signed" }).where(eq(transactions.id, tx!.id));
+  });
+
+  it("[M6] readback env unset -> no auto-sign (today's behaviour), Strata never called", async () => {
+    installReadback(false);
+    const before = signed.length;
+    const res = await signMint();
+    expect(res.status).toBe(202);
+    expect(((await res.json()) as any).data.readbackRefusal).toBe("readback_disabled");
+    expect(signed.length).toBe(before);
+    expect(calls).toHaveLength(0);
+    expect(readback.readbackConfigFromEnv({})).toBeNull();
+    expect(
+      readback.readbackConfigFromEnv({ STRATA_ISSUANCE_READBACK_URL: READBACK_URL }),
+    ).toBeNull();
+  });
+
+  it("[M5] suspend agent -> immediate human fallback; resume -> auto again; no restart", async () => {
+    // Only a pinned human approver can suspend; the agent credential cannot.
+    expect((await post("/protected-minter/suspend", { reason: "x" }, agentJwt)).status).toBe(403);
+    expect((await post("/protected-minter/suspend", { reason: "incident 42" })).status).toBe(200);
+    const before = signed.length;
+    const res = await signMint();
+    expect(res.status).toBe(202);
+    expect(((await res.json()) as any).data.readbackRefusal).toBe("agent_suspended");
+    expect(signed.length).toBe(before);
+    expect(calls).toHaveLength(0);
+    expect((await post("/protected-minter/resume")).status).toBe(200);
+    expect((await signMint()).status).toBe(200);
+    expect(signed.length).toBe(before + 1);
+  });
+
+  it("[M5] suspension also refuses at permit time (re-read in the vault)", async () => {
+    const r = ref();
+    reply = { kind: "status", status: 503 };
+    expect((await signMint(r)).status).toBe(202);
+    const { tx, q } = await queueRowByRef(r);
+    // Simulate a row that became readback-approved, then the agent is suspended.
+    await getDb()
+      .update(approvalQueue)
+      .set({ status: "approved", approvalSource: "issuance_readback", instructionDigest: DIGEST })
+      .where(eq(approvalQueue.id, q!.id));
+    expect((await post("/protected-minter/suspend", { reason: "late" })).status).toBe(200);
+    try {
+      await expect(
+        issueProtectedSigningPermit({
+          tenantId: TENANT,
+          agentId: AGENT,
+          txId: tx!.id,
+          reviewDigest: q!.reviewDigest!,
+        }),
+      ).rejects.toThrow(/suspended/);
+      const { q: after } = await queueRowByRef(r);
+      expect(after!.issuanceClaimedAt).toBeNull();
+    } finally {
+      expect((await post("/protected-minter/resume")).status).toBe(200);
+    }
+  });
+
+  it("[M1] permit: readback row without digest, or carrying a human approver, is refused; human CAS cannot consume a readback row", async () => {
+    // DB CHECK: readback source requires a digest.
+    const r = ref();
+    reply = { kind: "status", status: 503 };
+    expect((await signMint(r)).status).toBe(202);
+    const { tx, q } = await queueRowByRef(r);
+    await expect(
+      (async () => {
+        await getDb()
+          .update(approvalQueue)
+          .set({ status: "approved", approvalSource: "issuance_readback" })
+          .where(eq(approvalQueue.id, q!.id));
+      })(),
+    ).rejects.toThrow();
+    await getDb()
+      .update(approvalQueue)
+      .set({
+        status: "approved",
+        approvalSource: "issuance_readback",
+        instructionDigest: DIGEST,
+        approvedByUserId: OWNER_USER,
+      })
+      .where(eq(approvalQueue.id, q!.id));
+    await expect(
+      issueProtectedSigningPermit({
+        tenantId: TENANT,
+        agentId: AGENT,
+        txId: tx!.id,
+        reviewDigest: q!.reviewDigest!,
+      }),
+    ).rejects.toThrow(/human approver/);
+    const { q: after } = await queueRowByRef(r);
+    expect(after!.issuanceClaimedAt).toBeNull();
+  });
+
+  it("[M4] token deployed by Steward's own confirmed createDealToken is admitted automatically (no manifest edit, no restart) and auto-signs", async () => {
+    const digestBefore = boundary.getProtectedMinterManifestDigest();
+    // Unknown token, no deploy evidence -> refused (not even queued).
+    reply = { kind: "ok", instruction: { token: DEPLOYED_TOKEN } };
+    const refused = await signMint(ref(), DEPLOYED_TOKEN);
+    expect(refused.status).toBe(403);
+
+    // Steward's own protected createDealToken, broadcast with a hash.
+    const createData = encodeFunctionData({
+      abi: FACTORY_ABI,
+      functionName: "createDealToken",
+      args: ["Deal", "DL", SAFE, signerAddress as `0x${string}`, `0x${"11".repeat(32)}`],
+    });
+    await getDb().insert(transactions).values({
+      id: crypto.randomUUID(),
+      agentId: AGENT,
+      tenantId: TENANT,
+      executionRef: "tokenization:deploy:1",
+      status: "signed",
+      toAddress: FACTORY,
+      value: "0",
+      data: createData,
+      chainId: 8453,
+      txHash: DEPLOY_HASH,
+      policyResults: [],
+    });
+    const topics = encodeEventTopics({
+      abi: EVENT_ABI,
+      eventName: "DealTokenDeployed",
+      args: { token: DEPLOYED_TOKEN, admin: SAFE, minter: signerAddress as `0x${string}` },
+    });
+    const logData = encodeAbiParameters(parseAbiParameters("address, string, string, bytes32"), [
+      signerAddress as `0x${string}`,
+      "Deal",
+      "DL",
+      `0x${"11".repeat(32)}`,
+    ]);
+    let hasRole = false;
+    const readerCalls: string[] = [];
+    boundary.setProtectedChainReader({
+      async getReceipt(chainId, hash) {
+        readerCalls.push(`receipt:${chainId}:${hash}`);
+        return hash === DEPLOY_HASH
+          ? { status: "success", to: FACTORY, logs: [{ address: FACTORY, topics, data: logData }] }
+          : null;
+      },
+      async hasMinterRole(chainId, token, account) {
+        readerCalls.push(`role:${chainId}:${token}:${account.toLowerCase()}`);
+        return hasRole;
+      },
+    });
+    try {
+      // MINTER_ROLE not held -> not admitted.
+      expect((await signMint(ref(), DEPLOYED_TOKEN)).status).toBe(403);
+      expect(readerCalls).toContain(`role:8453:${DEPLOYED_TOKEN}:${signerAddress.toLowerCase()}`);
+      hasRole = true;
+      const before = signed.length;
+      const ok = await signMint(ref(), DEPLOYED_TOKEN);
+      expect(ok.status).toBe(200);
+      expect(signed.length).toBe(before + 1);
+      const [row] = await getDb()
+        .select()
+        .from(protectedMinterTokens)
+        .where(eq(protectedMinterTokens.tokenAddress, DEPLOYED_TOKEN));
+      expect(row!.status).toBe("active");
+      expect(row!.chainId).toBe(8453); // [M7] from the admission + configured network
+      expect(row!.deployTxHash).toBe(DEPLOY_HASH);
+      expect(row!.deployExecutionRef).toBe("tokenization:deploy:1");
+      expect(boundary.getProtectedMinterManifestDigest()).toBe(digestBefore);
+      // A token Steward did not deploy is never admitted.
+      reply = { kind: "ok", instruction: { token: FOREIGN_TOKEN } };
+      expect((await signMint(ref(), FOREIGN_TOKEN)).status).toBe(403);
+    } finally {
+      boundary.setProtectedChainReader(null);
+    }
+  });
+
+  it("[M5] revoke an admitted token -> next mint refused (human or readback), immediately, terminal", async () => {
+    reply = { kind: "ok", instruction: { token: DEPLOYED_TOKEN } };
+    expect(
+      (await post(`/protected-minter/tokens/${DEPLOYED_TOKEN}/revoke`, { reason: "x" }, agentJwt))
+        .status,
+    ).toBe(403);
+    // Queue one for a human first (readback down), then revoke.
+    reply = { kind: "status", status: 503 };
+    const pendingRef = ref();
+    expect((await signMint(pendingRef, DEPLOYED_TOKEN)).status).toBe(202);
+    const res = await post(`/protected-minter/tokens/${DEPLOYED_TOKEN}/revoke`, {
+      reason: "wrong deal",
+    });
+    expect(res.status).toBe(200);
+    reply = { kind: "ok", instruction: { token: DEPLOYED_TOKEN } };
+    const before = signed.length;
+    expect((await signMint(ref(), DEPLOYED_TOKEN)).status).toBe(403);
+    // The already-queued human approval is refused too (current scope).
+    const { tx, q } = await queueRowByRef(pendingRef);
+    const approve = await app.request(`/vault/${AGENT}/approve/${tx!.id}`, {
+      method: "POST",
+      headers: bearer(ownerToken),
+      body: JSON.stringify({ reviewDigest: q!.reviewDigest }),
+    });
+    expect(approve.status).toBe(403);
+    expect(signed.length).toBe(before);
+    // Terminal: the DB refuses re-activation.
+    await expect(
+      (async () => {
+        await getDb()
+          .update(protectedMinterTokens)
+          .set({ status: "active", revokedAt: null, revokedBy: null })
+          .where(eq(protectedMinterTokens.tokenAddress, DEPLOYED_TOKEN));
+      })(),
+    ).rejects.toThrow();
+    // Manifest tokens are deployment config, not revocable here.
+    expect((await post(`/protected-minter/tokens/${TOKEN}/revoke`, { reason: "x" })).status).toBe(
+      409,
+    );
+  });
+
+  it("[M8] the readback path never touches the human approve route; the agent token still cannot approve", async () => {
+    reply = { kind: "status", status: 409, body: { reason: "no_standing_authorization" } };
+    const r = ref();
+    expect((await signMint(r)).status).toBe(202);
+    const { tx, q } = await queueRowByRef(r);
+    const res = await app.request(`/vault/${AGENT}/approve/${tx!.id}`, {
+      method: "POST",
+      headers: bearer(agentJwt),
+      body: JSON.stringify({ reviewDigest: q!.reviewDigest }),
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("issuance readback client (contract with Strata S2)", () => {
+  it("strict schema: exact keys, types, authorized status", () => {
+    const good: IssuanceInstruction = {
+      tenantRef: "t",
+      chainId: 8453,
+      token: TOKEN,
+      recipient: RECIPIENT,
+      amount: "1",
+      participationId: "p",
+      mintId: "m",
+      executionRef: "r",
+      status: "authorized",
+      instructionDigest: DIGEST,
+    };
+    expect(readback.parseIssuanceInstruction(good)).not.toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, extra: 1 })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, amount: "0" })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, amount: "01" })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, amount: 1 })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, chainId: "8453" })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, chainId: 0 })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, token: "0x1" })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, instructionDigest: "0x12" })).toBeNull();
+    expect(readback.parseIssuanceInstruction({ ...good, status: "approved" })).toBeNull();
+    expect(readback.parseIssuanceInstruction([good])).toBeNull();
+  });
+
+  it("config: https only (loopback http allowed), bounded timeout", () => {
+    const cfg = readback.readbackConfigFromEnv;
+    expect(
+      cfg({
+        STRATA_ISSUANCE_READBACK_URL: "http://strata.example",
+        STRATA_ISSUANCE_READBACK_TOKEN: "t",
+      }),
+    ).toBeNull();
+    expect(
+      cfg({
+        STRATA_ISSUANCE_READBACK_URL: "http://127.0.0.1:3000",
+        STRATA_ISSUANCE_READBACK_TOKEN: "t",
+      })?.baseUrl,
+    ).toBe("http://127.0.0.1:3000");
+    const c = cfg({
+      STRATA_ISSUANCE_READBACK_URL: "https://strata.example/",
+      STRATA_ISSUANCE_READBACK_TOKEN: "t",
+      STRATA_ISSUANCE_READBACK_TIMEOUT_MS: "999999",
+    });
+    expect(c?.baseUrl).toBe("https://strata.example");
+    expect(c?.timeoutMs).toBe(readback.DEFAULT_READBACK_TIMEOUT_MS);
+  });
+
+  it("compareInstruction: case-insensitive addresses, integer amount", () => {
+    const ins = {
+      chainId: 8453,
+      token: TOKEN.toUpperCase().replace("0X", "0x"),
+      recipient: RECIPIENT,
+      amount: "5",
+    } as IssuanceInstruction;
+    const base = { chainId: 8453, token: TOKEN, recipient: RECIPIENT, amount: 5n };
+    expect(readback.compareInstruction(ins, base)).toBeNull();
+    expect(readback.compareInstruction(ins, { ...base, amount: 6n })).toBe("amount");
+    expect(readback.compareInstruction(ins, { ...base, chainId: 84532 })).toBe("chainId");
+  });
+});
