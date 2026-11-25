@@ -427,7 +427,7 @@ export async function issueProtectedSigningPermit(
  * Duplicate-safe by construction: the signer persists bytes with a CAS on
  * (status='pending' AND signed_raw IS NULL) BEFORE sending, so however many
  * resumes race, at most one signed transaction is ever recorded or sent.
- * Brakes are re-checked at key use (`authorizeProtectedKeyUse`).
+ * Brakes are re-checked at key use inside `runProtectedSigningSection`.
  */
 export async function issueProtectedResumePermit(input: {
   tenantId: string;
@@ -575,37 +575,6 @@ export class ProtectedKeyUseReleasedError extends ProtectedSignerError {
 }
 
 const MINT_SELECTOR = "0x40c10f19";
-
-/**
- * STRATA-1673 H4: the brakes, re-checked at key use under row locks.
- *
- * One transaction: share-lock the controls row, lock the approval row, and
- * share-lock the target token's admission row. Suspend (controls upsert)
- * and revoke (token upsert) conflict with these locks, so each brake either
- * committed before this check (and refuses here) or is ordered after it
- * (and the work is already-authorized, to be reconciled, never re-signed).
- *
- *  - revoked token -> refused for every approval source;
- *  - read-back row whose token has no active admission -> refused;
- *  - read-back row while suspended -> refused, and because nothing has been
- *    signed yet the row is returned to the existing human queue (claim
- *    cleared, readback approval removed) rather than stranded.
- */
-export async function authorizeProtectedKeyUse(input: {
-  tenantId: string;
-  agentId: string;
-  txId: string;
-  chainId: number;
-  to: string;
-  data?: string | null;
-}): Promise<void> {
-  const outcome = await getDb().transaction(async (tx) => {
-    const signed = await refuseIfSigned(tx, input);
-    return signed ?? checkProtectedKeyUse(tx, input);
-  });
-  if (outcome?.released) throw new ProtectedKeyUseReleasedError(outcome.refuse);
-  if (outcome) throw new ProtectedSignerError(outcome.refuse);
-}
 
 type KeyUseInput = {
   tenantId: string;

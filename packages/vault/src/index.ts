@@ -11,7 +11,6 @@ export type {
 export {
   assertNotProtected,
   assertProtectedPostureIntact,
-  authorizeProtectedKeyUse,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
   discardProtectedSigningPermit,
