@@ -13,6 +13,7 @@ export {
   assertProtectedPostureIntact,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
+  discardProtectedSigningPermit,
   getProtectedSignerGuard,
   isPersistedProtected,
   isProtectedIssuanceClaimed,

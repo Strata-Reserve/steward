@@ -766,7 +766,12 @@ export class Vault {
     // STRATA-1499 F1: persisted marker, independent of env. Fail closed.
     await assertProtectedPostureIntact(request.tenantId, request.agentId, "transaction signing");
 
-    const chainId = request.chainId || this.config.chainId || 8453;
+    // STRATA-1673 D8: no silent 8453 default. The chain is the request's or
+    // the configured network's; neither => refuse before any key use.
+    const chainId = request.chainId || this.config.chainId;
+    if (!chainId) {
+      throw new Error("chainId is required (no request chainId and no configured network)");
+    }
     // Determine chain family from chainId (101/102 = Solana)
     const isSolana = chainId === 101 || chainId === 102;
     const chainFamilyToUse = isSolana ? "solana" : "evm";
@@ -826,12 +831,15 @@ export class Vault {
       ) {
         throw new ProtectedSignerError("review digest does not match the bytes to be signed");
       }
-      const shape = guard.validateTransaction({
-        chainId,
-        to: request.to,
-        value: request.value,
-        data: request.data,
-      });
+      const shape = await guard.validateTransaction(
+        {
+          chainId,
+          to: request.to,
+          value: request.value,
+          data: request.data,
+        },
+        { tenantId: request.tenantId, agentId: request.agentId },
+      );
       if (!shape.ok) throw new ProtectedSignerError(shape.reason);
       if (agentRow.walletAddress.toLowerCase() !== protectedExpectedAddress.toLowerCase()) {
         throw new ProtectedSignerError("stored wallet address does not match the manifest pin");

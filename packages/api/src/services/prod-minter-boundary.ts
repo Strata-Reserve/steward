@@ -61,17 +61,34 @@
  * reaches it.
  */
 
-import { agents, getDb } from "@stwd/db";
 import {
+  agents,
+  getDb,
+  protectedMinterControls,
+  protectedMinterTokens,
+  transactions,
+} from "@stwd/db";
+import {
+  chainRpcUrlsFromEnv,
   computeProtectedReviewDigest,
   isUndefinedColumn,
   type ProtectedSignerGuard,
   type ProtectedTransactionShape,
   type ProtectedValidation,
   registerProtectedSignerGuard,
+  resolveEvmRpcUrl,
 } from "@stwd/vault";
-import { eq } from "drizzle-orm";
-import { encodeFunctionData, keccak256, parseAbi, stringToHex, toFunctionSelector } from "viem";
+import { and, desc, eq, inArray, isNotNull } from "drizzle-orm";
+import {
+  createPublicClient,
+  decodeEventLog,
+  encodeFunctionData,
+  http,
+  keccak256,
+  parseAbi,
+  stringToHex,
+  toFunctionSelector,
+} from "viem";
 
 // ─── Fixed constants ─────────────────────────────────────────────────────────
 
@@ -461,9 +478,15 @@ export type ProtectedShapeResult =
   | { ok: true; decoded: DecodedProtectedCall; projection: ProtectedReviewProjection }
   | { ok: false; reason: string };
 
+/**
+ * STRATA-1673 S1: the mint target set is manifest tokens UNION the active
+ * `protected_minter_tokens` rows for this (tenant, agent, manifest chain),
+ * passed in by the caller (the lookup is async; see `listAdmittedTokens`).
+ */
 export function validateProtectedShape(
   manifest: ProtectedMinterManifest,
   tx: ProtectedTransactionShape & { executionRef?: string },
+  admittedTokens: readonly VerifiedToken[] = [],
 ): ProtectedShapeResult {
   // B1: bound to the manifest's single chain, never to a global constant.
   if (typeof tx.chainId !== "number" || tx.chainId !== manifest.chainId) {
@@ -531,7 +554,9 @@ export function validateProtectedShape(
     };
   }
 
-  const token = manifest.verifiedTokens.find((t) => lower(t.address) === to);
+  const token =
+    manifest.verifiedTokens.find((t) => lower(t.address) === to) ??
+    admittedTokens.find((t) => lower(t.address) === to);
   if (token) {
     if (selector !== SELECTOR_MINT) {
       return { ok: false, reason: "verified token target permits only mint (0x40c10f19)" };
@@ -573,10 +598,17 @@ function buildGuard(manifest: ProtectedMinterManifest, digest: string): Protecte
         ? manifest.signerAddress
         : null,
     manifestDigest: () => digest,
-    validateTransaction: (tx): ProtectedValidation => {
-      const r = validateProtectedShape(manifest, tx);
+    validateTransaction: async (tx, scope): Promise<ProtectedValidation> => {
+      // STRATA-1673 S1: admitted tokens are re-read at key-use time, so a
+      // revocation between approval and signing refuses the signature.
+      const admitted =
+        scope && scope.tenantId === manifest.tenantId && scope.agentId === manifest.agentId
+          ? await listAdmittedTokens(scope.tenantId, scope.agentId, manifest.chainId)
+          : [];
+      const r = validateProtectedShape(manifest, tx, admitted);
       return r.ok ? { ok: true } : { ok: false, reason: r.reason };
     },
+    isAutoIssuanceSuspended: (tenantId, agentId) => isProtectedMintingSuspended(tenantId, agentId),
     // REVIEW-STEWARD-28-R5 N1: the vault verifies the recorded approver at
     // permit issuance against this same pinned allowlist.
     isApprover: (userId) =>
@@ -787,6 +819,254 @@ export async function isPersistedProtectedAgent(agentId: string): Promise<boolea
 export async function isQuarantinedProtectedAgent(agentId: string): Promise<boolean> {
   const row = await persistedProtectedAgentRow(agentId);
   return row !== null && !isProtectedMinterCovered(row);
+}
+
+// ─── STRATA-1673 S1: admitted tokens, suspension, self-admission ─────────────
+
+/** Active admitted tokens for (tenant, agent, chain). Revoked rows are never returned. */
+export async function listAdmittedTokens(
+  tenantId: string,
+  agentId: string,
+  chainId: number,
+): Promise<VerifiedToken[]> {
+  const rows = await getDb()
+    .select({
+      tokenAddress: protectedMinterTokens.tokenAddress,
+      deployTxHash: protectedMinterTokens.deployTxHash,
+    })
+    .from(protectedMinterTokens)
+    .where(
+      and(
+        eq(protectedMinterTokens.tenantId, tenantId),
+        eq(protectedMinterTokens.agentId, agentId),
+        eq(protectedMinterTokens.chainId, chainId),
+        eq(protectedMinterTokens.status, "active"),
+      ),
+    );
+  return rows.map((r) => ({ address: r.tokenAddress, provenance: `admitted:${r.deployTxHash}` }));
+}
+
+/** True when automatic (read-back) signing is suspended for the agent. */
+export async function isProtectedMintingSuspended(
+  tenantId: string,
+  agentId: string,
+): Promise<boolean> {
+  const [row] = await getDb()
+    .select({ at: protectedMinterControls.protectedMintingSuspendedAt })
+    .from(protectedMinterControls)
+    .where(
+      and(
+        eq(protectedMinterControls.tenantId, tenantId),
+        eq(protectedMinterControls.agentId, agentId),
+      ),
+    );
+  return Boolean(row?.at);
+}
+
+export interface ChainReceiptLog {
+  address: string;
+  topics: readonly `0x${string}`[];
+  data: `0x${string}`;
+}
+export interface ChainReceipt {
+  status: "success" | "reverted";
+  to: string | null;
+  logs: readonly ChainReceiptLog[];
+}
+/** Read-only chain access used for self-admission. Injectable for tests. */
+export interface ProtectedChainReader {
+  getReceipt(chainId: number, txHash: `0x${string}`): Promise<ChainReceipt | null>;
+  hasMinterRole(chainId: number, token: string, account: string): Promise<boolean>;
+}
+
+export const MINTER_ROLE = keccak256(stringToHex("MINTER_ROLE"));
+const DEAL_TOKEN_DEPLOYED_ABI = parseAbi([
+  "event DealTokenDeployed(address indexed token, address indexed admin, address indexed minter, address deployer, string name, string symbol, bytes32 salt)",
+]);
+const HAS_ROLE_ABI = parseAbi([
+  "function hasRole(bytes32 role, address account) view returns (bool)",
+]);
+
+function rpcClient(chainId: number) {
+  const url = resolveEvmRpcUrl(chainId, {
+    rpcUrl: process.env.RPC_URL,
+    chainRpcUrls: chainRpcUrlsFromEnv(),
+  });
+  if (!url) throw new Error(`no RPC endpoint for chainId ${chainId}`);
+  return createPublicClient({ transport: http(url) });
+}
+
+const viemChainReader: ProtectedChainReader = {
+  async getReceipt(chainId, txHash) {
+    try {
+      const r = await rpcClient(chainId).getTransactionReceipt({ hash: txHash });
+      return { status: r.status, to: r.to ?? null, logs: r.logs };
+    } catch {
+      return null;
+    }
+  },
+  async hasMinterRole(chainId, token, account) {
+    try {
+      return await rpcClient(chainId).readContract({
+        address: token as `0x${string}`,
+        abi: HAS_ROLE_ABI,
+        functionName: "hasRole",
+        args: [MINTER_ROLE, account as `0x${string}`],
+      });
+    } catch {
+      return false;
+    }
+  },
+};
+
+let chainReader: ProtectedChainReader = viemChainReader;
+
+/** Tests only. Null restores the viem reader. */
+export function setProtectedChainReader(reader: ProtectedChainReader | null): void {
+  chainReader = reader ?? viemChainReader;
+}
+
+const SELF_ADMISSION_CANDIDATE_LIMIT = 50;
+
+export type AdmissionResult =
+  | { ok: true; token: VerifiedToken; admitted: boolean }
+  | { ok: false; reason: string };
+
+/**
+ * Admit `tokenAddress` for protected mint iff Steward itself signed and
+ * broadcast the createDealToken that deployed it:
+ *   - a transactions row of THIS protected agent, on the manifest chain, with
+ *     a tx hash, to a manifest factory, whose calldata is a canonical
+ *     createDealToken with admin = manifest Safe and minter = signer;
+ *   - its receipt is mined successfully and carries a DealTokenDeployed log
+ *     emitted by that factory naming exactly this token, the Safe and the signer;
+ *   - hasRole(MINTER_ROLE, signer) is true on the token now.
+ * No human, no restart. A revoked admission is terminal and never re-admitted.
+ * Any RPC/decoding problem => not admitted (fail closed).
+ */
+export async function admitOwnDeployedToken(
+  tenantId: string,
+  agentId: string,
+  tokenAddress: string,
+): Promise<AdmissionResult> {
+  const manifest = activeManifest;
+  if (!manifest || manifest.tenantId !== tenantId || manifest.agentId !== agentId) {
+    return { ok: false, reason: "no manifest covers this agent" };
+  }
+  if (!ADDRESS_RE.test(tokenAddress)) return { ok: false, reason: "token is not an address" };
+  const token = lower(tokenAddress);
+  if (manifest.factories.some((f) => lower(f) === token)) {
+    return { ok: false, reason: "a factory cannot be a mint target" };
+  }
+  const db = getDb();
+  const existing = async () =>
+    (
+      await db
+        .select()
+        .from(protectedMinterTokens)
+        .where(
+          and(
+            eq(protectedMinterTokens.tenantId, tenantId),
+            eq(protectedMinterTokens.agentId, agentId),
+            eq(protectedMinterTokens.chainId, manifest.chainId),
+            eq(protectedMinterTokens.tokenAddress, token),
+          ),
+        )
+    )[0];
+  const prior = await existing();
+  if (prior) {
+    if (prior.status !== "active") return { ok: false, reason: "token admission is revoked" };
+    return {
+      ok: true,
+      admitted: false,
+      token: { address: prior.tokenAddress, provenance: `admitted:${prior.deployTxHash}` },
+    };
+  }
+
+  const candidates = await db
+    .select({
+      txHash: transactions.txHash,
+      toAddress: transactions.toAddress,
+      data: transactions.data,
+      executionRef: transactions.executionRef,
+    })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.tenantId, tenantId),
+        eq(transactions.agentId, agentId),
+        eq(transactions.chainId, manifest.chainId),
+        isNotNull(transactions.txHash),
+        isNotNull(transactions.executionRef),
+        inArray(transactions.status, ["signed", "broadcast", "confirmed"]),
+      ),
+    )
+    .orderBy(desc(transactions.createdAt))
+    .limit(SELF_ADMISSION_CANDIDATE_LIMIT * 4);
+
+  let checked = 0;
+  for (const cand of candidates) {
+    if (checked >= SELF_ADMISSION_CANDIDATE_LIMIT) break;
+    const factory = manifest.factories.find((f) => lower(f) === lower(cand.toAddress));
+    if (!factory || !cand.txHash || !cand.executionRef) continue;
+    const decoded = decodeCreateDealToken(cand.data);
+    if (
+      !decoded ||
+      lower(decoded.admin) !== lower(manifest.safeAdmin) ||
+      lower(decoded.minter) !== lower(manifest.signerAddress)
+    )
+      continue;
+    if (!/^0x[0-9a-fA-F]{64}$/.test(cand.txHash)) continue;
+    checked += 1;
+    const receipt = await chainReader.getReceipt(manifest.chainId, cand.txHash as `0x${string}`);
+    if (!receipt || receipt.status !== "success") continue;
+    if (!receipt.to || lower(receipt.to) !== lower(factory)) continue;
+    const deployed = receipt.logs.some((log) => {
+      if (lower(log.address) !== lower(factory)) return false;
+      try {
+        const ev = decodeEventLog({
+          abi: DEAL_TOKEN_DEPLOYED_ABI,
+          topics: log.topics as [`0x${string}`, ...`0x${string}`[]],
+          data: log.data,
+        });
+        return (
+          ev.eventName === "DealTokenDeployed" &&
+          lower(ev.args.token) === token &&
+          lower(ev.args.admin) === lower(manifest.safeAdmin) &&
+          lower(ev.args.minter) === lower(manifest.signerAddress)
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (!deployed) continue;
+    if (!(await chainReader.hasMinterRole(manifest.chainId, token, manifest.signerAddress))) {
+      return { ok: false, reason: "signer does not hold MINTER_ROLE on the deployed token" };
+    }
+    await db
+      .insert(protectedMinterTokens)
+      .values({
+        id: crypto.randomUUID(),
+        tenantId,
+        agentId,
+        chainId: manifest.chainId,
+        tokenAddress: token,
+        deployTxHash: lower(cand.txHash),
+        deployExecutionRef: cand.executionRef,
+      })
+      .onConflictDoNothing();
+    const row = await existing();
+    if (!row || row.status !== "active") return { ok: false, reason: "token admission is revoked" };
+    return {
+      ok: true,
+      admitted: true,
+      token: { address: row.tokenAddress, provenance: `admitted:${row.deployTxHash}` },
+    };
+  }
+  return {
+    ok: false,
+    reason: "token was not deployed by this signer's own confirmed createDealToken",
+  };
 }
 
 // Startup: read env once. Fail closed on invalid configuration.

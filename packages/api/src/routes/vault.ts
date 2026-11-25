@@ -5,7 +5,7 @@
  * Mount: app.route("/vault", vaultRoutes)
  */
 
-import { issueProtectedSigningPermit } from "@stwd/vault";
+import { discardProtectedSigningPermit, issueProtectedSigningPermit } from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { enforceRateLimit, recordVaultSpend } from "../middleware/redis-enforcement";
@@ -44,16 +44,30 @@ import {
   vault,
 } from "../services/context";
 import {
+  compareInstruction,
+  getIssuanceReadbackClient,
+  type IssuanceInstruction,
+} from "../services/issuance-readback-client";
+import {
+  admitOwnDeployedToken,
   getProtectedMinterManifest,
   getProtectedMinterManifestDigest,
   isProtectedMinter,
   isProtectedMinterApprover,
+  isProtectedMintingSuspended,
+  listAdmittedTokens,
+  type ProtectedShapeResult,
   protectedReviewDigest,
+  SELECTOR_MINT,
   validateProtectedShape,
 } from "../services/prod-minter-boundary";
+import { protectedMinterRoutes } from "./protected-minter";
 import { dispatchWebhook } from "../services/webhook-dispatch";
 
 export const vaultRoutes = new Hono<{ Variables: AppVariables }>();
+
+// STRATA-1673 S1: per-token revoke and per-agent suspend for the protected minter.
+vaultRoutes.route("/", protectedMinterRoutes);
 
 // ─── Protected production minter (STRATA-1499 SF-1) ────────────────────────────
 //
@@ -134,7 +148,13 @@ async function handleProtectedSign(
   const existing = await findByExecutionRef(tenantId, agentId, executionRef);
   if (existing) return replayExistingAction(c, existing, incoming);
 
-  const shape = validateProtectedShape(manifest, { chainId, to, value, data, executionRef });
+  const shape = await protectedShapeWithAdmission(manifest, tenantId, agentId, {
+    chainId,
+    to,
+    value,
+    data,
+    executionRef,
+  });
   if (!shape.ok) {
     trackAuditEvent({
       tenantId,
@@ -172,6 +192,35 @@ async function handleProtectedSign(
   const txId = crypto.randomUUID();
   const queueId = crypto.randomUUID();
 
+  // STRATA-1673 S1 (JJ 2026-11-25 option 1): a mint whose exact (chainId,
+  // token, recipient, amount) matches the live authoritative Strata record is
+  // approved and signed without a human. Anything else (readback disabled,
+  // agent suspended, 409, timeout, unreachable, malformed, any field
+  // mismatch, RPC not ready) falls through to the human queue below. Never
+  // auto-sign on error.
+  let readbackRefusal: string | null = null;
+  if (shape.decoded.kind === "mint") {
+    const auto = await tryReadbackAutoSign(c, {
+      tenantId,
+      agentId,
+      chainId,
+      to,
+      value,
+      data,
+      executionRef,
+      requestedBy,
+      reviewDigest,
+      manifestDigest,
+      txId,
+      queueId,
+      projection: shape.projection as unknown as Record<string, unknown>,
+      decoded: shape.decoded,
+      incoming,
+    });
+    if (auto.kind === "response") return auto.response;
+    readbackRefusal = auto.reason;
+  }
+
   const inserted = await db.transaction(async (tx) => {
     const rows = await tx
       .insert(transactions)
@@ -199,7 +248,10 @@ async function handleProtectedSign(
       status: "pending",
       reviewDigest,
       manifestDigest,
-      reviewProjection: shape.projection as unknown as Record<string, unknown>,
+      reviewProjection: {
+        ...(shape.projection as unknown as Record<string, unknown>),
+        ...(readbackRefusal ? { readbackRefusal } : {}),
+      },
       requestedBy,
     });
     return true;
@@ -229,6 +281,7 @@ async function handleProtectedSign(
       manifestDigest,
       requestedBy,
       review: shape.projection,
+      readbackRefusal,
     },
     ipAddress: c.req.header("x-forwarded-for") ?? null,
     userAgent: c.req.header("user-agent") ?? null,
@@ -248,10 +301,280 @@ async function handleProtectedSign(
         reviewDigest,
         manifestDigest,
         review: shape.projection,
+        ...(readbackRefusal ? { readbackRefusal } : {}),
       },
     },
     202,
   );
+}
+
+/**
+ * Shape check with the dynamic token set (manifest UNION active admitted
+ * rows). A mint to an unknown token triggers one self-admission attempt
+ * (Steward's own confirmed createDealToken); a revoked token is never
+ * re-admitted.
+ */
+async function protectedShapeWithAdmission(
+  manifest: NonNullable<ReturnType<typeof getProtectedMinterManifest>>,
+  tenantId: string,
+  agentId: string,
+  tx: { chainId: number; to: string; value: string; data?: string; executionRef: string },
+): Promise<ProtectedShapeResult> {
+  const admitted = await listAdmittedTokens(tenantId, agentId, manifest.chainId);
+  const first = validateProtectedShape(manifest, tx, admitted);
+  if (first.ok) return first;
+  const isMintSelector =
+    typeof tx.data === "string" && tx.data.toLowerCase().startsWith(SELECTOR_MINT);
+  const known =
+    manifest.verifiedTokens.some((t) => t.address.toLowerCase() === tx.to.toLowerCase()) ||
+    admitted.some((t) => t.address.toLowerCase() === tx.to.toLowerCase());
+  if (!isMintSelector || known || tx.chainId !== manifest.chainId) return first;
+  const admission = await admitOwnDeployedToken(tenantId, agentId, tx.to);
+  if (!admission.ok) return first;
+  if (admission.admitted) {
+    trackAuditEvent({
+      tenantId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "vault.protected_minter.token_admitted",
+      resourceType: "agent",
+      resourceId: agentId,
+      metadata: {
+        chainId: manifest.chainId,
+        token: admission.token.address,
+        provenance: admission.token.provenance,
+      },
+    });
+  }
+  return validateProtectedShape(manifest, tx, [...admitted, admission.token]);
+}
+
+type ReadbackAutoInput = {
+  tenantId: string;
+  agentId: string;
+  chainId: number;
+  to: string;
+  value: string;
+  data: string | undefined;
+  executionRef: string;
+  requestedBy: string;
+  reviewDigest: string;
+  manifestDigest: string;
+  txId: string;
+  queueId: string;
+  projection: Record<string, unknown>;
+  decoded: { kind: "mint"; recipient: string; amount: bigint };
+  incoming: NormalizedSignPayload;
+};
+
+type ReadbackAutoOutcome =
+  | { kind: "response"; response: Response }
+  | { kind: "fallback"; reason: string };
+
+async function tryReadbackAutoSign(
+  c: Context<{ Variables: AppVariables }>,
+  input: ReadbackAutoInput,
+): Promise<ReadbackAutoOutcome> {
+  const client = getIssuanceReadbackClient();
+  if (!client.enabled) return { kind: "fallback", reason: "readback_disabled" };
+  if (await isProtectedMintingSuspended(input.tenantId, input.agentId)) {
+    return { kind: "fallback", reason: "agent_suspended" };
+  }
+  const result = await client.read(input.executionRef);
+  if (result.kind !== "authorized") {
+    return {
+      kind: "fallback",
+      reason: result.kind === "disabled" ? "readback_disabled" : result.reason,
+    };
+  }
+  const instruction: IssuanceInstruction = result.instruction;
+  const mismatch = compareInstruction(instruction, {
+    chainId: input.chainId,
+    token: input.to,
+    recipient: input.decoded.recipient,
+    amount: input.decoded.amount,
+  });
+  if (mismatch) return { kind: "fallback", reason: `readback_mismatch:${mismatch}` };
+
+  // RPC readiness before anything is written or claimed (same rule as the
+  // human approve path): a configuration error leaves a human-queued row.
+  try {
+    vault.assertChainRpcReady(input.chainId);
+  } catch {
+    return { kind: "fallback", reason: "rpc_not_ready" };
+  }
+
+  const instructionDigest = instruction.instructionDigest.toLowerCase();
+  const resolvedAt = new Date();
+  let permit: string | null = null;
+  let inserted: boolean;
+  try {
+    inserted = await db.transaction(async (tx) => {
+      const rows = await tx
+        .insert(transactions)
+        .values({
+          id: input.txId,
+          agentId: input.agentId,
+          tenantId: input.tenantId,
+          executionRef: input.executionRef,
+          status: "pending",
+          toAddress: input.to,
+          value: input.value,
+          data: input.data,
+          chainId: input.chainId,
+          policyResults: [],
+        })
+        .onConflictDoNothing({
+          target: [transactions.tenantId, transactions.agentId, transactions.executionRef],
+        })
+        .returning({ id: transactions.id });
+      if (rows.length === 0) return false;
+      // Insert + approval + single-use claim in ONE transaction.
+      await tx.insert(approvalQueue).values({
+        id: input.queueId,
+        txId: input.txId,
+        agentId: input.agentId,
+        status: "approved",
+        resolvedAt,
+        resolvedBy: "issuance_readback",
+        reviewDigest: input.reviewDigest,
+        manifestDigest: input.manifestDigest,
+        reviewProjection: {
+          ...input.projection,
+          readback: {
+            participationId: instruction.participationId,
+            mintId: instruction.mintId,
+            tenantRef: instruction.tenantRef,
+          },
+        },
+        requestedBy: input.requestedBy,
+        approvalSource: "issuance_readback",
+        instructionDigest,
+      });
+      permit = await issueProtectedSigningPermit(
+        {
+          tenantId: input.tenantId,
+          agentId: input.agentId,
+          txId: input.txId,
+          reviewDigest: input.reviewDigest,
+        },
+        tx,
+      );
+      return true;
+    });
+  } catch (e) {
+    if (permit) discardProtectedSigningPermit(permit);
+    const requestId = c.get("requestId") || "unknown";
+    console.error(`[${requestId}] Protected read-back approval failed: ${describeRpcError(e)}`);
+    // Nothing committed. A concurrent request may have taken the ref.
+    const winner = await findByExecutionRef(input.tenantId, input.agentId, input.executionRef);
+    if (winner)
+      return { kind: "response", response: await replayExistingAction(c, winner, input.incoming) };
+    return { kind: "fallback", reason: "readback_claim_failed" };
+  }
+  if (!inserted) {
+    const winner = await findByExecutionRef(input.tenantId, input.agentId, input.executionRef);
+    if (!winner) {
+      return {
+        kind: "response",
+        response: c.json<ApiResponse>(
+          { ok: false, error: "Execution reference reservation failed; retry" },
+          503,
+        ),
+      };
+    }
+    return { kind: "response", response: await replayExistingAction(c, winner, input.incoming) };
+  }
+
+  trackAuditEvent({
+    tenantId: input.tenantId,
+    actorType: "agent",
+    actorId: input.agentId,
+    action: "vault.sign.protected_readback_approved",
+    resourceType: "transaction",
+    resourceId: input.txId,
+    metadata: {
+      executionRef: input.executionRef,
+      reviewDigest: input.reviewDigest,
+      manifestDigest: input.manifestDigest,
+      instructionDigest,
+      participationId: instruction.participationId,
+      mintId: instruction.mintId,
+      requestedBy: input.requestedBy,
+      review: input.projection,
+    },
+    ipAddress: c.req.header("x-forwarded-for") ?? null,
+    userAgent: c.req.header("user-agent") ?? null,
+    requestId: c.get("requestId") ?? null,
+  });
+
+  try {
+    const txHash = await vault.signTransaction(
+      {
+        agentId: input.agentId,
+        tenantId: input.tenantId,
+        to: input.to,
+        value: input.value,
+        data: input.data,
+        chainId: input.chainId,
+        executionRef: input.executionRef,
+        broadcast: true,
+      },
+      {
+        txId: input.txId,
+        policyResults: [],
+        status: "signed",
+        protectedPermit: permit ?? undefined,
+        protectedReviewDigest: input.reviewDigest,
+      },
+    );
+    await db
+      .update(transactions)
+      .set({ status: "signed", txHash, signedAt: resolvedAt })
+      .where(eq(transactions.id, input.txId));
+    dispatchWebhook(input.tenantId, input.agentId, "tx_signed", { txId: input.txId, txHash });
+    return {
+      kind: "response",
+      response: c.json<ApiResponse>({
+        ok: true,
+        data: {
+          txId: input.txId,
+          txHash,
+          executionRef: input.executionRef,
+          status: "signed",
+          approvalSource: "issuance_readback",
+          instructionDigest,
+        },
+      }),
+    };
+  } catch (e: unknown) {
+    // Claim consumed; never released, never re-signed under a new claim.
+    // Recovery is the executionRef status lookup.
+    const requestId = c.get("requestId") || "unknown";
+    const rawMessage = e instanceof Error ? e.message : "Unknown error";
+    console.error(`[${requestId}] Protected read-back sign failed, tx ${input.txId}:`, e);
+    await db
+      .update(transactions)
+      .set({ status: "failed" })
+      .where(and(eq(transactions.id, input.txId), eq(transactions.status, "pending")))
+      .catch(() => undefined);
+    dispatchWebhook(input.tenantId, input.agentId, "tx_failed", {
+      txId: input.txId,
+      executionRef: input.executionRef,
+      error: rawMessage,
+      requestId,
+    });
+    if (isRpcError(e)) {
+      return {
+        kind: "response",
+        response: c.json<ApiResponse>({ ok: false, error: extractRpcErrorMessage(e) }, 502),
+      };
+    }
+    return {
+      kind: "response",
+      response: c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500),
+    };
+  }
 }
 
 type QueueRow = typeof approvalQueue.$inferSelect;
@@ -321,13 +644,17 @@ async function handleProtectedApprove(
   }
   const manifest = getProtectedMinterManifest();
   if (!manifest) return protectedRefused(c, "manifest not installed");
-  const shape = validateProtectedShape(manifest, {
-    chainId: transaction.chainId,
-    to: transaction.toAddress,
-    value: transaction.value,
-    data: transaction.data,
-    executionRef: transaction.executionRef,
-  });
+  const shape = validateProtectedShape(
+    manifest,
+    {
+      chainId: transaction.chainId,
+      to: transaction.toAddress,
+      value: transaction.value,
+      data: transaction.data,
+      executionRef: transaction.executionRef,
+    },
+    await listAdmittedTokens(tenantId, agentId, manifest.chainId),
+  );
   if (!shape.ok) return protectedRefused(c, `stored payload fails current scope: ${shape.reason}`);
 
   // STRATA-1499 (F1, #27 x #28 integration): RPC readiness preflight BEFORE

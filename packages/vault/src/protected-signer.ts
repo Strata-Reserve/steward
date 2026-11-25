@@ -35,8 +35,20 @@ export interface ProtectedSignerGuard {
   expectedAddress(tenantId: string, agentId: string): string | null;
   /** Canonical digest of the deployment-controlled manifest. */
   manifestDigest(): string;
-  /** Hard shape validation (chain, value, target, selector, decoded arguments). */
-  validateTransaction(tx: ProtectedTransactionShape): ProtectedValidation;
+  /**
+   * Hard shape validation (chain, value, target, selector, decoded arguments).
+   * STRATA-1673 S1: `scope` lets the guard include the agent's active admitted
+   * tokens (re-read at call time, so a revocation is immediate).
+   */
+  validateTransaction(
+    tx: ProtectedTransactionShape,
+    scope?: { tenantId: string; agentId: string },
+  ): ProtectedValidation | Promise<ProtectedValidation>;
+  /**
+   * STRATA-1673 S1: true when automatic (read-back) signing is suspended for
+   * the agent. Absent => treated as suspended (fail closed).
+   */
+  isAutoIssuanceSuspended?(tenantId: string, agentId: string): Promise<boolean>;
   /**
    * REVIEW-STEWARD-28-R5 N1: true only when `userId` is a pinned approver in
    * the installed manifest allowlist. Empty allowlist / unknown user => false.
@@ -216,13 +228,25 @@ const permits = new Map<string, Permit>();
  * (via `guard.isApprover`). No guard, no approver or a non-allowlisted
  * approver refuses WITHOUT spending the durable claim.
  */
-export async function issueProtectedSigningPermit(input: {
-  tenantId: string;
-  agentId: string;
-  txId: string;
-  reviewDigest: string;
-}): Promise<string> {
-  const db = getDb();
+/**
+ * STRATA-1673 S1: an optional executor lets the caller take the claim inside
+ * the same DB transaction that inserted the read-back approval, so insert,
+ * approval and claim commit (or roll back) together.
+ */
+type DbExecutor =
+  | ReturnType<typeof getDb>
+  | Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
+
+export async function issueProtectedSigningPermit(
+  input: {
+    tenantId: string;
+    agentId: string;
+    txId: string;
+    reviewDigest: string;
+  },
+  executor?: DbExecutor,
+): Promise<string> {
+  const db = executor ?? getDb();
   const digest = input.reviewDigest.toLowerCase();
 
   const guard = registeredGuard;
@@ -257,12 +281,64 @@ export async function issueProtectedSigningPermit(input: {
   // The approving identity must be in the allowlist BEFORE the claim is
   // spent; a refused row must stay claimable by a legitimate re-approval.
   const [pre] = await db
-    .select({ status: approvalQueue.status, approvedByUserId: approvalQueue.approvedByUserId })
+    .select({
+      status: approvalQueue.status,
+      approvedByUserId: approvalQueue.approvedByUserId,
+      approvalSource: approvalQueue.approvalSource,
+      instructionDigest: approvalQueue.instructionDigest,
+    })
     .from(approvalQueue)
     .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)));
   if (!pre || pre.status !== "approved") {
     throw new ProtectedSignerError("permit refused: no consumed approval for this transaction");
   }
+
+  // STRATA-1673 S1 (JJ 2026-11-25 option 1): a row approved by a live Strata
+  // read-back match. Accepted only with a recorded instruction digest, no
+  // human approver on the row, and an unsuspended agent (re-read here).
+  if (pre.approvalSource === "issuance_readback") {
+    if (!pre.instructionDigest || !/^0x[0-9a-fA-F]{64}$/.test(pre.instructionDigest)) {
+      throw new ProtectedSignerError(
+        "permit refused: read-back approval has no instruction digest",
+      );
+    }
+    if (pre.approvedByUserId) {
+      throw new ProtectedSignerError("permit refused: read-back approval carries a human approver");
+    }
+    if (!guard.isAutoIssuanceSuspended) {
+      throw new ProtectedSignerError("permit refused: guard cannot check suspension");
+    }
+    if (await guard.isAutoIssuanceSuspended(input.tenantId, input.agentId)) {
+      throw new ProtectedSignerError(
+        "permit refused: protected minting is suspended for this agent",
+      );
+    }
+    const readbackClaim = await db
+      .update(approvalQueue)
+      .set({ issuanceClaimedAt: new Date() })
+      .where(
+        and(
+          eq(approvalQueue.txId, input.txId),
+          eq(approvalQueue.agentId, input.agentId),
+          eq(approvalQueue.status, "approved"),
+          eq(approvalQueue.approvalSource, "issuance_readback"),
+          eq(approvalQueue.instructionDigest, pre.instructionDigest),
+          isNull(approvalQueue.approvedByUserId),
+          isNull(approvalQueue.issuanceClaimedAt),
+          sql`lower(${approvalQueue.reviewDigest}) = ${digest}`,
+        ),
+      )
+      .returning({ id: approvalQueue.id });
+    if (readbackClaim.length !== 1) {
+      throw new ProtectedSignerError(
+        "permit refused: a permit was already issued for this approval or the digest does not match; resolve via executionRef lookup",
+      );
+    }
+    const handle = crypto.randomUUID();
+    permits.set(handle, { ...input, expiresAt: Date.now() + PERMIT_TTL_MS });
+    return handle;
+  }
+
   const approver = pre.approvedByUserId ?? null;
   if (!approver) {
     throw new ProtectedSignerError("permit refused: approval has no recorded approver");
@@ -287,6 +363,7 @@ export async function issueProtectedSigningPermit(input: {
         eq(approvalQueue.status, "approved"),
         eq(approvalQueue.approvedByUserId, approver),
         isNull(approvalQueue.issuanceClaimedAt),
+        sql`${approvalQueue.approvalSource} IS DISTINCT FROM 'issuance_readback'`,
         sql`lower(${approvalQueue.reviewDigest}) = ${digest}`,
       ),
     )
@@ -353,6 +430,11 @@ export function consumeProtectedSigningPermit(
     return { ok: false, reason: "signing permit does not match the approved payload" };
   }
   return { ok: true };
+}
+
+/** Drop an unconsumed permit (e.g. its issuing DB transaction rolled back). */
+export function discardProtectedSigningPermit(handle: string): void {
+  permits.delete(handle);
 }
 
 /** Test/diagnostic helper: number of unconsumed permits. */
