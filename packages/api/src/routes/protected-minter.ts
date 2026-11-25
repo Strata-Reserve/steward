@@ -112,54 +112,40 @@ protectedMinterRoutes.post("/:agentId/protected-minter/tokens/:token/revoke", as
   if (!reason) return refuse(c, "a non-empty reason (<= 1000 chars) is required", 400);
   const manifest = getProtectedMinterManifest();
   if (!manifest) return refuse(c, "manifest not installed");
-  if (manifest.verifiedTokens.some((t) => t.address.toLowerCase() === token.toLowerCase())) {
-    return refuse(
-      c,
-      "manifest tokens are deployment config; remove from the manifest or revoke MINTER_ROLE via the Safe",
-      409,
-    );
-  }
+  // STRATA-1673 H3/H4: revoke works for every token, manifest-listed or not,
+  // and is ONE statement: insert a revoked row, or flip an active row to
+  // revoked. A concurrent first admission either lands first (and is flipped
+  // here) or conflicts afterwards (ON CONFLICT DO NOTHING on the admission
+  // side), so a completed revoke never leaves an active row behind.
   const revokedAt = new Date();
-  const updated = await db
-    .update(protectedMinterTokens)
-    .set({
+  const revokedBy = `user:${auth.userId}`;
+  const changed = await db
+    .insert(protectedMinterTokens)
+    .values({
+      id: crypto.randomUUID(),
+      tenantId,
+      agentId,
+      chainId: manifest.chainId,
+      tokenAddress: token.toLowerCase(),
+      deployTxHash: `0x${"0".repeat(64)}`,
+      deployExecutionRef: "revoked-before-admission",
       status: "revoked",
       revokedAt,
-      revokedBy: `user:${auth.userId}`,
+      revokedBy,
       revokeReason: reason,
     })
-    .where(
-      and(
-        eq(protectedMinterTokens.tenantId, tenantId),
-        eq(protectedMinterTokens.agentId, agentId),
-        eq(protectedMinterTokens.chainId, manifest.chainId),
-        eq(protectedMinterTokens.tokenAddress, token.toLowerCase()),
-        eq(protectedMinterTokens.status, "active"),
-      ),
-    )
+    .onConflictDoUpdate({
+      target: [
+        protectedMinterTokens.tenantId,
+        protectedMinterTokens.agentId,
+        protectedMinterTokens.chainId,
+        protectedMinterTokens.tokenAddress,
+      ],
+      set: { status: "revoked", revokedAt, revokedBy, revokeReason: reason },
+      setWhere: eq(protectedMinterTokens.status, "active"),
+    })
     .returning({ id: protectedMinterTokens.id });
-  if (updated.length === 0) {
-    // Not admitted yet: record a revoked tombstone so it can never be
-    // self-admitted later.
-    const inserted = await db
-      .insert(protectedMinterTokens)
-      .values({
-        id: crypto.randomUUID(),
-        tenantId,
-        agentId,
-        chainId: manifest.chainId,
-        tokenAddress: token.toLowerCase(),
-        deployTxHash: `0x${"0".repeat(64)}`,
-        deployExecutionRef: "revoked-before-admission",
-        status: "revoked",
-        revokedAt,
-        revokedBy: `user:${auth.userId}`,
-        revokeReason: reason,
-      })
-      .onConflictDoNothing()
-      .returning({ id: protectedMinterTokens.id });
-    if (inserted.length === 0) return refuse(c, "token is already revoked", 409);
-  }
+  if (changed.length === 0) return refuse(c, "token is already revoked", 409);
   trackAuditEvent({
     tenantId,
     actorType: "user",

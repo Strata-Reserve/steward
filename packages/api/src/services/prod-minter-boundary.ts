@@ -487,10 +487,16 @@ export function validateProtectedShape(
   manifest: ProtectedMinterManifest,
   tx: ProtectedTransactionShape & { executionRef?: string },
   admittedTokens: readonly VerifiedToken[] = [],
+  revokedTokens: readonly string[] = [],
 ): ProtectedShapeResult {
   // B1: bound to the manifest's single chain, never to a global constant.
   if (typeof tx.chainId !== "number" || tx.chainId !== manifest.chainId) {
     return { ok: false, reason: `chainId must be exactly ${manifest.chainId}` };
+  }
+  // STRATA-1673 H3: a revoked admission overrides manifest membership, for
+  // every path (auto, human, key use).
+  if (typeof tx.to === "string" && revokedTokens.some((t) => lower(t) === lower(tx.to))) {
+    return { ok: false, reason: "token admission is revoked" };
   }
   let value: bigint;
   try {
@@ -601,11 +607,11 @@ function buildGuard(manifest: ProtectedMinterManifest, digest: string): Protecte
     validateTransaction: async (tx, scope): Promise<ProtectedValidation> => {
       // STRATA-1673 S1: admitted tokens are re-read at key-use time, so a
       // revocation between approval and signing refuses the signature.
-      const admitted =
+      const ts =
         scope && scope.tenantId === manifest.tenantId && scope.agentId === manifest.agentId
-          ? await listAdmittedTokens(scope.tenantId, scope.agentId, manifest.chainId)
-          : [];
-      const r = validateProtectedShape(manifest, tx, admitted);
+          ? await loadTokenScope(scope.tenantId, scope.agentId, manifest.chainId)
+          : { admitted: [], revoked: [] };
+      const r = validateProtectedShape(manifest, tx, ts.admitted, ts.revoked);
       return r.ok ? { ok: true } : { ok: false, reason: r.reason };
     },
     // REVIEW-STEWARD-28-R5 N1: the vault verifies the recorded approver at
@@ -843,6 +849,61 @@ export async function listAdmittedTokens(
       ),
     );
   return rows.map((r) => ({ address: r.tokenAddress, provenance: `admitted:${r.deployTxHash}` }));
+}
+
+/**
+ * STRATA-1673 H3: active admissions AND revoked tokens for (tenant, agent,
+ * chain), one read. Revoked addresses override manifest membership.
+ */
+export async function loadTokenScope(
+  tenantId: string,
+  agentId: string,
+  chainId: number,
+): Promise<{ admitted: VerifiedToken[]; revoked: string[] }> {
+  const rows = await getDb()
+    .select({
+      tokenAddress: protectedMinterTokens.tokenAddress,
+      deployTxHash: protectedMinterTokens.deployTxHash,
+      status: protectedMinterTokens.status,
+    })
+    .from(protectedMinterTokens)
+    .where(
+      and(
+        eq(protectedMinterTokens.tenantId, tenantId),
+        eq(protectedMinterTokens.agentId, agentId),
+        eq(protectedMinterTokens.chainId, chainId),
+      ),
+    );
+  return {
+    admitted: rows
+      .filter((r) => r.status === "active")
+      .map((r) => ({ address: r.tokenAddress, provenance: `admitted:${r.deployTxHash}` })),
+    revoked: rows.filter((r) => r.status === "revoked").map((r) => lower(r.tokenAddress)),
+  };
+}
+
+/**
+ * STRATA-1673 H3: automatic (read-back) signing requires an ACTIVE admission
+ * row for the token. Manifest membership alone keeps the existing human path.
+ */
+export async function hasActiveAdmission(
+  tenantId: string,
+  agentId: string,
+  chainId: number,
+  token: string,
+): Promise<boolean> {
+  const [row] = await getDb()
+    .select({ status: protectedMinterTokens.status })
+    .from(protectedMinterTokens)
+    .where(
+      and(
+        eq(protectedMinterTokens.tenantId, tenantId),
+        eq(protectedMinterTokens.agentId, agentId),
+        eq(protectedMinterTokens.chainId, chainId),
+        eq(protectedMinterTokens.tokenAddress, lower(token)),
+      ),
+    );
+  return row?.status === "active";
 }
 
 /** True when automatic (read-back) signing is suspended for the agent. */

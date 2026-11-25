@@ -40,6 +40,10 @@ const FACTORY = "0x00000000000000000000000000000000000f0001";
 const TOKEN = "0x0000000000000000000000000000000000700001";
 const DEPLOYED_TOKEN = "0x0000000000000000000000000000000000700abc";
 const FOREIGN_TOKEN = "0x0000000000000000000000000000000000700def";
+/** H3: in the manifest, never admitted -> human path only. */
+const MANIFEST_ONLY_TOKEN = "0x0000000000000000000000000000000000700002";
+/** H3: in the manifest AND admitted; revoked in the H3 test. */
+const OVERLAP_TOKEN = "0x0000000000000000000000000000000000700003";
 const SAFE = "0x3Ea77cDf3eC33603bF4135bb1a36712B5e21d721";
 const RECIPIENT = "0x00000000000000000000000000000000000000aa";
 const OTHER_RECIPIENT = "0x00000000000000000000000000000000000000bb";
@@ -198,9 +202,28 @@ beforeAll(async () => {
     chainId: 8453,
     safeAdmin: SAFE,
     factories: [FACTORY],
-    verifiedTokens: [{ address: TOKEN, provenance: "0xdeploy:verified" }],
+    verifiedTokens: [
+      { address: TOKEN, provenance: "0xdeploy:verified" },
+      { address: MANIFEST_ONLY_TOKEN, provenance: "0xdeploy:verified2" },
+      { address: OVERLAP_TOKEN, provenance: "0xdeploy:verified3" },
+    ],
     approvers: [OWNER_USER],
   });
+  // H3: auto-sign needs an active admission; TOKEN and OVERLAP_TOKEN have one.
+  for (const [address, n] of [
+    [TOKEN, "a1"],
+    [OVERLAP_TOKEN, "a3"],
+  ] as const) {
+    await db.insert(protectedMinterTokens).values({
+      id: crypto.randomUUID(),
+      tenantId: TENANT,
+      agentId: AGENT,
+      chainId: 8453,
+      tokenAddress: address,
+      deployTxHash: `0x${n.repeat(32)}`,
+      deployExecutionRef: `tokenization:deploy:${n}`,
+    });
+  }
   ownerToken = await signAccessToken(
     { address: `0x${"1".repeat(40)}`, tenantId: TENANT, userId: OWNER_USER } as never,
     "1h",
@@ -571,10 +594,67 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
           .where(eq(protectedMinterTokens.tokenAddress, DEPLOYED_TOKEN));
       })(),
     ).rejects.toThrow();
-    // Manifest tokens are deployment config, not revocable here.
-    expect((await post(`/protected-minter/tokens/${TOKEN}/revoke`, { reason: "x" })).status).toBe(
-      409,
-    );
+    // Revoking again is reported as already revoked, never as a fresh revoke.
+    expect(
+      (await post(`/protected-minter/tokens/${DEPLOYED_TOKEN}/revoke`, { reason: "again" })).status,
+    ).toBe(409);
+  });
+
+  it("[H3] manifest-only token (no admission) -> never auto-signed, existing human path", async () => {
+    reply = { kind: "ok", instruction: { token: MANIFEST_ONLY_TOKEN } };
+    const before = signed.length;
+    const r = ref();
+    const res = await signMint(r, MANIFEST_ONLY_TOKEN);
+    expect(res.status).toBe(202);
+    expect(((await res.json()) as any).data.readbackRefusal).toBe("token_not_admitted");
+    expect(signed.length).toBe(before);
+    const { q } = await queueRowByRef(r);
+    expect(q!.status).toBe("pending");
+    expect(q!.issuanceClaimedAt).toBeNull();
+    // The Strata read principal is not even consulted.
+    expect(calls).toHaveLength(0);
+  });
+
+  it("[H3] overlap: manifest + admitted auto-signs; revoke overrides the manifest for every path", async () => {
+    reply = { kind: "ok", instruction: { token: OVERLAP_TOKEN } };
+    expect((await signMint(ref(), OVERLAP_TOKEN)).status).toBe(200);
+    // Queue one for a human (readback down) before the revoke.
+    reply = { kind: "status", status: 503 };
+    const pendingRef = ref();
+    expect((await signMint(pendingRef, OVERLAP_TOKEN)).status).toBe(202);
+    const res = await post(`/protected-minter/tokens/${OVERLAP_TOKEN}/revoke`, {
+      reason: "manifest token incident",
+    });
+    expect(res.status).toBe(200);
+    const before = signed.length;
+    reply = { kind: "ok", instruction: { token: OVERLAP_TOKEN } };
+    expect((await signMint(ref(), OVERLAP_TOKEN)).status).toBe(403);
+    reply = { kind: "status", status: 503 };
+    expect((await signMint(ref(), OVERLAP_TOKEN)).status).toBe(403);
+    const { tx, q } = await queueRowByRef(pendingRef);
+    const approve = await app.request(`/vault/${AGENT}/approve/${tx!.id}`, {
+      method: "POST",
+      headers: bearer(ownerToken),
+      body: JSON.stringify({ reviewDigest: q!.reviewDigest }),
+    });
+    expect(approve.status).toBe(403);
+    expect(signed.length).toBe(before);
+  });
+
+  it("[H3] revoke a manifest-only token (no prior admission row) -> refused everywhere", async () => {
+    const res = await post(`/protected-minter/tokens/${MANIFEST_ONLY_TOKEN}/revoke`, {
+      reason: "manifest-only incident",
+    });
+    expect(res.status).toBe(200);
+    const [row] = await getDb()
+      .select()
+      .from(protectedMinterTokens)
+      .where(eq(protectedMinterTokens.tokenAddress, MANIFEST_ONLY_TOKEN));
+    expect(row!.status).toBe("revoked");
+    const before = signed.length;
+    reply = { kind: "status", status: 503 };
+    expect((await signMint(ref(), MANIFEST_ONLY_TOKEN)).status).toBe(403);
+    expect(signed.length).toBe(before);
   });
 
   it("[M8] the readback path never touches the human approve route; the agent token still cannot approve", async () => {

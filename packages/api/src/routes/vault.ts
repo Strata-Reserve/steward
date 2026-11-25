@@ -55,7 +55,8 @@ import {
   isProtectedMinter,
   isProtectedMinterApprover,
   isProtectedMintingSuspended,
-  listAdmittedTokens,
+  hasActiveAdmission,
+  loadTokenScope,
   type ProtectedShapeResult,
   protectedReviewDigest,
   SELECTOR_MINT,
@@ -320,9 +321,10 @@ async function protectedShapeWithAdmission(
   agentId: string,
   tx: { chainId: number; to: string; value: string; data?: string; executionRef: string },
 ): Promise<ProtectedShapeResult> {
-  const admitted = await listAdmittedTokens(tenantId, agentId, manifest.chainId);
-  const first = validateProtectedShape(manifest, tx, admitted);
+  const { admitted, revoked } = await loadTokenScope(tenantId, agentId, manifest.chainId);
+  const first = validateProtectedShape(manifest, tx, admitted, revoked);
   if (first.ok) return first;
+  if (revoked.includes(tx.to.toLowerCase())) return first;
   const isMintSelector =
     typeof tx.data === "string" && tx.data.toLowerCase().startsWith(SELECTOR_MINT);
   const known =
@@ -346,7 +348,7 @@ async function protectedShapeWithAdmission(
       },
     });
   }
-  return validateProtectedShape(manifest, tx, [...admitted, admission.token]);
+  return validateProtectedShape(manifest, tx, [...admitted, admission.token], revoked);
 }
 
 type ReadbackAutoInput = {
@@ -379,6 +381,11 @@ async function tryReadbackAutoSign(
   if (!client.enabled) return { kind: "fallback", reason: "readback_disabled" };
   if (await isProtectedMintingSuspended(input.tenantId, input.agentId)) {
     return { kind: "fallback", reason: "agent_suspended" };
+  }
+  // STRATA-1673 H3: no automatic power without an active, revocable
+  // admission. Manifest-only tokens keep the existing human path.
+  if (!(await hasActiveAdmission(input.tenantId, input.agentId, input.chainId, input.to))) {
+    return { kind: "fallback", reason: "token_not_admitted" };
   }
   const result = await client.read(input.executionRef);
   if (result.kind !== "authorized") {
@@ -653,7 +660,10 @@ async function handleProtectedApprove(
       data: transaction.data,
       executionRef: transaction.executionRef,
     },
-    await listAdmittedTokens(tenantId, agentId, manifest.chainId),
+    ...(await (async () => {
+      const ts = await loadTokenScope(tenantId, agentId, manifest.chainId);
+      return [ts.admitted, ts.revoked] as const;
+    })()),
   );
   if (!shape.ok) return protectedRefused(c, `stored payload fails current scope: ${shape.reason}`);
 
