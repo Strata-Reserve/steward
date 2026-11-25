@@ -10,6 +10,11 @@
 --   protected_minter_controls  one row per protected agent; non-NULL
 --                              protected_minting_suspended_at => nothing is
 --                              auto-signed (every mint falls back to the human queue).
+--   transactions.signed_raw / signed_nonce / signer_address / sent_at (H1)
+--                              protected signer only: exact signed bytes, nonce
+--                              and signer persisted BEFORE the send, so an
+--                              uncertain outcome is reconciled and the SAME
+--                              bytes retransmitted; never re-signed.
 --   approval_queue.approval_source / instruction_digest
 --                              'issuance_readback' rows were approved by a live
 --                              Strata read-back match, not by a human. The vault
@@ -18,6 +23,9 @@
 --
 -- Rollback (only BEFORE any issuance_readback row was signed; afterwards it
 -- erases the evidence of why those transactions were signed):
+--   ALTER TABLE transactions DROP CONSTRAINT transactions_signed_raw_chk;
+--   ALTER TABLE transactions DROP COLUMN sent_at, DROP COLUMN signer_address,
+--     DROP COLUMN signed_nonce, DROP COLUMN signed_raw;
 --   ALTER TABLE approval_queue DROP CONSTRAINT approval_queue_source_chk;
 --   ALTER TABLE approval_queue DROP CONSTRAINT approval_queue_readback_digest_chk;
 --   ALTER TABLE approval_queue DROP COLUMN instruction_digest;
@@ -116,3 +124,14 @@ ALTER TABLE "application_proposal_executions" DROP CONSTRAINT "application_execu
 --> statement-breakpoint
 ALTER TABLE "application_proposal_executions" ADD CONSTRAINT "application_executions_chain_chk"
   CHECK ("chain_id" > 0);
+--> statement-breakpoint
+ALTER TABLE "transactions" ADD COLUMN IF NOT EXISTS "signed_raw" text;
+--> statement-breakpoint
+ALTER TABLE "transactions" ADD COLUMN IF NOT EXISTS "signed_nonce" bigint;
+--> statement-breakpoint
+ALTER TABLE "transactions" ADD COLUMN IF NOT EXISTS "signer_address" varchar(42);
+--> statement-breakpoint
+ALTER TABLE "transactions" ADD COLUMN IF NOT EXISTS "sent_at" timestamp with time zone;
+--> statement-breakpoint
+ALTER TABLE "transactions" ADD CONSTRAINT "transactions_signed_raw_chk"
+  CHECK ("signed_raw" IS NULL OR ("tx_hash" IS NOT NULL AND "signed_nonce" IS NOT NULL AND "signer_address" IS NOT NULL));

@@ -409,6 +409,69 @@ export async function issueProtectedSigningPermit(
   throw new ProtectedSignerError("permit refused: issuance claim lost");
 }
 
+/**
+ * STRATA-1673 H1: resume a claimed protected issuance whose process was lost
+ * BEFORE any signature was recorded. Does not touch the claim (it stays
+ * spent); it only hands out a fresh one-use permit, and only when:
+ *   - the transaction row is still `pending` with NO recorded signed bytes,
+ *   - the approval is `approved` and claimed, and the claim is older than the
+ *     permit TTL (the original permit can no longer be used),
+ *   - the approval source is still valid (pinned human approver, or a
+ *     read-back row with its digest).
+ * Duplicate-safe by construction: the signer persists bytes with a CAS on
+ * (status='pending' AND signed_raw IS NULL) BEFORE sending, so however many
+ * resumes race, at most one signed transaction is ever recorded or sent.
+ * Brakes are re-checked at key use (`authorizeProtectedKeyUse`).
+ */
+export async function issueProtectedResumePermit(input: {
+  tenantId: string;
+  agentId: string;
+  txId: string;
+  reviewDigest: string;
+}): Promise<string | null> {
+  const guard = registeredGuard;
+  if (!guard || !guard.isProtected(input.tenantId, input.agentId)) return null;
+  const db = getDb();
+  const [tx] = await db
+    .select({ status: transactions.status, signedRaw: transactions.signedRaw })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.id, input.txId),
+        eq(transactions.agentId, input.agentId),
+        eq(transactions.tenantId, input.tenantId),
+      ),
+    );
+  if (!tx || tx.status !== "pending" || tx.signedRaw) return null;
+  const [q] = await db
+    .select({
+      status: approvalQueue.status,
+      reviewDigest: approvalQueue.reviewDigest,
+      issuanceClaimedAt: approvalQueue.issuanceClaimedAt,
+      approvalSource: approvalQueue.approvalSource,
+      approvedByUserId: approvalQueue.approvedByUserId,
+      instructionDigest: approvalQueue.instructionDigest,
+    })
+    .from(approvalQueue)
+    .where(and(eq(approvalQueue.txId, input.txId), eq(approvalQueue.agentId, input.agentId)));
+  if (!q || q.status !== "approved" || !q.issuanceClaimedAt) return null;
+  if (!q.reviewDigest || q.reviewDigest.toLowerCase() !== input.reviewDigest.toLowerCase()) {
+    return null;
+  }
+  if (Date.now() - q.issuanceClaimedAt.getTime() <= PERMIT_TTL_MS) return null;
+  if (q.approvalSource === "issuance_readback") {
+    if (!q.instructionDigest || q.approvedByUserId) return null;
+  } else if (!q.approvedByUserId || !guard.isApprover(q.approvedByUserId)) {
+    return null;
+  }
+  const handle = crypto.randomUUID();
+  permits.set(handle, { ...input, expiresAt: Date.now() + PERMIT_TTL_MS });
+  return handle;
+}
+
+/** Permit lifetime; a claim older than this cannot have a usable permit. */
+export const PROTECTED_PERMIT_TTL_MS = PERMIT_TTL_MS;
+
 /** Diagnostic: whether the one-time issuance claim for a txId has been taken. */
 export async function isProtectedIssuanceClaimed(txId: string): Promise<boolean> {
   const [row] = await getDb()

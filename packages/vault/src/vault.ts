@@ -27,7 +27,10 @@ import {
   createPublicClient,
   createWalletClient,
   formatEther,
+  type Hex,
   http,
+  keccak256,
+  type LocalAccount,
   type TransactionSerializable,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -317,6 +320,25 @@ function detectChainType(walletAddress: string): "evm" | "solana" {
 function resolveSolanaRpc(chainId?: number): string {
   return SOLANA_RPCS[chainId ?? 101] ?? SOLANA_RPCS[101];
 }
+
+/** STRATA-1673 H1: the durable record of one protected signature. */
+export interface ProtectedSignedTx {
+  raw: Hex;
+  hash: `0x${string}`;
+  nonce: number;
+}
+export interface ProtectedChainObservation {
+  latestNonce: number;
+  receipt: "success" | "reverted" | null;
+  known: boolean;
+}
+export type ProtectedReconcileOutcome =
+  | "unsigned"
+  | "confirmed"
+  | "failed"
+  | "sent"
+  | "nonce_consumed"
+  | "unknown";
 
 export interface SignTransactionOptions {
   txId?: string;
@@ -915,6 +937,7 @@ export class Vault {
     }
 
     let hash: string;
+    let protectedSentAt: Date | undefined;
 
     if (isSolana) {
       const rpcUrl = this.config.rpcUrl ?? resolveSolanaRpc(chainId);
@@ -955,13 +978,29 @@ export class Vault {
             transport: http(rpcUrl),
           });
 
-          hash = await this.broadcastEvm(client, {
-            to: request.to as `0x${string}`,
-            value: BigInt(request.value),
-            data: request.data as `0x${string}` | undefined,
-            gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
-            chainId,
-          });
+          // STRATA-1673 H1: the protected signer records the exact signed
+          // bytes, nonce and hash on its transactions row BEFORE sending.
+          const persist =
+            protectedExpectedAddress !== null && options.txId
+              ? (signed: ProtectedSignedTx) =>
+                  this.persistProtectedSigned(
+                    { tenantId: request.tenantId, agentId: request.agentId, txId: options.txId! },
+                    signed,
+                    account.address,
+                  )
+              : undefined;
+          hash = await this.broadcastEvm(
+            client,
+            {
+              to: request.to as `0x${string}`,
+              value: BigInt(request.value),
+              data: request.data as `0x${string}` | undefined,
+              gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
+              chainId,
+            },
+            persist,
+          );
+          if (persist) protectedSentAt = new Date();
         } else {
           // Sign without broadcasting - return the serialized signed transaction
           const publicClient = createPublicClient({
@@ -1011,6 +1050,7 @@ export class Vault {
         policyResults: options.policyResults ?? [],
         signedAt,
         createdAt: signedAt,
+        ...(protectedSentAt ? { sentAt: protectedSentAt } : {}),
       })
       .onConflictDoUpdate({
         target: transactions.id,
@@ -1024,6 +1064,7 @@ export class Vault {
           txHash: shouldBroadcast ? hash : undefined,
           policyResults: options.policyResults ?? [],
           signedAt,
+          ...(protectedSentAt ? { sentAt: protectedSentAt } : {}),
         },
       });
 
@@ -1044,13 +1085,192 @@ export class Vault {
       gas?: bigint;
       chainId: number;
     },
+    persist?: (signed: ProtectedSignedTx) => Promise<void>,
   ): Promise<`0x${string}`> {
-    return client.sendTransaction({
+    if (!persist) {
+      return client.sendTransaction({
+        to: tx.to,
+        value: tx.value,
+        data: tx.data,
+        gas: tx.gas,
+      } as Parameters<typeof client.sendTransaction>[0]);
+    }
+    // STRATA-1673 H1: prepare (pending nonce, fees, gas) -> sign locally ->
+    // persist bytes/nonce/hash -> send those exact bytes. A failure after
+    // persist leaves a resumable row; reconciliation never re-signs.
+    const account = client.account as LocalAccount | undefined;
+    if (!account?.signTransaction) throw new Error("protected broadcast requires a local account");
+    const prepared = await this.prepareProtectedEvm(client, tx);
+    const raw = await account.signTransaction(prepared, {
+      serializer: client.chain?.serializers?.transaction,
+    } as never);
+    const hash = keccak256(raw);
+    await persist({ raw, hash, nonce: Number(prepared.nonce) });
+    const sent = await this.sendRawEvm(client, raw);
+    if (sent.toLowerCase() !== hash.toLowerCase()) {
+      throw new Error("RPC acknowledged a different transaction hash than the signed bytes");
+    }
+    return hash;
+  }
+
+  /** H1 seam: fill nonce (pending), fees and gas exactly as sendTransaction would. */
+  protected async prepareProtectedEvm(
+    client: ReturnType<typeof createWalletClient>,
+    tx: { to: `0x${string}`; value: bigint; data?: `0x${string}`; gas?: bigint; chainId: number },
+  ): Promise<TransactionSerializable & { nonce: number }> {
+    const prepared = (await client.prepareTransactionRequest({
+      account: client.account!,
+      chain: client.chain,
       to: tx.to,
       value: tx.value,
       data: tx.data,
       gas: tx.gas,
-    } as Parameters<typeof client.sendTransaction>[0]);
+    } as never)) as unknown as Record<string, unknown>;
+    const { account: _a, chain: _c, from: _f, parameters: _p, ...rest } = prepared;
+    return { ...(rest as TransactionSerializable), chainId: tx.chainId } as TransactionSerializable & {
+      nonce: number;
+    };
+  }
+
+  /** H1 seam: hand already-signed bytes to the network. */
+  protected async sendRawEvm(
+    client: ReturnType<typeof createWalletClient>,
+    raw: Hex,
+  ): Promise<`0x${string}`> {
+    return client.sendRawTransaction({ serializedTransaction: raw });
+  }
+
+  /**
+   * H1 seam: what the chain knows about `hash`. Nonce is read FIRST so a
+   * consumed nonce without our receipt really means another transaction.
+   */
+  protected async observeProtectedTx(
+    chainId: number,
+    hash: `0x${string}`,
+    signer: `0x${string}`,
+  ): Promise<ProtectedChainObservation> {
+    const rpcUrl = requireEvmRpcUrl(chainId, this.config);
+    const pc = createPublicClient({ chain: CHAINS[chainId], transport: http(rpcUrl) });
+    const latestNonce = await pc.getTransactionCount({ address: signer, blockTag: "latest" });
+    const receipt = await pc.getTransactionReceipt({ hash }).catch(() => null);
+    if (receipt) return { latestNonce, receipt: receipt.status, known: true };
+    const known = await pc
+      .getTransaction({ hash })
+      .then(() => true)
+      .catch(() => false);
+    return { latestNonce, receipt: null, known };
+  }
+
+  /**
+   * H1: record the signed bytes on the claimed row. CAS: only a pending row
+   * with no recorded bytes accepts them, so at most one signed transaction
+   * is ever persisted (and therefore sent) per claim.
+   */
+  private async persistProtectedSigned(
+    scope: { tenantId: string; agentId: string; txId: string },
+    signed: ProtectedSignedTx,
+    signer: string,
+  ): Promise<void> {
+    const rows = await getDb()
+      .update(transactions)
+      .set({
+        status: "signed",
+        txHash: signed.hash,
+        signedRaw: signed.raw,
+        signedNonce: signed.nonce,
+        signerAddress: signer.toLowerCase(),
+        signedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(transactions.id, scope.txId),
+          eq(transactions.tenantId, scope.tenantId),
+          eq(transactions.agentId, scope.agentId),
+          eq(transactions.status, "pending"),
+          isNull(transactions.signedRaw),
+        ),
+      )
+      .returning({ id: transactions.id });
+    if (rows.length !== 1) {
+      throw new ProtectedSignerError(
+        "signed bytes already recorded for this transaction; resolve via executionRef lookup",
+      );
+    }
+  }
+
+  /**
+   * STRATA-1673 H1: resolve an uncertain protected send from the chain, and
+   * if the chain has never seen it, retransmit the SAME recorded bytes. Never
+   * signs, never touches the claim. Idempotent and safe to run concurrently.
+   *   receipt success   -> confirmed
+   *   receipt reverted  -> failed
+   *   known (mempool)   -> signed, sent_at recorded
+   *   nonce consumed by another tx -> failed (human reconciliation; no re-sign)
+   *   unknown           -> retransmit same bytes; sent_at on acknowledgement
+   */
+  async reconcileProtectedTransaction(scope: {
+    tenantId: string;
+    agentId: string;
+    txId: string;
+  }): Promise<ProtectedReconcileOutcome> {
+    const db = getDb();
+    const where = and(
+      eq(transactions.id, scope.txId),
+      eq(transactions.tenantId, scope.tenantId),
+      eq(transactions.agentId, scope.agentId),
+    );
+    const [row] = await db.select().from(transactions).where(where);
+    if (!row || !row.signedRaw || !row.txHash || row.signedNonce === null || !row.signerAddress) {
+      return "unsigned";
+    }
+    if (row.status === "confirmed" || row.status === "failed") return row.status;
+    const hash = row.txHash as `0x${string}`;
+    let obs: ProtectedChainObservation;
+    try {
+      obs = await this.observeProtectedTx(
+        row.chainId,
+        hash,
+        row.signerAddress as `0x${string}`,
+      );
+    } catch {
+      return "unknown";
+    }
+    const now = new Date();
+    if (obs.receipt === "success") {
+      await db
+        .update(transactions)
+        .set({ status: "confirmed", confirmedAt: now, sentAt: row.sentAt ?? now })
+        .where(where);
+      return "confirmed";
+    }
+    if (obs.receipt === "reverted") {
+      await db
+        .update(transactions)
+        .set({ status: "failed", sentAt: row.sentAt ?? now })
+        .where(where);
+      return "failed";
+    }
+    if (obs.known) {
+      if (!row.sentAt) await db.update(transactions).set({ sentAt: now }).where(where);
+      return "sent";
+    }
+    if (obs.latestNonce > row.signedNonce) {
+      await db.update(transactions).set({ status: "failed" }).where(where);
+      return "nonce_consumed";
+    }
+    try {
+      const chain = CHAINS[row.chainId];
+      const client = createWalletClient({
+        chain,
+        transport: http(requireEvmRpcUrl(row.chainId, this.config)),
+      });
+      const sent = await this.sendRawEvm(client, row.signedRaw as Hex);
+      if (sent.toLowerCase() !== hash.toLowerCase()) return "unknown";
+    } catch {
+      return "unknown";
+    }
+    await db.update(transactions).set({ sentAt: now }).where(where);
+    return "sent";
   }
 
   /**

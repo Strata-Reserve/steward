@@ -19,10 +19,12 @@ export {
   isPersistedProtected,
   isProtectedIssuanceClaimed,
   isProtectedSigner,
+  issueProtectedResumePermit,
   issueProtectedSigningPermit,
   isUndefinedColumn,
   outstandingProtectedPermits,
   ProtectedKeyUseReleasedError,
+  PROTECTED_PERMIT_TTL_MS,
   ProtectedSignerError,
   registerProtectedSignerGuard,
 } from "./protected-signer";
@@ -64,7 +66,12 @@ export {
 } from "./user-wallet-config";
 export type { ReapplyRateLimitOptions, ReapplyRateLimitResult } from "./user-wallet-reapply";
 export { reapplyUserWalletRateLimit } from "./user-wallet-reapply";
-export type { VaultConfig } from "./vault";
+export type {
+  ProtectedChainObservation,
+  ProtectedReconcileOutcome,
+  ProtectedSignedTx,
+  VaultConfig,
+} from "./vault";
 export {
   assertChainRpcReady,
   chainRpcEnvKey,

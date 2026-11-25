@@ -602,6 +602,17 @@ export const transactions = pgTable(
      */
     tenantId: varchar("tenant_id", { length: 64 }),
     executionRef: varchar("execution_ref", { length: 128 }),
+    /**
+     * STRATA-1673 H1 (0032): protected signer only. The exact signed bytes,
+     * their nonce and signer are recorded BEFORE the send; `sent_at` is set
+     * once the network acknowledged them. A row with `signed_raw` and no
+     * `sent_at` is resolved by reconciliation (receipt / tx by hash / nonce)
+     * and, if still unknown to the chain, by retransmitting the SAME bytes.
+     */
+    signedRaw: text("signed_raw"),
+    signedNonce: bigint("signed_nonce", { mode: "number" }),
+    signerAddress: varchar("signer_address", { length: 42 }),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
   },
   (table) => ({
     agentIdIdx: index("transactions_agent_id_idx").on(table.agentId),
@@ -613,6 +624,10 @@ export const transactions = pgTable(
     executionRefChk: check(
       "transactions_execution_ref_chk",
       sql`${table.executionRef} IS NULL OR (${table.tenantId} IS NOT NULL AND length(${table.executionRef}) BETWEEN 1 AND 128)`,
+    ),
+    signedRawChk: check(
+      "transactions_signed_raw_chk",
+      sql`${table.signedRaw} IS NULL OR (${table.txHash} IS NOT NULL AND ${table.signedNonce} IS NOT NULL AND ${table.signerAddress} IS NOT NULL)`,
     ),
   }),
 );
