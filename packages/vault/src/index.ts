@@ -14,6 +14,7 @@ export {
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
   discardProtectedSigningPermit,
+  effectiveClaimAt,
   getProtectedSignerGuard,
   isPersistedProtected,
   isProtectedIssuanceClaimed,

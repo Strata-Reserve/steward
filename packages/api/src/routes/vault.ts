@@ -7,6 +7,7 @@
 
 import {
   discardProtectedSigningPermit,
+  effectiveClaimAt,
   issueProtectedResumePermit,
   issueProtectedSigningPermit,
   ProtectedKeyUseReleasedError,
@@ -761,6 +762,59 @@ async function recoverProtectedAction(row: TransactionRow): Promise<TransactionR
 
 type QueueRow = typeof approvalQueue.$inferSelect;
 
+/**
+ * STRATA-1673 r6 G1: a repeat approval by the SAME approver with the SAME
+ * digest on an approved, claimed, unsigned row (e.g. the process died after
+ * the approval+claim commit). Continues under the existing claim through the
+ * same recovery as the executionRef lookup: never a new claim, at most one
+ * recorded signature (signer persist CAS), fresh claims are left alone.
+ */
+async function resumeProtectedApproval(
+  c: Context<{ Variables: AppVariables }>,
+  transaction: TransactionRow,
+  userId: string,
+  reviewDigest: string,
+) {
+  const row = await recoverProtectedAction(transaction);
+  const status = await resolveActionStatus(row);
+  trackAuditEvent({
+    tenantId: row.tenantId ?? "",
+    actorType: "user",
+    actorId: userId,
+    action: "vault.approve.protected_resumed",
+    resourceType: "transaction",
+    resourceId: row.id,
+    metadata: { agentId: row.agentId, reviewDigest, status, txHash: row.txHash ?? null },
+    ipAddress: c.req.header("x-forwarded-for") ?? null,
+    userAgent: c.req.header("user-agent") ?? null,
+    requestId: c.get("requestId") ?? null,
+  });
+  if (status === "processing" || status === "pending_approval" || !row.txHash) {
+    return c.json<ApiResponse>(
+      {
+        ok: false,
+        error: "Approval is still being processed; resolve via executionRef lookup",
+        data: actionView(row, status),
+      },
+      202,
+    );
+  }
+  const ok = status !== "failed";
+  return c.json<ApiResponse>(
+    {
+      ok,
+      ...(ok ? {} : { error: "Transaction failed" }),
+      data: {
+        txId: row.id,
+        txHash: row.txHash,
+        executionRef: row.executionRef ?? undefined,
+        status,
+      },
+    },
+    ok ? 200 : 500,
+  );
+}
+
 async function handleProtectedApprove(
   c: Context<{ Variables: AppVariables }>,
   tenantId: string,
@@ -859,19 +913,77 @@ async function handleProtectedApprove(
   }
 
   const resolvedAt = new Date();
-  const claim = await db
-    .update(approvalQueue)
-    .set({ status: "approved", resolvedAt, resolvedBy: `user:${userId}`, approvedByUserId: userId })
-    .where(
-      and(
-        eq(approvalQueue.id, queue.id),
-        eq(approvalQueue.txId, txId),
-        eq(approvalQueue.status, "pending"),
-        eq(approvalQueue.reviewDigest, queue.reviewDigest),
-      ),
-    )
-    .returning({ id: approvalQueue.id });
-  if (claim.length === 0) {
+  const permitInput = { tenantId, agentId, txId, reviewDigest: queue.reviewDigest };
+  let claim: { approved: boolean; permit: string | null; error: unknown };
+  if (queue.status !== "pending") {
+    // STRATA-1673 r6 G1: an already-approved, unsigned row. Only the SAME
+    // approver with the SAME (echoed, recomputed) digest may continue it.
+    const already = { ok: false, error: "Transaction already processed or not found" };
+    if (queue.status !== "approved" || transaction.status !== "pending" || transaction.signedRaw) {
+      return c.json<ApiResponse>(already, 409);
+    }
+    if (!queue.approvedByUserId) return c.json<ApiResponse>(already, 409);
+    if (queue.approvedByUserId !== userId) {
+      return protectedRefused(c, "approval is held by a different approver");
+    }
+    if (effectiveClaimAt(queue.issuanceClaimedAt, queue.reviewProjection)) {
+      // Claimed and unsigned: resume under the SAME claim (permit TTL rule,
+      // signer persist CAS => at most one signature), never a new claim.
+      return resumeProtectedApproval(c, transaction, userId, queue.reviewDigest);
+    }
+    // Approved but never claimed (pre-atomic interrupted approval): take the
+    // one-use claim now, bound to this approver and digest by the CAS.
+    try {
+      claim = {
+        approved: true,
+        permit: await issueProtectedSigningPermit(permitInput),
+        error: null,
+      };
+    } catch (e) {
+      claim = { approved: true, permit: null, error: e };
+    }
+  } else {
+    // STRATA-1673 r6 G1: approval and its durable claim commit TOGETHER.
+    // The claim (issuance_claimed_at, or readbackHandoff.humanClaimedAt for a
+    // handed-off row) is taken in a savepoint of the same transaction, so a
+    // crash can never leave an approved row with no claim; a refused claim
+    // keeps today's outcome (approval recorded, error reported below).
+    let issued: string | null = null;
+    try {
+      claim = await db.transaction(async (dbtx) => {
+        const won = await dbtx
+          .update(approvalQueue)
+          .set({
+            status: "approved",
+            resolvedAt,
+            resolvedBy: `user:${userId}`,
+            approvedByUserId: userId,
+          })
+          .where(
+            and(
+              eq(approvalQueue.id, queue.id),
+              eq(approvalQueue.txId, txId),
+              eq(approvalQueue.status, "pending"),
+              eq(approvalQueue.reviewDigest, queue.reviewDigest as string),
+            ),
+          )
+          .returning({ id: approvalQueue.id });
+        if (won.length === 0) return { approved: false, permit: null, error: null };
+        try {
+          issued = await dbtx.transaction((sp) => issueProtectedSigningPermit(permitInput, sp));
+          return { approved: true, permit: issued, error: null };
+        } catch (e) {
+          return { approved: true, permit: null, error: e };
+        }
+      });
+    } catch (e) {
+      // Commit failed: nothing was approved or claimed; drop the permit.
+      if (issued) discardProtectedSigningPermit(issued);
+      console.error(`Protected approve commit failed, tx ${txId}: ${describeRpcError(e)}`);
+      return c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500);
+    }
+  }
+  if (!claim.approved) {
     return c.json<ApiResponse>(
       { ok: false, error: "Transaction already processed or not found" },
       409,
@@ -897,12 +1009,8 @@ async function handleProtectedApprove(
   });
 
   try {
-    const permit = await issueProtectedSigningPermit({
-      tenantId,
-      agentId,
-      txId,
-      reviewDigest: queue.reviewDigest,
-    });
+    if (claim.error || !claim.permit) throw claim.error ?? new Error("permit refused");
+    const permit = claim.permit;
     const txHash = await vault.signTransaction(
       { ...toSignRequest(transaction), tenantId, broadcast: true },
       {

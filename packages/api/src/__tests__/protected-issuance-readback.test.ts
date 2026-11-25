@@ -1493,6 +1493,93 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     }
   });
 
+  it("[G1] handed-off row: approval + human re-claim commit together; crash before signing -> same approver/digest resumes once; other approver/digest refused; replay 409", async () => {
+    const { r, keyUse } = await outstandingReadbackPermit();
+    expect((await post("/protected-minter/suspend", { reason: "g1" })).status).toBe(200);
+    try {
+      await withFakeChain(async () => {
+        await expect(keyUse()).rejects.toBeInstanceOf(ProtectedKeyUseReleasedError);
+      });
+    } finally {
+      expect((await post("/protected-minter/resume")).status).toBe(200);
+    }
+    const { tx, q } = await queueRowByRef(r);
+    expect(q!.status).toBe("pending");
+    const approveAs = (digest: string) =>
+      app.request(`/vault/${AGENT}/approve/${tx!.id}`, {
+        method: "POST",
+        headers: bearer(ownerToken),
+        body: JSON.stringify({ reviewDigest: digest }),
+      });
+    // Crash injected between the approval commit and signing: key use never runs.
+    let reached!: () => void;
+    const atSign = new Promise<void>((res) => {
+      reached = res;
+    });
+    const hang = spyOn(vault, "signTransaction").mockImplementationOnce((() => {
+      reached();
+      return new Promise<string>(() => {});
+    }) as never);
+    void approveAs(q!.reviewDigest!); // the process "dies" here
+    await atSign;
+    hang.mockRestore();
+    const crashed = (await queueRowByRef(r)).q!;
+    expect(crashed.status).toBe("approved");
+    expect(crashed.approvedByUserId).toBe(OWNER_USER);
+    // Atomic: the durable human claim committed with the approval.
+    const h = (crashed.reviewProjection as any).readbackHandoff;
+    expect(h.humanClaimedAt).not.toBeNull();
+    expect(crashed.issuanceClaimedAt?.getTime()).toBe(q!.issuanceClaimedAt?.getTime());
+    // The lost permit is past its TTL.
+    const aged = new Date(Date.now() - 5 * 60_000).toISOString();
+    await getDb()
+      .update(approvalQueue)
+      .set({
+        reviewProjection: {
+          ...(crashed.reviewProjection as any),
+          readbackHandoff: { ...h, humanClaimedAt: aged },
+        },
+      })
+      .where(eq(approvalQueue.id, crashed.id));
+    await withFakeChain(async (chain) => {
+      // Different digest -> refused, nothing signed.
+      expect((await approveAs(`0x${"cd".repeat(32)}`)).status).toBe(403);
+      // Different approver on the row -> refused, nothing signed.
+      const other = crypto.randomUUID();
+      await getDb()
+        .update(approvalQueue)
+        .set({ approvedByUserId: other })
+        .where(eq(approvalQueue.id, crashed.id));
+      const refused = await approveAs(q!.reviewDigest!);
+      expect(refused.status).toBe(403);
+      expect(((await refused.json()) as any).error).toMatch(/different approver/);
+      await getDb()
+        .update(approvalQueue)
+        .set({ approvedByUserId: OWNER_USER })
+        .where(eq(approvalQueue.id, crashed.id));
+      expect(chain.sends).toHaveLength(0);
+      // Same approver + same digest -> resumes under the same claim, once.
+      const resumed = await Promise.all([approveAs(q!.reviewDigest!), approveAs(q!.reviewDigest!)]);
+      // One racer resumes; the other sees the signed row (409 as today) or is still processing.
+      expect(resumed.some((x) => x.status === 200 || x.status === 202)).toBe(true);
+      for (const x of resumed) expect([200, 202, 409]).toContain(x.status);
+      expect(chain.sends).toHaveLength(1);
+      expect(chain.mined.size).toBe(1);
+      const look = await app.request(`/vault/${AGENT}/actions/by-ref/${encodeURIComponent(r)}`, {
+        headers: bearer(agentJwt),
+      });
+      const lb = (await look.json()) as any;
+      expect(lb.data.status).toBe("confirmed");
+      const { tx: done, q: qd } = await queueRowByRef(r);
+      expect(done!.status).toBe("confirmed");
+      expect(lb.data.txHash).toBe(done!.txHash);
+      expect((qd!.reviewProjection as any).readbackHandoff.humanClaimedAt).toBe(aged);
+      // Replay after confirmed -> 409 as today; no second key use.
+      expect((await approveAs(q!.reviewDigest!)).status).toBe(409);
+      expect(chain.sends).toHaveLength(1);
+    });
+  });
+
   it("[M8] the readback path never touches the human approve route; the agent token still cannot approve", async () => {
     reply = { kind: "status", status: 409, body: { reason: "no_standing_authorization" } };
     const r = ref();
