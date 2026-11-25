@@ -27,6 +27,7 @@ export {
   ProtectedKeyUseReleasedError,
   ProtectedSignerError,
   registerProtectedSignerGuard,
+  runProtectedSigningSection,
 } from "./protected-signer";
 export type { MatchedRoute } from "./route-matcher";
 export {

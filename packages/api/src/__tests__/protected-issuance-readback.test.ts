@@ -25,6 +25,7 @@ import { createPGLiteDb, setPGLiteOverride } from "@stwd/db/pglite";
 import {
   issueProtectedSigningPermit,
   ProtectedKeyUseReleasedError,
+  runProtectedSigningSection,
   Vault as VaultClass,
 } from "@stwd/vault";
 import { and, eq } from "drizzle-orm";
@@ -1045,7 +1046,8 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
         observe: "ok" | "down";
         depth: "deep" | "shallow";
       };
-      bumpNonce: () => void;
+      /** Another tx consumes nonces up to and including `through` (default: next). */
+      bumpNonce: (through?: number) => void;
     }) => Promise<void>,
   ) {
     const original = VaultClass.prototype.broadcastEvm as unknown as (
@@ -1109,7 +1111,14 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       return original.apply(vault, a);
     } as never);
     try {
-      await run({ mined, sends, mode, bumpNonce: () => (nonce += 1) });
+      await run({
+        mined,
+        sends,
+        mode,
+        bumpNonce: (through?: number) => {
+          nonce = Math.max(nonce + 1, (through ?? -1) + 1);
+        },
+      });
     } finally {
       for (const sp of spies) sp.mockRestore();
       sendSpy.mockImplementation((async (
@@ -1256,7 +1265,7 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       reply = { kind: "ok", instruction: {} };
       const r = ref();
       expect((await signMint(r)).status).toBe(202);
-      chain.bumpNonce(); // someone else's tx used our nonce
+      chain.bumpNonce((await queueRowByRef(r)).tx!.signedNonce!); // someone else's tx used our nonce
       chain.mode.send = "ok";
       chain.mode.observe = "ok";
       const sendsBefore = chain.sends.length;
@@ -1305,7 +1314,7 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       expect((await signMint(r)).status).toBe(202);
       const { tx } = await queueRowByRef(r);
       const scope = { tenantId: tx!.tenantId, agentId: tx!.agentId, txId: tx!.id };
-      chain.bumpNonce();
+      chain.bumpNonce(tx!.signedNonce!);
       chain.mode.send = "ok";
       chain.mode.observe = "ok";
       chain.mode.depth = "shallow";
@@ -1319,6 +1328,93 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       expect(chain.sends.length).toBe(sendsBefore);
       expect(chain.mined.size).toBe(0);
     });
+  });
+
+  it("[H1-nonce] two outstanding claims for the same signer get DISTINCT nonces (persisted reservation, not RPC pending)", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "crash_before"; // neither is mined: RPC pending stays put
+      chain.mode.observe = "down";
+      reply = { kind: "ok", instruction: {} };
+      const a = ref();
+      const b = ref();
+      expect((await signMint(a)).status).toBe(202);
+      expect((await signMint(b)).status).toBe(202);
+      const ta = (await queueRowByRef(a)).tx!;
+      const tb = (await queueRowByRef(b)).tx!;
+      expect(ta.signedNonce).not.toBeNull();
+      expect(tb.signedNonce).toBe(ta.signedNonce! + 1);
+      chain.mode.send = "ok";
+      chain.mode.observe = "ok";
+      for (const t of [ta, tb]) {
+        await vault.reconcileProtectedTransaction({
+          tenantId: t.tenantId,
+          agentId: t.agentId,
+          txId: t.id,
+        });
+      }
+      expect(chain.mined.size).toBe(2);
+    });
+  });
+
+  it("[(b)] signing section: a signed row already exists under the lock -> no key use for a second permit", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "crash_before";
+      chain.mode.observe = "down";
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      expect((await signMint(r)).status).toBe(202);
+      const t = (await queueRowByRef(r)).tx!;
+      expect(t.signedRaw).not.toBeNull();
+      let keyUses = 0;
+      await expect(
+        runProtectedSigningSection(
+          {
+            tenantId: t.tenantId,
+            agentId: t.agentId,
+            txId: t.id,
+            chainId: t.chainId,
+            to: t.toAddress,
+            data: t.data,
+            signer: t.signerAddress!,
+          },
+          async () => {
+            keyUses += 1;
+          },
+        ),
+      ).rejects.toThrow(/signed transaction already exists/);
+      expect(keyUses).toBe(0);
+      expect((await queueRowByRef(r)).tx!.signedRaw).toBe(t.signedRaw);
+    });
+  });
+
+  it("[H4] signing section: suspension committed before the lock -> refused before key use", async () => {
+    const { r, txId } = await outstandingReadbackPermit();
+    const t = (await queueRowByRef(r)).tx!;
+    expect((await post("/protected-minter/suspend", { reason: "incident" })).status).toBe(200);
+    let keyUses = 0;
+    try {
+      await expect(
+        runProtectedSigningSection(
+          {
+            tenantId: TENANT,
+            agentId: AGENT,
+            txId,
+            chainId: 8453,
+            to: t.toAddress,
+            data: t.data,
+            signer: signerAddress,
+          },
+          async () => {
+            keyUses += 1;
+          },
+        ),
+      ).rejects.toBeInstanceOf(ProtectedKeyUseReleasedError);
+      expect(keyUses).toBe(0);
+      const { q } = await queueRowByRef(r);
+      expect(q!.issuanceClaimedAt).not.toBeNull();
+    } finally {
+      expect((await post("/protected-minter/resume")).status).toBe(200);
+    }
   });
 
   it("[M8] the readback path never touches the human approve route; the agent token still cannot approve", async () => {

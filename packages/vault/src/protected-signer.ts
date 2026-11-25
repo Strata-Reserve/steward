@@ -23,7 +23,7 @@ import {
   protectedMinterTokens,
   transactions,
 } from "@stwd/db";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { keccak256, stringToHex } from "viem";
 
 export interface ProtectedTransactionShape {
@@ -236,7 +236,7 @@ const permits = new Map<string, Permit>();
  * the same DB transaction that inserted the read-back approval, so insert,
  * approval and claim commit (or roll back) together.
  */
-type DbExecutor =
+export type DbExecutor =
   | ReturnType<typeof getDb>
   | Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
 
@@ -599,7 +599,95 @@ export async function authorizeProtectedKeyUse(input: {
   to: string;
   data?: string | null;
 }): Promise<void> {
-  const outcome = await getDb().transaction(async (tx) => {
+  const outcome = await getDb().transaction((tx) => checkProtectedKeyUse(tx, input));
+  if (outcome?.released) throw new ProtectedKeyUseReleasedError(outcome.refuse);
+  if (outcome) throw new ProtectedSignerError(outcome.refuse);
+}
+
+type KeyUseInput = {
+  tenantId: string;
+  agentId: string;
+  txId: string;
+  chainId: number;
+  to: string;
+  data?: string | null;
+};
+type KeyUseRefusal = { refuse: string; released: boolean } | null;
+
+/**
+ * STRATA-1673 H1-nonce / H4 / (b): THE protected signing critical section.
+ *
+ * One DB transaction, exclusive per (chain, signer address) via
+ * `pg_advisory_xact_lock` (same pattern as the audit chain lock), held across:
+ *   1. the brake re-check (controls / approval / admission row locks),
+ *   2. "no signed row exists for this transaction" (row locked FOR UPDATE),
+ *   3. nonce floor = highest non-terminal persisted nonce for chain+signer + 1
+ *      (the caller takes max(floor, RPC pending)),
+ *   4. local key use and the signed-row write (`fn`, on the same executor).
+ * Commit happens when `fn` returns; the caller sends only AFTER commit.
+ * A suspend/revoke attempted while this runs blocks on the row locks until
+ * the signed row is durable; one committed earlier refuses before key use.
+ * A second permit after the TTL can only sign if, under this lock, no signed
+ * row exists: a stale signer still in flight holds the lock, so at most one
+ * key use per claim.
+ */
+export async function runProtectedSigningSection<T>(
+  input: KeyUseInput & { signer: string },
+  fn: (exec: DbExecutor, nonceFloor: number) => Promise<T>,
+): Promise<T> {
+  const signer = input.signer.toLowerCase();
+  const result = await getDb().transaction(async (tx) => {
+    await tx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtextextended(${`steward_protected_signer:${input.chainId}:${signer}`}, 0))`,
+    );
+    const refusal = await checkProtectedKeyUse(tx, input);
+    if (refusal) return { refusal, value: undefined };
+    const [row] = await tx
+      .select({ status: transactions.status, signedRaw: transactions.signedRaw })
+      .from(transactions)
+      .where(
+        and(
+          eq(transactions.id, input.txId),
+          eq(transactions.tenantId, input.tenantId),
+          eq(transactions.agentId, input.agentId),
+        ),
+      )
+      .for("update");
+    if (row && (row.signedRaw || row.status !== "pending")) {
+      return {
+        refusal: {
+          refuse:
+            "a signed transaction already exists for this claim; resolve via executionRef lookup",
+          released: false,
+        },
+        value: undefined,
+      };
+    }
+    const [floor] = await tx
+      .select({
+        max: sql<string | number | null>`max(${transactions.signedNonce})`,
+      })
+      .from(transactions)
+      .where(
+        and(
+          eq(transactions.chainId, input.chainId),
+          sql`lower(${transactions.signerAddress}) = ${signer}`,
+          sql`${transactions.signedRaw} IS NOT NULL`,
+          inArray(transactions.status, ["pending", "signed", "broadcast"]),
+        ),
+      );
+    const nonceFloor = floor?.max === null || floor?.max === undefined ? 0 : Number(floor.max) + 1;
+    return { refusal: null as KeyUseRefusal, value: await fn(tx, nonceFloor) };
+  });
+  if (result.refusal) {
+    if (result.refusal.released) throw new ProtectedKeyUseReleasedError(result.refusal.refuse);
+    throw new ProtectedSignerError(result.refusal.refuse);
+  }
+  return result.value as T;
+}
+
+async function checkProtectedKeyUse(tx: DbExecutor, input: KeyUseInput): Promise<KeyUseRefusal> {
+  {
     const control = await lockProtectedControls(tx, input.tenantId, input.agentId);
     const [q] = await tx
       .select({
@@ -671,7 +759,5 @@ export async function authorizeProtectedKeyUse(input: {
       };
     }
     return null;
-  });
-  if (outcome?.released) throw new ProtectedKeyUseReleasedError(outcome.refuse);
-  if (outcome) throw new ProtectedSignerError(outcome.refuse);
+  }
 }

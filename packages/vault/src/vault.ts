@@ -54,8 +54,10 @@ import {
   authorizeProtectedKeyUse,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
+  type DbExecutor,
   getProtectedSignerGuard,
   ProtectedSignerError,
+  runProtectedSigningSection,
 } from "./protected-signer";
 import {
   generateSolanaKeypair,
@@ -336,6 +338,13 @@ export interface ProtectedSignedTx {
   hash: `0x${string}`;
   nonce: number;
 }
+/**
+ * STRATA-1673: runs `sign(nonceFloor)` (local key use) and persists its result
+ * inside the exclusive protected signing section; resolves after commit.
+ */
+export type ProtectedSection = (
+  sign: (nonceFloor: number) => Promise<ProtectedSignedTx>,
+) => Promise<ProtectedSignedTx>;
 export interface ProtectedChainObservation {
   latestNonce: number;
   /**
@@ -996,13 +1005,36 @@ export class Vault {
 
           // STRATA-1673 H1: the protected signer records the exact signed
           // bytes, nonce and hash on its transactions row BEFORE sending.
-          const persist =
+          // STRATA-1673 H1-nonce/H4/(b): prepare, nonce, key use and the
+          // signed-row write all run inside ONE exclusive per-(chain, signer)
+          // DB transaction that also re-checks the brakes; send is after commit.
+          const persist: ProtectedSection | undefined =
             protectedExpectedAddress !== null && options.txId
-              ? (signed: ProtectedSignedTx) =>
-                  this.persistProtectedSigned(
-                    { tenantId: request.tenantId, agentId: request.agentId, txId: options.txId! },
-                    signed,
-                    account.address,
+              ? (sign) =>
+                  runProtectedSigningSection(
+                    {
+                      tenantId: request.tenantId,
+                      agentId: request.agentId,
+                      txId: options.txId!,
+                      chainId,
+                      to: request.to,
+                      data: request.data,
+                      signer: account.address,
+                    },
+                    async (exec, nonceFloor) => {
+                      const signed = await sign(nonceFloor);
+                      await this.persistProtectedSigned(
+                        {
+                          tenantId: request.tenantId,
+                          agentId: request.agentId,
+                          txId: options.txId!,
+                        },
+                        signed,
+                        account.address,
+                        exec,
+                      );
+                      return signed;
+                    },
                   )
               : undefined;
           hash = await this.broadcastEvm(
@@ -1101,7 +1133,7 @@ export class Vault {
       gas?: bigint;
       chainId: number;
     },
-    persist?: (signed: ProtectedSignedTx) => Promise<void>,
+    persist?: ProtectedSection,
   ): Promise<`0x${string}`> {
     if (!persist) {
       return client.sendTransaction({
@@ -1116,12 +1148,16 @@ export class Vault {
     // persist leaves a resumable row; reconciliation never re-signs.
     const account = client.account as LocalAccount | undefined;
     if (!account?.signTransaction) throw new Error("protected broadcast requires a local account");
-    const prepared = await this.prepareProtectedEvm(client, tx);
-    const raw = await account.signTransaction(prepared, {
-      serializer: client.chain?.serializers?.transaction,
-    } as never);
-    const hash = keccak256(raw);
-    await persist({ raw, hash, nonce: Number(prepared.nonce) });
+    const { raw, hash } = await persist(async (nonceFloor) => {
+      const prepared = await this.prepareProtectedEvm(client, tx);
+      // Nonce = max(RPC pending, highest non-terminal persisted nonce + 1),
+      // allocated under the per-signer lock: outstanding claims never collide.
+      const nonce = Math.max(Number(prepared.nonce), nonceFloor);
+      const raw = await account.signTransaction({ ...prepared, nonce }, {
+        serializer: client.chain?.serializers?.transaction,
+      } as never);
+      return { raw, hash: keccak256(raw), nonce };
+    });
     const sent = await this.sendRawEvm(client, raw);
     if (sent.toLowerCase() !== hash.toLowerCase()) {
       throw new Error("RPC acknowledged a different transaction hash than the signed bytes");
@@ -1203,8 +1239,9 @@ export class Vault {
     scope: { tenantId: string; agentId: string; txId: string },
     signed: ProtectedSignedTx,
     signer: string,
+    exec: DbExecutor = getDb(),
   ): Promise<void> {
-    const rows = await getDb()
+    const rows = await exec
       .update(transactions)
       .set({
         status: "signed",
