@@ -31,6 +31,8 @@ import {
   http,
   keccak256,
   type LocalAccount,
+  TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
   type TransactionSerializable,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -195,6 +197,13 @@ export function assertChainRpcReady(
 
 const RPC_REDACTED = "[redacted-rpc-endpoint]";
 
+/**
+ * STRATA-1673 H1: confirmation depth (receipt block = 1) at which a consumed
+ * signer nonce proves our signed tx was replaced. Mirrors the admission depth
+ * (api PROTECTED_ADMISSION_MIN_CONFIRMATIONS).
+ */
+export const PROTECTED_TERMINAL_DEPTH = 10;
+
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -329,6 +338,13 @@ export interface ProtectedSignedTx {
 }
 export interface ProtectedChainObservation {
   latestNonce: number;
+  /**
+   * STRATA-1673 H1: signer nonce at the admission confirmation depth
+   * (head - PROTECTED_TERMINAL_DEPTH + 1). Only a nonce consumed this deep
+   * by a different hash is proof of replacement; anything shallower may be
+   * propagation lag or a reorg.
+   */
+  nonceAtDepth: number;
   receipt: "success" | "reverted" | null;
   known: boolean;
 }
@@ -1146,6 +1162,8 @@ export class Vault {
   /**
    * H1 seam: what the chain knows about `hash`. Nonce is read FIRST so a
    * consumed nonce without our receipt really means another transaction.
+   * STRATA-1673 H1: only a definitive not-found counts as absence; any other
+   * RPC error propagates (the caller treats it as UNKNOWN, never absence).
    */
   protected async observeProtectedTx(
     chainId: number,
@@ -1154,14 +1172,26 @@ export class Vault {
   ): Promise<ProtectedChainObservation> {
     const rpcUrl = requireEvmRpcUrl(chainId, this.config);
     const pc = createPublicClient({ chain: CHAINS[chainId], transport: http(rpcUrl) });
+    const head = await pc.getBlockNumber();
+    const depthBlock = head - BigInt(PROTECTED_TERMINAL_DEPTH - 1);
+    const nonceAtDepth =
+      depthBlock < 0n
+        ? 0
+        : await pc.getTransactionCount({ address: signer, blockNumber: depthBlock });
     const latestNonce = await pc.getTransactionCount({ address: signer, blockTag: "latest" });
-    const receipt = await pc.getTransactionReceipt({ hash }).catch(() => null);
-    if (receipt) return { latestNonce, receipt: receipt.status, known: true };
+    const receipt = await pc.getTransactionReceipt({ hash }).catch((e: unknown) => {
+      if (e instanceof TransactionReceiptNotFoundError) return null;
+      throw e;
+    });
+    if (receipt) return { latestNonce, nonceAtDepth, receipt: receipt.status, known: true };
     const known = await pc
       .getTransaction({ hash })
       .then(() => true)
-      .catch(() => false);
-    return { latestNonce, receipt: null, known };
+      .catch((e: unknown) => {
+        if (e instanceof TransactionNotFoundError) return false;
+        throw e;
+      });
+    return { latestNonce, nonceAtDepth, receipt: null, known };
   }
 
   /**
@@ -1253,10 +1283,19 @@ export class Vault {
       if (!row.sentAt) await db.update(transactions).set({ sentAt: now }).where(where);
       return "sent";
     }
-    if (obs.latestNonce > row.signedNonce) {
-      await db.update(transactions).set({ status: "failed" }).where(where);
-      return "nonce_consumed";
+    // STRATA-1673 H1: terminal `failed` only when, at the admission
+    // confirmation depth, this signer's nonce is consumed and our hash is
+    // neither mined nor known. A shallower consumption may still be our tx
+    // propagating (or a reorg): stay signed, do not retransmit, retry later.
+    if (obs.nonceAtDepth > row.signedNonce) {
+      const rows = await db
+        .update(transactions)
+        .set({ status: "failed" })
+        .where(and(where, inArray(transactions.status, ["pending", "signed"])))
+        .returning({ id: transactions.id });
+      return rows.length === 1 ? "nonce_consumed" : "unknown";
     }
+    if (obs.latestNonce > row.signedNonce) return "unknown";
     try {
       const chain = CHAINS[row.chainId];
       const client = createWalletClient({

@@ -1015,7 +1015,11 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     run: (chain: {
       mined: Map<string, string>; // hash -> raw
       sends: string[]; // every raw handed to sendRawEvm
-      mode: { send: "ok" | "crash_before" | "lost_ack"; observe: "ok" | "down" };
+      mode: {
+        send: "ok" | "crash_before" | "lost_ack";
+        observe: "ok" | "down";
+        depth: "deep" | "shallow";
+      };
       bumpNonce: () => void;
     }) => Promise<void>,
   ) {
@@ -1028,6 +1032,9 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     const mode = {
       send: "ok" as "ok" | "crash_before" | "lost_ack",
       observe: "ok" as "ok" | "down",
+      // "shallow": the latest nonce moved but nothing is yet at the
+      // confirmation depth (propagation lag / reorg window).
+      depth: "deep" as "deep" | "shallow",
     };
     const spies = [
       spyOn(vault as never, "prepareProtectedEvm" as never).mockImplementation((async (
@@ -1067,6 +1074,7 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
         const h = hash.toLowerCase();
         return {
           latestNonce: nonce,
+          nonceAtDepth: mode.depth === "shallow" ? 0 : nonce,
           receipt: mined.has(h) ? "success" : null,
           known: mined.has(h),
         };
@@ -1234,6 +1242,57 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
       expect(chain.mined.size).toBe(0);
       const { q } = await queueRowByRef(r);
       expect(q!.issuanceClaimedAt).not.toBeNull();
+    });
+  });
+
+  it("[H1] RPC error during reconcile is UNKNOWN: row stays signed (never failed), later recovers to exactly one mint", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "crash_before";
+      chain.mode.observe = "down";
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      expect((await signMint(r)).status).toBe(202);
+      const { tx } = await queueRowByRef(r);
+      const scope = { tenantId: tx!.tenantId, agentId: tx!.agentId, txId: tx!.id };
+      for (let i = 0; i < 3; i++) {
+        expect(await vault.reconcileProtectedTransaction(scope)).toBe("unknown");
+      }
+      const mid = (await queueRowByRef(r)).tx!;
+      expect(mid.status).toBe("signed");
+      expect(mid.signedRaw).toBe(tx!.signedRaw);
+      chain.mode.send = "ok";
+      chain.mode.observe = "ok";
+      expect(await vault.reconcileProtectedTransaction(scope)).toBe("sent");
+      expect(await vault.reconcileProtectedTransaction(scope)).toBe("confirmed");
+      expect(chain.mined.size).toBe(1);
+      expect(new Set(chain.sends).size).toBe(1);
+      const { q } = await queueRowByRef(r);
+      expect(q!.issuanceClaimedAt).not.toBeNull();
+    });
+  });
+
+  it("[H1] nonce consumed above the confirmation depth only: stays signed, not failed, not resent", async () => {
+    await withFakeChain(async (chain) => {
+      chain.mode.send = "crash_before";
+      chain.mode.observe = "down";
+      reply = { kind: "ok", instruction: {} };
+      const r = ref();
+      expect((await signMint(r)).status).toBe(202);
+      const { tx } = await queueRowByRef(r);
+      const scope = { tenantId: tx!.tenantId, agentId: tx!.agentId, txId: tx!.id };
+      chain.bumpNonce();
+      chain.mode.send = "ok";
+      chain.mode.observe = "ok";
+      chain.mode.depth = "shallow";
+      const sendsBefore = chain.sends.length;
+      expect(await vault.reconcileProtectedTransaction(scope)).toBe("unknown");
+      expect((await queueRowByRef(r)).tx!.status).toBe("signed");
+      expect(chain.sends.length).toBe(sendsBefore);
+      chain.mode.depth = "deep";
+      expect(await vault.reconcileProtectedTransaction(scope)).toBe("nonce_consumed");
+      expect((await queueRowByRef(r)).tx!.status).toBe("failed");
+      expect(chain.sends.length).toBe(sendsBefore);
+      expect(chain.mined.size).toBe(0);
     });
   });
 
