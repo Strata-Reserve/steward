@@ -11,7 +11,7 @@ import {
   issueProtectedSigningPermit,
   ProtectedKeyUseReleasedError,
 } from "@stwd/vault";
-import { and, eq } from "drizzle-orm";
+import { and, eq, notInArray } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import { enforceRateLimit, recordVaultSpend } from "../middleware/redis-enforcement";
 import { trackAuditEvent } from "../services/audit";
@@ -540,24 +540,28 @@ async function tryReadbackAutoSign(
         protectedReviewDigest: input.reviewDigest,
       },
     );
-    await db
-      .update(transactions)
-      .set({ status: "signed", txHash, signedAt: resolvedAt })
-      .where(eq(transactions.id, input.txId));
-    dispatchWebhook(input.tenantId, input.agentId, "tx_signed", { txId: input.txId, txHash });
+    const post = await recordProtectedPostSend(input.txId, txHash, resolvedAt);
+    if (post.won) {
+      dispatchWebhook(input.tenantId, input.agentId, "tx_signed", { txId: input.txId, txHash });
+    }
+    const ok = post.status !== "failed";
     return {
       kind: "response",
-      response: c.json<ApiResponse>({
-        ok: true,
-        data: {
-          txId: input.txId,
-          txHash,
-          executionRef: input.executionRef,
-          status: "signed",
-          approvalSource: "issuance_readback",
-          instructionDigest,
+      response: c.json<ApiResponse>(
+        {
+          ok,
+          ...(ok ? {} : { error: "Transaction failed" }),
+          data: {
+            txId: input.txId,
+            txHash: post.txHash,
+            executionRef: input.executionRef,
+            status: post.status,
+            approvalSource: "issuance_readback",
+            instructionDigest,
+          },
         },
-      }),
+        ok ? 200 : 500,
+      ),
     };
   } catch (e: unknown) {
     // STRATA-1673 H4: a brake (suspension) refused key use BEFORE any
@@ -615,6 +619,31 @@ async function tryReadbackAutoSign(
       response: c.json<ApiResponse>({ ok: false, error: sanitizeErrorMessage(e) }, 500),
     };
   }
+}
+
+/**
+ * STRATA-1673 F3: the monotonic post-send status write. Moves the row to
+ * `signed` only from a non-terminal status; a row a concurrent lookup already
+ * resolved to confirmed/failed is never moved back. Returns the DURABLE
+ * status and hash; `won` is false when the guard lost (caller must not emit
+ * a stale `tx_signed`).
+ */
+export async function recordProtectedPostSend(
+  txId: string,
+  txHash: string,
+  signedAt: Date,
+): Promise<{ won: boolean; status: TransactionRow["status"]; txHash: string }> {
+  const won = await db
+    .update(transactions)
+    .set({ status: "signed", txHash, signedAt })
+    .where(and(eq(transactions.id, txId), notInArray(transactions.status, ["confirmed", "failed"])))
+    .returning({ id: transactions.id });
+  if (won.length === 1) return { won: true, status: "signed", txHash };
+  const [cur] = await db
+    .select({ status: transactions.status, txHash: transactions.txHash })
+    .from(transactions)
+    .where(eq(transactions.id, txId));
+  return { won: false, status: cur?.status ?? "signed", txHash: cur?.txHash ?? txHash };
 }
 
 /**
@@ -707,11 +736,10 @@ async function recoverProtectedAction(row: TransactionRow): Promise<TransactionR
                 protectedReviewDigest: q.reviewDigest,
               },
             );
-            await db
-              .update(transactions)
-              .set({ status: "signed", txHash, signedAt: new Date() })
-              .where(eq(transactions.id, row.id));
-            dispatchWebhook(row.tenantId, row.agentId, "tx_signed", { txId: row.id, txHash });
+            const post = await recordProtectedPostSend(row.id, txHash, new Date());
+            if (post.won) {
+              dispatchWebhook(row.tenantId, row.agentId, "tx_signed", { txId: row.id, txHash });
+            }
           } catch (e) {
             discardProtectedSigningPermit(permit);
             if (!(e instanceof ProtectedKeyUseReleasedError)) {
@@ -885,10 +913,7 @@ async function handleProtectedApprove(
         protectedReviewDigest: queue.reviewDigest,
       },
     );
-    await db
-      .update(transactions)
-      .set({ status: "signed", txHash, signedAt: resolvedAt })
-      .where(eq(transactions.id, txId));
+    const post = await recordProtectedPostSend(txId, txHash, resolvedAt);
     trackAuditEvent({
       tenantId,
       actorType: "user",
@@ -907,11 +932,23 @@ async function handleProtectedApprove(
       userAgent: c.req.header("user-agent") ?? null,
       requestId: c.get("requestId") ?? null,
     });
-    dispatchWebhook(tenantId, agentId, "tx_signed", { txId, txHash });
-    return c.json<ApiResponse<{ txId: string; txHash: string; executionRef: string }>>({
-      ok: true,
-      data: { txId, txHash, executionRef: transaction.executionRef },
-    });
+    if (post.won) dispatchWebhook(tenantId, agentId, "tx_signed", { txId, txHash });
+    const ok = post.status !== "failed";
+    return c.json<
+      ApiResponse<{ txId: string; txHash: string; executionRef: string; status: string }>
+    >(
+      {
+        ok,
+        ...(ok ? {} : { error: "Transaction failed" }),
+        data: {
+          txId,
+          txHash: post.txHash,
+          executionRef: transaction.executionRef,
+          status: post.status,
+        },
+      },
+      ok ? 200 : 500,
+    );
   } catch (e: unknown) {
     // Same fail-closed rule as #24: the claim is consumed and never released.
     const requestId = c.get("requestId") || "unknown";

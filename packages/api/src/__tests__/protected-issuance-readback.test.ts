@@ -1347,6 +1347,36 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     });
   });
 
+  it("[F3] lookup stores confirmed before the sender's ack handler runs -> row stays confirmed, response reports confirmed", async () => {
+    const r = ref();
+    sendSpy.mockImplementationOnce((async (
+      _c: unknown,
+      tx: { to: string; data?: string; chainId: number },
+    ) => {
+      signed.push(tx);
+      const h = `0x${signed.length.toString(16).padStart(64, "0")}`;
+      // A by-ref lookup resolves the receipt and commits `confirmed` while
+      // the original sender is still between send and its ack handling.
+      const { tx: row } = await queueRowByRef(r);
+      await getDb()
+        .update(transactions)
+        .set({ status: "confirmed", txHash: h, confirmedAt: new Date() })
+        .where(eq(transactions.id, row!.id));
+      return h;
+    }) as never);
+    reply = { kind: "ok", instruction: {} };
+    const before = signed.length;
+    const res = await signMint(r);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.data.status).toBe("confirmed");
+    expect(signed.length).toBe(before + 1);
+    const { tx } = await queueRowByRef(r);
+    expect(tx!.status).toBe("confirmed");
+    expect(tx!.confirmedAt).not.toBeNull();
+    expect(tx!.txHash).toBe(body.data.txHash);
+  });
+
   it("[F1] nonce advanced but hash index misses our tx and no other hash is positively identified -> stays signed, never failed", async () => {
     await withFakeChain(async (chain) => {
       chain.mode.send = "crash_before";

@@ -21,7 +21,7 @@ import type {
   TxStatus,
 } from "@stwd/shared";
 import { toCaip2 } from "@stwd/shared";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import {
   type Chain,
   createPublicClient,
@@ -1112,6 +1112,9 @@ export class Vault {
           signedAt,
           ...(protectedSentAt ? { sentAt: protectedSentAt } : {}),
         },
+        // STRATA-1673 F3: post-send writes are monotonic. A row a concurrent
+        // lookup already resolved to confirmed/failed is never moved back.
+        setWhere: notInArray(transactions.status, ["confirmed", "failed"]),
       });
 
     return hash;
@@ -1342,19 +1345,31 @@ export class Vault {
       return "unknown";
     }
     const now = new Date();
+    // STRATA-1673 F3: terminal writes only from a non-terminal row; never
+    // confirmed <-> failed. A lost guard reports the durable status.
+    const open = and(where, notInArray(transactions.status, ["confirmed", "failed"]));
+    const durable = async (): Promise<ProtectedReconcileOutcome> => {
+      const [cur] = await db
+        .select({ status: transactions.status })
+        .from(transactions)
+        .where(where);
+      return cur?.status === "confirmed" || cur?.status === "failed" ? cur.status : "unknown";
+    };
     if (obs.receipt === "success") {
-      await db
+      const won = await db
         .update(transactions)
         .set({ status: "confirmed", confirmedAt: now, sentAt: row.sentAt ?? now })
-        .where(where);
-      return "confirmed";
+        .where(open)
+        .returning({ id: transactions.id });
+      return won.length === 1 ? "confirmed" : durable();
     }
     if (obs.receipt === "reverted") {
-      await db
+      const won = await db
         .update(transactions)
         .set({ status: "failed", sentAt: row.sentAt ?? now })
-        .where(where);
-      return "failed";
+        .where(open)
+        .returning({ id: transactions.id });
+      return won.length === 1 ? "failed" : durable();
     }
     if (obs.known) {
       if (!row.sentAt) await db.update(transactions).set({ sentAt: now }).where(where);
