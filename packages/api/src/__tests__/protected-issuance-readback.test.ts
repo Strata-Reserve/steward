@@ -62,6 +62,14 @@ const EVENT_ABI = parseAbi([
   "event DealTokenDeployed(address indexed token, address indexed admin, address indexed minter, address deployer, string name, string symbol, bytes32 salt)",
 ]);
 
+const RESTRICTED_FACTORY_ABI = parseAbi([
+  "struct RoleConfig { address admin; address issuer; address operator; address pauser; }",
+  "function createRestrictedDealToken(string name, string symbol, uint8 decimals, RoleConfig roles, bytes32 salt) returns (address token)",
+]);
+const RESTRICTED_EVENT_ABI = parseAbi([
+  "event RestrictedDealTokenDeployed(address indexed token, address indexed admin, address indexed issuer, address operator, address pauser, address deployer, bytes32 salt, bytes32 versionId)",
+]);
+
 let app: Hono;
 let signerAddress: string;
 let ownerToken: string;
@@ -482,62 +490,207 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     expect(after!.issuanceClaimedAt).toBeNull();
   });
 
-  it("[M4] token deployed by Steward's own confirmed createDealToken is admitted automatically (no manifest edit, no restart) and auto-signs", async () => {
+  it("[M4/H2] token from Steward's own protected RestrictedDealToken deploy is admitted (receipt, event, depth, live roles); every negative is refused", async () => {
     const digestBefore = boundary.getProtectedMinterManifestDigest();
+    const OPERATOR = "0x00000000000000000000000000000000000000c1";
+    const PAUSER = "0x00000000000000000000000000000000000000c2";
+    const SALT = `0x${"11".repeat(32)}` as `0x${string}`;
+    const signer = signerAddress.toLowerCase();
     // Unknown token, no deploy evidence -> refused (not even queued).
     reply = { kind: "ok", instruction: { token: DEPLOYED_TOKEN } };
-    const refused = await signMint(ref(), DEPLOYED_TOKEN);
-    expect(refused.status).toBe(403);
+    expect((await signMint(ref(), DEPLOYED_TOKEN)).status).toBe(403);
 
-    // Steward's own protected createDealToken, broadcast with a hash.
-    const createData = encodeFunctionData({
-      abi: FACTORY_ABI,
-      functionName: "createDealToken",
-      args: ["Deal", "DL", SAFE, signerAddress as `0x${string}`, `0x${"11".repeat(32)}`],
-    });
-    await getDb().insert(transactions).values({
-      id: crypto.randomUUID(),
-      agentId: AGENT,
-      tenantId: TENANT,
-      executionRef: "tokenization:deploy:1",
-      status: "signed",
-      toAddress: FACTORY,
-      value: "0",
-      data: createData,
-      chainId: 8453,
-      txHash: DEPLOY_HASH,
-      policyResults: [],
-    });
-    const topics = encodeEventTopics({
+    // Legacy DealToken: Steward's own createDealToken + DealTokenDeployed + MINTER_ROLE.
+    const LEGACY_HASH = `0x${"1e".repeat(32)}`;
+    const legacyTxId = crypto.randomUUID();
+    await getDb()
+      .insert(transactions)
+      .values({
+        id: legacyTxId,
+        agentId: AGENT,
+        tenantId: TENANT,
+        executionRef: "tokenization:deploy:legacy",
+        status: "signed",
+        toAddress: FACTORY,
+        value: "0",
+        data: encodeFunctionData({
+          abi: FACTORY_ABI,
+          functionName: "createDealToken",
+          args: ["Deal", "DL", SAFE, signerAddress as `0x${string}`, SALT],
+        }),
+        chainId: 8453,
+        txHash: LEGACY_HASH,
+        policyResults: [],
+      });
+    const legacyTopics = encodeEventTopics({
       abi: EVENT_ABI,
       eventName: "DealTokenDeployed",
       args: { token: DEPLOYED_TOKEN, admin: SAFE, minter: signerAddress as `0x${string}` },
     });
-    const logData = encodeAbiParameters(parseAbiParameters("address, string, string, bytes32"), [
+    const legacyData = encodeAbiParameters(parseAbiParameters("address, string, string, bytes32"), [
       signerAddress as `0x${string}`,
       "Deal",
       "DL",
-      `0x${"11".repeat(32)}`,
+      SALT,
     ]);
-    let hasRole = false;
+
+    // Steward's own RestrictedDealToken deploy row.
+    const deployTxId = crypto.randomUUID();
+    await getDb()
+      .insert(transactions)
+      .values({
+        id: deployTxId,
+        agentId: AGENT,
+        tenantId: TENANT,
+        executionRef: "tokenization:deploy:1",
+        status: "signed",
+        toAddress: FACTORY,
+        value: "0",
+        data: encodeFunctionData({
+          abi: RESTRICTED_FACTORY_ABI,
+          functionName: "createRestrictedDealToken",
+          args: [
+            "Deal",
+            "DL",
+            18,
+            {
+              admin: SAFE,
+              issuer: signerAddress as `0x${string}`,
+              operator: OPERATOR,
+              pauser: PAUSER,
+            },
+            SALT,
+          ],
+        }),
+        chainId: 8453,
+        txHash: DEPLOY_HASH,
+        policyResults: [],
+      });
+    const rTopics = encodeEventTopics({
+      abi: RESTRICTED_EVENT_ABI,
+      eventName: "RestrictedDealTokenDeployed",
+      args: { token: DEPLOYED_TOKEN, admin: SAFE, issuer: signerAddress as `0x${string}` },
+    });
+    const rData = (deployer: string, versionId = boundary.RESTRICTED_FACTORY_VERSION_ID) =>
+      encodeAbiParameters(parseAbiParameters("address, address, address, bytes32, bytes32"), [
+        OPERATOR,
+        PAUSER,
+        deployer as `0x${string}`,
+        SALT,
+        versionId,
+      ]);
+
+    // Chain state the reader reports (mutated per negative case).
+    const st = {
+      from: signer,
+      deployer: signer,
+      versionId: boundary.RESTRICTED_FACTORY_VERSION_ID as `0x${string}`,
+      block: 100n,
+      head: 200n,
+      roles: new Set<string>(), // `${role}:${account}`
+    };
+    const grant = (role: string, account: string) => st.roles.add(`${role}:${account.toLowerCase()}`);
     const readerCalls: string[] = [];
     boundary.setProtectedChainReader({
-      async getReceipt(chainId, hash) {
-        readerCalls.push(`receipt:${chainId}:${hash}`);
-        return hash === DEPLOY_HASH
-          ? { status: "success", to: FACTORY, logs: [{ address: FACTORY, topics, data: logData }] }
-          : null;
+      async getReceipt(_chainId, hash) {
+        readerCalls.push(`receipt:${hash}`);
+        if (hash === LEGACY_HASH)
+          return {
+            status: "success",
+            to: FACTORY,
+            from: signer,
+            blockNumber: 50n,
+            logs: [{ address: FACTORY, topics: legacyTopics, data: legacyData }],
+          };
+        if (hash !== DEPLOY_HASH) return null;
+        return {
+          status: "success",
+          to: FACTORY,
+          from: st.from,
+          blockNumber: st.block,
+          logs: [{ address: FACTORY, topics: rTopics, data: rData(st.deployer, st.versionId) }],
+        };
       },
-      async hasMinterRole(chainId, token, account) {
-        readerCalls.push(`role:${chainId}:${token}:${account.toLowerCase()}`);
-        return hasRole;
+      async getBlockNumber() {
+        return st.head;
+      },
+      async hasRole(_chainId, _token, role, account) {
+        return st.roles.has(`${role}:${account.toLowerCase()}`);
       },
     });
+    const refusedNow = async (label: string) => {
+      const before = signed.length;
+      expect((await signMint(ref(), DEPLOYED_TOKEN)).status, label).toBe(403);
+      expect(signed.length, label).toBe(before);
+      const rows = await getDb()
+        .select()
+        .from(protectedMinterTokens)
+        .where(eq(protectedMinterTokens.tokenAddress, DEPLOYED_TOKEN));
+      expect(rows, label).toHaveLength(0);
+    };
     try {
-      // MINTER_ROLE not held -> not admitted.
-      expect((await signMint(ref(), DEPLOYED_TOKEN)).status).toBe(403);
-      expect(readerCalls).toContain(`role:8453:${DEPLOYED_TOKEN}:${signerAddress.toLowerCase()}`);
-      hasRole = true;
+      // Legacy row even with every role granted -> never admitted.
+      grant(boundary.MINTER_ROLE, signer);
+      grant(boundary.DEFAULT_ADMIN_ROLE, SAFE);
+      grant(boundary.ISSUER_ROLE, signer);
+      // Restricted deploy row WITHOUT a protected approval (not Steward's protected deploy).
+      await refusedNow("no protected approval binding");
+      expect(readerCalls).not.toContain(`receipt:${LEGACY_HASH}`);
+      await getDb()
+        .insert(approvalQueue)
+        .values({
+          id: crypto.randomUUID(),
+          txId: deployTxId,
+          agentId: AGENT,
+          status: "approved",
+          reviewDigest: DIGEST,
+          approvedByUserId: OWNER_USER,
+          issuanceClaimedAt: new Date(),
+        });
+      await getDb()
+        .insert(approvalQueue)
+        .values({
+          id: crypto.randomUUID(),
+          txId: legacyTxId,
+          agentId: AGENT,
+          status: "approved",
+          reviewDigest: DIGEST,
+          approvedByUserId: OWNER_USER,
+          issuanceClaimedAt: new Date(),
+        });
+      st.roles.clear();
+      // Unrelated deployer: receipt sender is someone else.
+      st.from = FOREIGN_TOKEN;
+      await refusedNow("receipt.from != signer");
+      st.from = signer;
+      // Event deployer differs.
+      st.deployer = FOREIGN_TOKEN;
+      await refusedNow("event deployer != signer");
+      st.deployer = signer;
+      // Untrusted factory version.
+      st.versionId = `0x${"99".repeat(32)}`;
+      await refusedNow("versionId mismatch");
+      st.versionId = boundary.RESTRICTED_FACTORY_VERSION_ID as `0x${string}`;
+      // Unconfirmed receipt (too shallow).
+      st.head = st.block + 2n;
+      grant(boundary.DEFAULT_ADMIN_ROLE, SAFE);
+      grant(boundary.ISSUER_ROLE, signer);
+      await refusedNow("unconfirmed receipt");
+      st.head = 200n;
+      // Missing roles.
+      st.roles.clear();
+      grant(boundary.ISSUER_ROLE, signer);
+      await refusedNow("Safe lacks DEFAULT_ADMIN_ROLE");
+      st.roles.clear();
+      grant(boundary.DEFAULT_ADMIN_ROLE, SAFE);
+      grant(boundary.MINTER_ROLE, signer); // legacy role is not ISSUER_ROLE
+      await refusedNow("signer lacks ISSUER_ROLE");
+      grant(boundary.ISSUER_ROLE, signer);
+      grant(boundary.DEFAULT_ADMIN_ROLE, signer);
+      await refusedNow("signer holds DEFAULT_ADMIN_ROLE");
+      st.roles.delete(`${boundary.DEFAULT_ADMIN_ROLE}:${signer}`);
+
+      // Everything holds -> admitted and auto-signed.
       const before = signed.length;
       const ok = await signMint(ref(), DEPLOYED_TOKEN);
       expect(ok.status).toBe(200);
@@ -557,6 +710,37 @@ describe.serial("STRATA-1673 S1 read-back auto-sign", () => {
     } finally {
       boundary.setProtectedChainReader(null);
     }
+  });
+
+  it("[H2] createRestrictedDealToken shape: Safe admin + signer issuer queues for a human; substitutions refused", async () => {
+    const OPERATOR = "0x00000000000000000000000000000000000000c1";
+    const PAUSER = "0x00000000000000000000000000000000000000c2";
+    const call = (roles: { admin: string; issuer: string; operator: string; pauser: string }) =>
+      sign({
+        to: FACTORY,
+        value: "0",
+        data: encodeFunctionData({
+          abi: RESTRICTED_FACTORY_ABI,
+          functionName: "createRestrictedDealToken",
+          args: ["Deal", "DL", 18, roles as never, `0x${"22".repeat(32)}`],
+        }),
+        chainId: 8453,
+        executionRef: ref(),
+      });
+    const good = { admin: SAFE, issuer: signerAddress, operator: OPERATOR, pauser: PAUSER };
+    const before = signed.length;
+    const ok = await call(good);
+    expect(ok.status).toBe(202); // deploys are never auto-signed
+    expect(((await ok.json()) as any).data.review.kind).toBe("createRestrictedDealToken");
+    for (const [label, roles] of [
+      ["admin not Safe", { ...good, admin: OPERATOR }],
+      ["issuer not signer", { ...good, issuer: OPERATOR }],
+      ["operator = signer", { ...good, operator: signerAddress }],
+      ["pauser = signer", { ...good, pauser: signerAddress }],
+    ] as const) {
+      expect((await call(roles)).status, label).toBe(403);
+    }
+    expect(signed.length).toBe(before);
   });
 
   it("[M5] revoke an admitted token -> next mint refused (human or readback), immediately, terminal", async () => {
