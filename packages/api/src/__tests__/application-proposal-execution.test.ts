@@ -661,25 +661,30 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
   });
   // ─── 84532 hard pin (prod-executor-38-finish) ────────────────────────────
 
-  it("env allowlist can only narrow the 84532 pin, never widen it", () => {
+  it("STRATA-1673 D1/D3: the env allowlist is the only chain gate (no code constant)", () => {
     const ids = executionsModule.applicationExecutionChainIds;
     const env = (v: string | undefined) => ({ STEWARD_APPLICATION_EXECUTION_CHAIN_IDS: v });
     expect([...ids(env(undefined))]).toEqual([]);
     expect([...ids(env(""))]).toEqual([]);
-    expect([...ids(env("8453"))]).toEqual([]);
-    expect([...ids(env("1,10,137,11155111,8453"))]).toEqual([]);
-    expect([...ids(env("8453, 84532 ,1"))]).toEqual([84532]);
-    expect([...ids(env("84532"))]).toEqual([84532]);
+    expect([...ids(env("8453"))]).toEqual([8453]);
+    expect([...ids(env("8453, 84532 ,1"))].sort((a, b) => a - b)).toEqual([1, 8453, 84532]);
     expect(() => ids(env("84532,base"))).toThrow();
-    expect(executionsModule.APPLICATION_EXECUTION_CHAIN_ID).toBe(84532);
+    expect(() => ids(env("0"))).toThrow();
+    expect((executionsModule as Record<string, unknown>).APPLICATION_EXECUTION_CHAIN_ID).toBe(
+      undefined,
+    );
+    const enabled = executionsModule.isApplicationExecutionChainEnabled;
+    expect(enabled(8453, env("8453"))).toBe(true);
+    expect(enabled(84532, env("8453"))).toBe(false);
+    expect(enabled(8453, env(""))).toBe(false);
   });
 
-  it("8453 and arbitrary chains are refused before any vault/key/RPC use, even when configured", async () => {
+  it("chains the deployment has not enabled are refused before any vault/key/RPC use", async () => {
     const issued = await issuePrincipal("party_inv_pin");
     const wallet = await ensureWallet(issued, "party_inv_pin");
     expect((await bind(issued.principal.id)).status).toBe(201);
     const previousEnv = process.env.STEWARD_APPLICATION_EXECUTION_CHAIN_IDS;
-    process.env.STEWARD_APPLICATION_EXECUTION_CHAIN_IDS = `${CHAIN},8453,1,11155111,2147483647`;
+    process.env.STEWARD_APPLICATION_EXECUTION_CHAIN_IDS = String(CHAIN);
     process.env.RPC_URL_8453 = "https://exec-gap-a-mainnet.invalid/v2/UNUSED";
     const rpcReady = spyOn(vault, "assertChainRpcReady");
     const sign = spyOn(vault, "signTransaction");
@@ -693,7 +698,7 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
         const sentBefore = sent.length;
         const r = await execute(issued.principal.id, proposalId, bearer(adminToken));
         expect(r.status, `chain ${chainId}`).toBe(403);
-        expect(((await r.json()) as any).data.code).toBe("chain_not_permitted");
+        expect(((await r.json()) as any).data.code).toBe("chain_not_enabled");
         expect(sent.length).toBe(sentBefore);
         expect(await executionRows(proposalId)).toHaveLength(0);
         expect(await reservationRows(proposalId)).toHaveLength(0);
@@ -712,9 +717,9 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
     }
   });
 
-  it("a non-84532 executor-signer binding is refused at creation and writes nothing", async () => {
+  it("an executor-signer binding for a chain the deployment has not enabled is refused and writes nothing", async () => {
     const issued = await issuePrincipal("party_inv_pin_bind");
-    process.env.STEWARD_APPLICATION_EXECUTION_CHAIN_IDS = `${CHAIN},8453`;
+    process.env.STEWARD_APPLICATION_EXECUTION_CHAIN_IDS = String(CHAIN);
     try {
       for (const chainId of [8453, 1, 10, 11155111]) {
         const r = await bind(issued.principal.id, [TOKEN], SIGNER, adminToken, chainId);
@@ -737,14 +742,14 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
           ),
         );
       expect(denied).toHaveLength(0);
-      // The pinned chain still binds normally afterwards.
+      // The enabled chain still binds normally afterwards.
       expect((await bind(issued.principal.id)).status).toBe(201);
     } finally {
       process.env.STEWARD_APPLICATION_EXECUTION_CHAIN_IDS = String(CHAIN);
     }
   });
 
-  it("the database refuses non-84532 binding and execution rows directly", async () => {
+  it("STRATA-1673 D5: the database refuses non-positive chain ids; any positive chain is a config decision", async () => {
     const refused = async (op: PromiseLike<unknown>) => {
       try {
         await op;
@@ -754,7 +759,7 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
       }
     };
     const issued = await issuePrincipal("party_inv_pin_db");
-    for (const chainId of [8453, 1, 0, -1]) {
+    for (const chainId of [0, -1]) {
       expect(
         await refused(
           getDb()
@@ -778,69 +783,28 @@ describe.serial("application proposal execution (STRATA-1515 exec gap A)", () =>
           .values({
             tenantId: TENANT,
             principalId: issued.principal.id,
-            chainId: CHAIN,
+            chainId: 8453,
             signerAgentId: SIGNER,
             allowedTargets: [TOKEN],
             createdBy: "test:direct-db",
           }),
       ),
     ).toBe(false);
-    // An existing 84532 binding cannot be re-pointed to 8453 (immutable).
+    // A binding stays immutable: it cannot be re-pointed to another chain.
     expect(
       await refused(
         getDb()
           .update(applicationExecutorSigners)
-          .set({ chainId: 8453 })
+          .set({ chainId: CHAIN })
           .where(eq(applicationExecutorSigners.principalId, issued.principal.id)),
       ),
     ).toBe(true);
-
-    // Execution rows: copy a real broadcast row's identity onto 8453.
     const [row] = await getDb()
       .select()
       .from(applicationProposalExecutions)
       .where(eq(applicationProposalExecutions.status, "broadcast"));
     expect(row).toBeDefined();
-    const wallet = await ensureWallet(issued, "party_inv_pin_db");
-    const proposalId = await propose(issued, wallet.id, { recipient: wallet.addresses.evm });
-    const txId = crypto.randomUUID();
-    await getDb()
-      .insert(transactions)
-      .values({
-        id: txId,
-        agentId: SIGNER,
-        tenantId: TENANT,
-        executionRef: `direct-db:${proposalId}`,
-        status: "approved",
-        toAddress: TOKEN,
-        value: "0",
-        chainId: 8453,
-      });
-    const base = {
-      id: `ape_${"d".repeat(40)}`,
-      tenantId: TENANT,
-      principalId: issued.principal.id,
-      proposalId,
-      signerAgentId: SIGNER,
-      transactionId: txId,
-      executionRef: `direct-db:${proposalId}`,
-      toAddress: TOKEN,
-      recipientAddress: wallet.addresses.evm.toLowerCase(),
-      amount: "1",
-      approvedBy: "test:direct-db",
-    };
-    for (const chainId of [8453, 1]) {
-      expect(
-        await refused(
-          getDb()
-            .insert(applicationProposalExecutions)
-            .values({ ...base, chainId }),
-        ),
-        `execution chain ${chainId}`,
-      ).toBe(true);
-    }
-    expect(await executionRows(proposalId)).toHaveLength(0);
-    // And an existing 84532 execution row can never be moved to 8453.
+    // An existing execution row can never be moved to another chain.
     expect(
       await refused(
         getDb()

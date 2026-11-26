@@ -13,15 +13,21 @@ export {
   assertProtectedPostureIntact,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
+  discardProtectedSigningPermit,
+  effectiveClaimAt,
   getProtectedSignerGuard,
   isPersistedProtected,
   isProtectedIssuanceClaimed,
   isProtectedSigner,
+  issueProtectedResumePermit,
   issueProtectedSigningPermit,
   isUndefinedColumn,
   outstandingProtectedPermits,
+  PROTECTED_PERMIT_TTL_MS,
+  ProtectedKeyUseReleasedError,
   ProtectedSignerError,
   registerProtectedSignerGuard,
+  runProtectedSigningSection,
 } from "./protected-signer";
 export type { MatchedRoute } from "./route-matcher";
 export {
@@ -61,7 +67,12 @@ export {
 } from "./user-wallet-config";
 export type { ReapplyRateLimitOptions, ReapplyRateLimitResult } from "./user-wallet-reapply";
 export { reapplyUserWalletRateLimit } from "./user-wallet-reapply";
-export type { VaultConfig } from "./vault";
+export type {
+  ProtectedChainObservation,
+  ProtectedReconcileOutcome,
+  ProtectedSignedTx,
+  VaultConfig,
+} from "./vault";
 export {
   assertChainRpcReady,
   chainRpcEnvKey,

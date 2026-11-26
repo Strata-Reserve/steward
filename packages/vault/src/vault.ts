@@ -21,13 +21,18 @@ import type {
   TxStatus,
 } from "@stwd/shared";
 import { toCaip2 } from "@stwd/shared";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import {
   type Chain,
   createPublicClient,
   createWalletClient,
   formatEther,
+  type Hex,
   http,
+  keccak256,
+  type LocalAccount,
+  TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
   type TransactionSerializable,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -48,8 +53,10 @@ import {
   assertProtectedPostureIntact,
   computeProtectedReviewDigest,
   consumeProtectedSigningPermit,
+  type DbExecutor,
   getProtectedSignerGuard,
   ProtectedSignerError,
+  runProtectedSigningSection,
 } from "./protected-signer";
 import {
   generateSolanaKeypair,
@@ -191,6 +198,13 @@ export function assertChainRpcReady(
 
 const RPC_REDACTED = "[redacted-rpc-endpoint]";
 
+/**
+ * STRATA-1673 H1: confirmation depth (receipt block = 1) at which a consumed
+ * signer nonce proves our signed tx was replaced. Mirrors the admission depth
+ * (api PROTECTED_ADMISSION_MIN_CONFIRMATIONS).
+ */
+export const PROTECTED_TERMINAL_DEPTH = 10;
+
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -316,6 +330,41 @@ function detectChainType(walletAddress: string): "evm" | "solana" {
 function resolveSolanaRpc(chainId?: number): string {
   return SOLANA_RPCS[chainId ?? 101] ?? SOLANA_RPCS[101];
 }
+
+/** STRATA-1673 H1: the durable record of one protected signature. */
+export interface ProtectedSignedTx {
+  raw: Hex;
+  hash: `0x${string}`;
+  nonce: number;
+}
+/**
+ * STRATA-1673: runs `sign(nonceFloor)` (local key use) and persists its result
+ * inside the exclusive protected signing section; resolves after commit.
+ */
+export type ProtectedSection = (
+  sign: (nonceFloor: number) => Promise<ProtectedSignedTx>,
+) => Promise<ProtectedSignedTx>;
+export interface ProtectedChainObservation {
+  latestNonce: number;
+  receipt: "success" | "reverted" | null;
+  known: boolean;
+  /**
+   * STRATA-1673 F1: the transaction POSITIVELY identified as canonically
+   * included for this signer + nonce (found in the block where the nonce was
+   * consumed, with its own receipt in that canonical block), and its
+   * confirmation count (inclusion block = 1). Null when not established.
+   * Only a hash different from ours at >= PROTECTED_TERMINAL_DEPTH proves
+   * replacement; negative lookups never do.
+   */
+  included: { hash: `0x${string}`; confirmations: number } | null;
+}
+export type ProtectedReconcileOutcome =
+  | "unsigned"
+  | "confirmed"
+  | "failed"
+  | "sent"
+  | "nonce_consumed"
+  | "unknown";
 
 export interface SignTransactionOptions {
   txId?: string;
@@ -766,7 +815,12 @@ export class Vault {
     // STRATA-1499 F1: persisted marker, independent of env. Fail closed.
     await assertProtectedPostureIntact(request.tenantId, request.agentId, "transaction signing");
 
-    const chainId = request.chainId || this.config.chainId || 8453;
+    // STRATA-1673 D8: no silent 8453 default. The chain is the request's or
+    // the configured network's; neither => refuse before any key use.
+    const chainId = request.chainId || this.config.chainId;
+    if (!chainId) {
+      throw new Error("chainId is required (no request chainId and no configured network)");
+    }
     // Determine chain family from chainId (101/102 = Solana)
     const isSolana = chainId === 101 || chainId === 102;
     const chainFamilyToUse = isSolana ? "solana" : "evm";
@@ -826,16 +880,23 @@ export class Vault {
       ) {
         throw new ProtectedSignerError("review digest does not match the bytes to be signed");
       }
-      const shape = guard.validateTransaction({
-        chainId,
-        to: request.to,
-        value: request.value,
-        data: request.data,
-      });
+      const shape = await guard.validateTransaction(
+        {
+          chainId,
+          to: request.to,
+          value: request.value,
+          data: request.data,
+        },
+        { tenantId: request.tenantId, agentId: request.agentId },
+      );
       if (!shape.ok) throw new ProtectedSignerError(shape.reason);
       if (agentRow.walletAddress.toLowerCase() !== protectedExpectedAddress.toLowerCase()) {
         throw new ProtectedSignerError("stored wallet address does not match the manifest pin");
       }
+      // STRATA-1673 H4/F2: brakes (and any suspension handoff) are checked
+      // ONLY inside the exclusive signing section, after the signed-row
+      // check, so a signed row can never be returned to the human queue.
+      if (!options.txId) throw new ProtectedSignerError("txId is required");
     }
 
     // ── Resolve the correct signing key ─────────────────────────────────
@@ -895,6 +956,7 @@ export class Vault {
     }
 
     let hash: string;
+    let protectedSentAt: Date | undefined;
 
     if (isSolana) {
       const rpcUrl = this.config.rpcUrl ?? resolveSolanaRpc(chainId);
@@ -935,13 +997,52 @@ export class Vault {
             transport: http(rpcUrl),
           });
 
-          hash = await this.broadcastEvm(client, {
-            to: request.to as `0x${string}`,
-            value: BigInt(request.value),
-            data: request.data as `0x${string}` | undefined,
-            gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
-            chainId,
-          });
+          // STRATA-1673 H1: the protected signer records the exact signed
+          // bytes, nonce and hash on its transactions row BEFORE sending.
+          // STRATA-1673 H1-nonce/H4/(b): prepare, nonce, key use and the
+          // signed-row write all run inside ONE exclusive per-(chain, signer)
+          // DB transaction that also re-checks the brakes; send is after commit.
+          const persist: ProtectedSection | undefined =
+            protectedExpectedAddress !== null && options.txId
+              ? (sign) =>
+                  runProtectedSigningSection(
+                    {
+                      tenantId: request.tenantId,
+                      agentId: request.agentId,
+                      txId: options.txId!,
+                      chainId,
+                      to: request.to,
+                      data: request.data,
+                      signer: account.address,
+                    },
+                    async (exec, nonceFloor) => {
+                      const signed = await sign(nonceFloor);
+                      await this.persistProtectedSigned(
+                        {
+                          tenantId: request.tenantId,
+                          agentId: request.agentId,
+                          txId: options.txId!,
+                        },
+                        signed,
+                        account.address,
+                        exec,
+                      );
+                      return signed;
+                    },
+                  )
+              : undefined;
+          hash = await this.broadcastEvm(
+            client,
+            {
+              to: request.to as `0x${string}`,
+              value: BigInt(request.value),
+              data: request.data as `0x${string}` | undefined,
+              gas: request.gasLimit ? BigInt(request.gasLimit) : undefined,
+              chainId,
+            },
+            persist,
+          );
+          if (persist) protectedSentAt = new Date();
         } else {
           // Sign without broadcasting - return the serialized signed transaction
           const publicClient = createPublicClient({
@@ -970,6 +1071,10 @@ export class Vault {
       } catch (err) {
         // STRATA-1499 (F2): viem embeds the transport URL in its errors.
         // Redact at the boundary so no caller can log/return the endpoint.
+        // STRATA-1673 F2: signing-section refusals (fixed messages, no
+        // endpoint) keep their type so callers can tell a released handoff
+        // from a signed-row refusal.
+        if (err instanceof ProtectedSignerError) throw err;
         throw redactRpcError(err, this.configuredRpcUrls());
       }
     }
@@ -991,6 +1096,7 @@ export class Vault {
         policyResults: options.policyResults ?? [],
         signedAt,
         createdAt: signedAt,
+        ...(protectedSentAt ? { sentAt: protectedSentAt } : {}),
       })
       .onConflictDoUpdate({
         target: transactions.id,
@@ -1004,7 +1110,11 @@ export class Vault {
           txHash: shouldBroadcast ? hash : undefined,
           policyResults: options.policyResults ?? [],
           signedAt,
+          ...(protectedSentAt ? { sentAt: protectedSentAt } : {}),
         },
+        // STRATA-1673 F3: post-send writes are monotonic. A row a concurrent
+        // lookup already resolved to confirmed/failed is never moved back.
+        setWhere: notInArray(transactions.status, ["confirmed", "failed"]),
       });
 
     return hash;
@@ -1024,13 +1134,278 @@ export class Vault {
       gas?: bigint;
       chainId: number;
     },
+    persist?: ProtectedSection,
   ): Promise<`0x${string}`> {
-    return client.sendTransaction({
+    if (!persist) {
+      return client.sendTransaction({
+        to: tx.to,
+        value: tx.value,
+        data: tx.data,
+        gas: tx.gas,
+      } as Parameters<typeof client.sendTransaction>[0]);
+    }
+    // STRATA-1673 H1: prepare (pending nonce, fees, gas) -> sign locally ->
+    // persist bytes/nonce/hash -> send those exact bytes. A failure after
+    // persist leaves a resumable row; reconciliation never re-signs.
+    const account = client.account as LocalAccount | undefined;
+    if (!account?.signTransaction) throw new Error("protected broadcast requires a local account");
+    const { raw, hash } = await persist(async (nonceFloor) => {
+      const prepared = await this.prepareProtectedEvm(client, tx);
+      // Nonce = max(RPC pending, highest non-terminal persisted nonce + 1),
+      // allocated under the per-signer lock: outstanding claims never collide.
+      const nonce = Math.max(Number(prepared.nonce), nonceFloor);
+      const raw = await account.signTransaction({ ...prepared, nonce }, {
+        serializer: client.chain?.serializers?.transaction,
+      } as never);
+      return { raw, hash: keccak256(raw), nonce };
+    });
+    const sent = await this.sendRawEvm(client, raw);
+    if (sent.toLowerCase() !== hash.toLowerCase()) {
+      throw new Error("RPC acknowledged a different transaction hash than the signed bytes");
+    }
+    return hash;
+  }
+
+  /** H1 seam: fill nonce (pending), fees and gas exactly as sendTransaction would. */
+  protected async prepareProtectedEvm(
+    client: ReturnType<typeof createWalletClient>,
+    tx: { to: `0x${string}`; value: bigint; data?: `0x${string}`; gas?: bigint; chainId: number },
+  ): Promise<TransactionSerializable & { nonce: number }> {
+    const prepared = (await client.prepareTransactionRequest({
+      account: client.account!,
+      chain: client.chain,
       to: tx.to,
       value: tx.value,
       data: tx.data,
       gas: tx.gas,
-    } as Parameters<typeof client.sendTransaction>[0]);
+    } as never)) as unknown as Record<string, unknown>;
+    const { account: _a, chain: _c, from: _f, parameters: _p, ...rest } = prepared;
+    return {
+      ...(rest as TransactionSerializable),
+      chainId: tx.chainId,
+    } as TransactionSerializable & {
+      nonce: number;
+    };
+  }
+
+  /** H1 seam: hand already-signed bytes to the network. */
+  protected async sendRawEvm(
+    client: ReturnType<typeof createWalletClient>,
+    raw: Hex,
+  ): Promise<`0x${string}`> {
+    return client.sendRawTransaction({ serializedTransaction: raw });
+  }
+
+  /**
+   * H1 seam: what the chain knows about `hash`.
+   * STRATA-1673 H1: only a definitive not-found counts as absence; any other
+   * RPC error propagates (the caller treats it as UNKNOWN, never absence).
+   * STRATA-1673 F1: when our hash is unseen but the signer's nonce is
+   * consumed, locate the block that consumed `nonce`, find the signer's
+   * transaction at that nonce in it, and read ITS receipt from that same
+   * canonical block. Anything short of that leaves `included` null.
+   */
+  protected async observeProtectedTx(
+    chainId: number,
+    hash: `0x${string}`,
+    signer: `0x${string}`,
+    nonce: number,
+  ): Promise<ProtectedChainObservation> {
+    const rpcUrl = requireEvmRpcUrl(chainId, this.config);
+    const pc = createPublicClient({ chain: CHAINS[chainId], transport: http(rpcUrl) });
+    const latestNonce = await pc.getTransactionCount({ address: signer, blockTag: "latest" });
+    const receipt = await pc.getTransactionReceipt({ hash }).catch((e: unknown) => {
+      if (e instanceof TransactionReceiptNotFoundError) return null;
+      throw e;
+    });
+    if (receipt) return { latestNonce, receipt: receipt.status, known: true, included: null };
+    const known = await pc
+      .getTransaction({ hash })
+      .then(() => true)
+      .catch((e: unknown) => {
+        if (e instanceof TransactionNotFoundError) return false;
+        throw e;
+      });
+    if (known || latestNonce <= nonce) {
+      return { latestNonce, receipt: null, known, included: null };
+    }
+    const head = await pc.getBlockNumber();
+    // Lowest block whose post-state nonce is > `nonce`: the consuming block.
+    let lo = 0n;
+    let hi = head;
+    if ((await pc.getTransactionCount({ address: signer, blockNumber: hi })) <= nonce) {
+      return { latestNonce, receipt: null, known, included: null };
+    }
+    while (lo < hi) {
+      const mid = (lo + hi) / 2n;
+      const n = await pc.getTransactionCount({ address: signer, blockNumber: mid });
+      if (n > nonce) hi = mid;
+      else lo = mid + 1n;
+    }
+    const block = await pc.getBlock({ blockNumber: lo, includeTransactions: true });
+    const tx = block.transactions.find(
+      (t) => t.from.toLowerCase() === signer.toLowerCase() && t.nonce === nonce,
+    );
+    if (!tx) return { latestNonce, receipt: null, known, included: null };
+    const other = await pc.getTransactionReceipt({ hash: tx.hash }).catch((e: unknown) => {
+      if (e instanceof TransactionReceiptNotFoundError) return null;
+      throw e;
+    });
+    if (
+      !other ||
+      other.blockNumber !== lo ||
+      !block.hash ||
+      other.blockHash.toLowerCase() !== block.hash.toLowerCase() ||
+      other.from.toLowerCase() !== signer.toLowerCase()
+    ) {
+      return { latestNonce, receipt: null, known, included: null };
+    }
+    return {
+      latestNonce,
+      receipt: null,
+      known,
+      included: { hash: tx.hash, confirmations: Number(head - lo + 1n) },
+    };
+  }
+
+  /**
+   * H1: record the signed bytes on the claimed row. CAS: only a pending row
+   * with no recorded bytes accepts them, so at most one signed transaction
+   * is ever persisted (and therefore sent) per claim.
+   */
+  private async persistProtectedSigned(
+    scope: { tenantId: string; agentId: string; txId: string },
+    signed: ProtectedSignedTx,
+    signer: string,
+    exec: DbExecutor = getDb(),
+  ): Promise<void> {
+    const rows = await exec
+      .update(transactions)
+      .set({
+        status: "signed",
+        txHash: signed.hash,
+        signedRaw: signed.raw,
+        signedNonce: signed.nonce,
+        signerAddress: signer.toLowerCase(),
+        signedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(transactions.id, scope.txId),
+          eq(transactions.tenantId, scope.tenantId),
+          eq(transactions.agentId, scope.agentId),
+          eq(transactions.status, "pending"),
+          isNull(transactions.signedRaw),
+        ),
+      )
+      .returning({ id: transactions.id });
+    if (rows.length !== 1) {
+      throw new ProtectedSignerError(
+        "signed bytes already recorded for this transaction; resolve via executionRef lookup",
+      );
+    }
+  }
+
+  /**
+   * STRATA-1673 H1: resolve an uncertain protected send from the chain, and
+   * if the chain has never seen it, retransmit the SAME recorded bytes. Never
+   * signs, never touches the claim. Idempotent and safe to run concurrently.
+   *   receipt success   -> confirmed
+   *   receipt reverted  -> failed
+   *   known (mempool)   -> signed, sent_at recorded
+   *   nonce consumed by another tx -> failed (human reconciliation; no re-sign)
+   *   unknown           -> retransmit same bytes; sent_at on acknowledgement
+   */
+  async reconcileProtectedTransaction(scope: {
+    tenantId: string;
+    agentId: string;
+    txId: string;
+  }): Promise<ProtectedReconcileOutcome> {
+    const db = getDb();
+    const where = and(
+      eq(transactions.id, scope.txId),
+      eq(transactions.tenantId, scope.tenantId),
+      eq(transactions.agentId, scope.agentId),
+    );
+    const [row] = await db.select().from(transactions).where(where);
+    if (!row || !row.signedRaw || !row.txHash || row.signedNonce === null || !row.signerAddress) {
+      return "unsigned";
+    }
+    if (row.status === "confirmed" || row.status === "failed") return row.status;
+    const hash = row.txHash as `0x${string}`;
+    let obs: ProtectedChainObservation;
+    try {
+      obs = await this.observeProtectedTx(
+        row.chainId,
+        hash,
+        row.signerAddress as `0x${string}`,
+        row.signedNonce,
+      );
+    } catch {
+      return "unknown";
+    }
+    const now = new Date();
+    // STRATA-1673 F3: terminal writes only from a non-terminal row; never
+    // confirmed <-> failed. A lost guard reports the durable status.
+    const open = and(where, notInArray(transactions.status, ["confirmed", "failed"]));
+    const durable = async (): Promise<ProtectedReconcileOutcome> => {
+      const [cur] = await db
+        .select({ status: transactions.status })
+        .from(transactions)
+        .where(where);
+      return cur?.status === "confirmed" || cur?.status === "failed" ? cur.status : "unknown";
+    };
+    if (obs.receipt === "success") {
+      const won = await db
+        .update(transactions)
+        .set({ status: "confirmed", confirmedAt: now, sentAt: row.sentAt ?? now })
+        .where(open)
+        .returning({ id: transactions.id });
+      return won.length === 1 ? "confirmed" : durable();
+    }
+    if (obs.receipt === "reverted") {
+      const won = await db
+        .update(transactions)
+        .set({ status: "failed", sentAt: row.sentAt ?? now })
+        .where(open)
+        .returning({ id: transactions.id });
+      return won.length === 1 ? "failed" : durable();
+    }
+    if (obs.known) {
+      if (!row.sentAt) await db.update(transactions).set({ sentAt: now }).where(where);
+      return "sent";
+    }
+    // STRATA-1673 F1: terminal `failed` only when a DIFFERENT hash is
+    // positively identified as canonically included for this signer + nonce
+    // at the admission confirmation depth. Negative lookups + an advanced
+    // nonce (hash index gap, lagging backend, shallow reorg window) stay
+    // signed: no retransmit, retry later.
+    if (
+      obs.included &&
+      obs.included.hash.toLowerCase() !== hash.toLowerCase() &&
+      obs.included.confirmations >= PROTECTED_TERMINAL_DEPTH
+    ) {
+      const rows = await db
+        .update(transactions)
+        .set({ status: "failed" })
+        .where(and(where, inArray(transactions.status, ["pending", "signed"])))
+        .returning({ id: transactions.id });
+      return rows.length === 1 ? "nonce_consumed" : "unknown";
+    }
+    if (obs.latestNonce > row.signedNonce) return "unknown";
+    try {
+      const chain = CHAINS[row.chainId];
+      const client = createWalletClient({
+        chain,
+        transport: http(requireEvmRpcUrl(row.chainId, this.config)),
+      });
+      const sent = await this.sendRawEvm(client, row.signedRaw as Hex);
+      if (sent.toLowerCase() !== hash.toLowerCase()) return "unknown";
+    } catch {
+      return "unknown";
+    }
+    await db.update(transactions).set({ sentAt: now }).where(where);
+    return "sent";
   }
 
   /**

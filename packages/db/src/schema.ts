@@ -21,6 +21,7 @@ import {
   numeric,
   pgEnum,
   pgTable,
+  primaryKey,
   serial,
   text,
   timestamp,
@@ -601,6 +602,17 @@ export const transactions = pgTable(
      */
     tenantId: varchar("tenant_id", { length: 64 }),
     executionRef: varchar("execution_ref", { length: 128 }),
+    /**
+     * STRATA-1673 H1 (0032): protected signer only. The exact signed bytes,
+     * their nonce and signer are recorded BEFORE the send; `sent_at` is set
+     * once the network acknowledged them. A row with `signed_raw` and no
+     * `sent_at` is resolved by reconciliation (receipt / tx by hash / nonce)
+     * and, if still unknown to the chain, by retransmitting the SAME bytes.
+     */
+    signedRaw: text("signed_raw"),
+    signedNonce: bigint("signed_nonce", { mode: "number" }),
+    signerAddress: varchar("signer_address", { length: 42 }),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
   },
   (table) => ({
     agentIdIdx: index("transactions_agent_id_idx").on(table.agentId),
@@ -612,6 +624,10 @@ export const transactions = pgTable(
     executionRefChk: check(
       "transactions_execution_ref_chk",
       sql`${table.executionRef} IS NULL OR (${table.tenantId} IS NOT NULL AND length(${table.executionRef}) BETWEEN 1 AND 128)`,
+    ),
+    signedRawChk: check(
+      "transactions_signed_raw_chk",
+      sql`${table.signedRaw} IS NULL OR (${table.txHash} IS NOT NULL AND ${table.signedNonce} IS NOT NULL AND ${table.signerAddress} IS NOT NULL)`,
     ),
   }),
 );
@@ -648,10 +664,89 @@ export const approvalQueue = pgTable(
      * permit may ever be issued for this row.
      */
     issuanceClaimedAt: timestamp("issuance_claimed_at", { withTimezone: true }),
+    /**
+     * STRATA-1673 S1 (0032): who approved. NULL/'human' = a pinned human
+     * approver; 'issuance_readback' = a live Strata read-back matched the
+     * exact calldata. A readback row always carries `instruction_digest`.
+     */
+    approvalSource: varchar("approval_source", { length: 32 }),
+    instructionDigest: varchar("instruction_digest", { length: 66 }),
   },
   (table) => ({
     txIdUniqueIdx: uniqueIndex("approval_queue_tx_id_idx").on(table.txId),
     statusIdx: index("approval_queue_status_idx").on(table.status),
+    sourceCheck: check(
+      "approval_queue_source_chk",
+      sql`${table.approvalSource} IS NULL OR ${table.approvalSource} IN ('human', 'issuance_readback')`,
+    ),
+    readbackDigestCheck: check(
+      "approval_queue_readback_digest_chk",
+      sql`${table.approvalSource} IS DISTINCT FROM 'issuance_readback' OR ${table.instructionDigest} IS NOT NULL`,
+    ),
+  }),
+);
+
+// ─── STRATA-1673 S1: protected minter token admission + controls (0032) ───────
+
+export const protectedMinterTokenStatusEnum = pgEnum("protected_minter_token_status", [
+  "active",
+  "revoked",
+]);
+
+export const protectedMinterTokens = pgTable(
+  "protected_minter_tokens",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    agentId: varchar("agent_id", { length: 64 }).notNull(),
+    chainId: integer("chain_id").notNull(),
+    tokenAddress: varchar("token_address", { length: 42 }).notNull(),
+    deployTxHash: varchar("deploy_tx_hash", { length: 66 }).notNull(),
+    deployExecutionRef: varchar("deploy_execution_ref", { length: 128 }).notNull(),
+    admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
+    status: protectedMinterTokenStatusEnum("status").notNull().default("active"),
+    revokedBy: varchar("revoked_by", { length: 255 }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    revokeReason: text("revoke_reason"),
+  },
+  (table) => ({
+    scopeUnique: uniqueIndex("protected_minter_tokens_scope_idx").on(
+      table.tenantId,
+      table.agentId,
+      table.chainId,
+      table.tokenAddress,
+    ),
+    chainCheck: check("protected_minter_tokens_chain_chk", sql`${table.chainId} > 0`),
+    agentFk: foreignKey({
+      columns: [table.tenantId, table.agentId],
+      foreignColumns: [agents.tenantId, agents.id],
+      name: "protected_minter_tokens_agent_fk",
+    }).onDelete("cascade"),
+  }),
+);
+
+export const protectedMinterControls = pgTable(
+  "protected_minter_controls",
+  {
+    tenantId: varchar("tenant_id", { length: 64 }).notNull(),
+    agentId: varchar("agent_id", { length: 64 }).notNull(),
+    protectedMintingSuspendedAt: timestamp("protected_minting_suspended_at", {
+      withTimezone: true,
+    }),
+    suspendedBy: varchar("suspended_by", { length: 255 }),
+    suspendReason: text("suspend_reason"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    pk: primaryKey({
+      columns: [table.tenantId, table.agentId],
+      name: "protected_minter_controls_pk",
+    }),
+    agentFk: foreignKey({
+      columns: [table.tenantId, table.agentId],
+      foreignColumns: [agents.tenantId, agents.id],
+      name: "protected_minter_controls_agent_fk",
+    }).onDelete("cascade"),
   }),
 );
 
@@ -1184,7 +1279,7 @@ export const applicationExecutorSigners = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
-    chainCheck: check("application_executor_signers_chain_chk", sql`${table.chainId} = 84532`),
+    chainCheck: check("application_executor_signers_chain_chk", sql`${table.chainId} > 0`),
     scopeUnique: uniqueIndex("application_executor_signers_scope_idx").on(
       table.tenantId,
       table.principalId,
@@ -1250,7 +1345,7 @@ export const applicationProposalExecutions = pgTable(
       foreignColumns: [agents.tenantId, agents.id],
       name: "application_executions_agent_fk",
     }).onDelete("cascade"),
-    chainCheck: check("application_executions_chain_chk", sql`${table.chainId} = 84532`),
+    chainCheck: check("application_executions_chain_chk", sql`${table.chainId} > 0`),
     hashCheck: check(
       "application_executions_hash_chk",
       sql`(${table.status} = 'broadcast') = (${table.txHash} IS NOT NULL)`,
